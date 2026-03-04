@@ -1,0 +1,64 @@
+---
+description: spawriter - AI-assisted browser automation for single-spa projects
+globs: "**"
+alwaysApply: false
+---
+
+# spawriter
+
+You have access to MCP tools from `spawriter` that control the user's real
+Chrome tab (not a headless browser).
+
+## Prerequisites
+
+Before using MCP tools, ensure:
+
+1. The browser extension is installed and at least one tab is attached (green badge visible on the toolbar).
+2. The MCP server `spawriter` is registered in Cursor's MCP config and running.
+
+If tools like `screenshot` or `dashboard_state` are not available, the MCP server may not be running.
+Ask the user to verify at least one tab is attached (green badge) and the MCP server is active.
+
+## Cursor MCP configuration
+
+Add to `.cursor/mcp.json` or `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "spawriter": {
+      "command": "node",
+      "args": ["<path-to>/mcp/dist/cli.js", "serve"]
+    }
+  }
+}
+```
+
+Relay port: `19989` (independent from playwriter's `19988`).
+
+## Available MCP tools
+
+- `dashboard_state` - read single-spa app states, override status, localhost override detection
+- `screenshot` - capture current Chrome tab rendering (including import-map-overrides)
+- `execute` - run JavaScript in the real page context
+- `accessibility_snapshot` - get accessibility tree
+- `navigate` - navigate to URL
+- `ensure_fresh_render` - clear cache and reload if state looks stale
+- `clear_cache_and_reload` - explicit cache reset
+- `reset` - reset CDP/session connection
+
+## Recommended workflow
+
+1. `dashboard_state` first - check override status and app state.
+2. `screenshot` - confirm visible UI matches expected state.
+3. `execute` - small runtime checks (URL, selector existence, values).
+4. If state looks stale after code changes, call `ensure_fresh_render`.
+5. `clear_cache_and_reload` only when explicit cache reset is needed.
+6. `reset` if CDP/session is unstable.
+
+## Safety rules
+
+- Only operate on normal web pages; avoid `chrome://`, `edge://`, extension pages.
+- Verify single-spa state via runtime checks, not static HTML.
+- Keep operations incremental; screenshot between major actions.
+- Do not assume code changes are active until `dashboard_state` confirms localhost override is effective.

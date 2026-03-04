@@ -1,0 +1,634 @@
+import { Hono } from 'hono';
+import { WebSocketServer, WebSocket } from 'ws';
+import http from 'http';
+import { pathToFileURL } from 'node:url';
+import { getRelayPort, getRelayToken, getCdpUrl, getAllowedExtensionIds, isLocalhost, log, error, VERSION, } from './utils.js';
+const app = new Hono();
+let extensionWs = null;
+const cdpClients = new Map();
+const attachedTargets = new Map();
+const pendingRequests = new Map();
+const pendingExtensionCmdRequests = new Map();
+let nextExtensionRequestId = 1;
+const ALLOWED_EXTENSION_IDS = getAllowedExtensionIds();
+const ALLOW_ANY_EXTENSION = ALLOWED_EXTENSION_IDS.length === 0;
+app.get('/', (c) => {
+    return c.text('OK');
+});
+app.post('/connect-active-tab', async (c) => {
+    if (!isExtensionConnected()) {
+        return c.json({ success: false, error: 'Extension not connected' }, 503);
+    }
+    return new Promise((resolve) => {
+        const relayId = nextExtensionRequestId++;
+        const timeoutId = setTimeout(() => {
+            pendingExtensionCmdRequests.delete(relayId);
+            resolve(c.json({ success: false, error: 'Timeout waiting for extension' }, 504));
+        }, 15000);
+        const mockWs = {
+            send(data) {
+                clearTimeout(timeoutId);
+                pendingExtensionCmdRequests.delete(relayId);
+                try {
+                    resolve(c.json(JSON.parse(data)));
+                }
+                catch {
+                    resolve(c.json({ success: false, error: 'Invalid response' }, 500));
+                }
+            },
+            readyState: 1,
+        };
+        pendingExtensionCmdRequests.set(relayId, { ws: mockWs, timeoutId });
+        sendToExtension({
+            id: relayId,
+            method: 'connectActiveTab',
+        });
+    });
+});
+app.get('/version', (c) => {
+    return c.json({ version: VERSION });
+});
+app.get('/json/version', (c) => {
+    const port = getRelayPort();
+    return c.json({
+        Browser: `spawriter/${VERSION}`,
+        'Protocol-Version': '1.3',
+        webSocketDebuggerUrl: getCdpUrl(port),
+    });
+});
+app.get('/json/list', (c) => {
+    const targets = Array.from(attachedTargets.values()).map((target) => {
+        const targetInfo = target.targetInfo ?? {};
+        return {
+            id: targetInfo.targetId ?? target.sessionId,
+            tabId: target.tabId,
+            type: targetInfo.type ?? 'page',
+            title: targetInfo.title ?? '',
+            url: targetInfo.url ?? '',
+            webSocketDebuggerUrl: getCdpUrl(getRelayPort(), target.sessionId),
+        };
+    });
+    return c.json(targets);
+});
+function sendToExtension(message) {
+    if (extensionWs?.readyState === WebSocket.OPEN) {
+        extensionWs.send(JSON.stringify(message));
+    }
+    else {
+        error('Extension WebSocket not connected, cannot send message');
+    }
+}
+function isExtensionConnected() {
+    return extensionWs?.readyState === WebSocket.OPEN;
+}
+function sendToCDPClient(clientId, message) {
+    const client = cdpClients.get(clientId);
+    if (client?.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(JSON.stringify(message));
+    }
+}
+function broadcastToCDPClients(message) {
+    for (const client of cdpClients.values()) {
+        if (client.ws.readyState === WebSocket.OPEN) {
+            client.ws.send(JSON.stringify(message));
+        }
+    }
+}
+function validateExtensionOrigin(origin) {
+    if (!origin)
+        return false;
+    const match = origin.match(/^chrome-extension:\/\/([^/]+)/);
+    if (!match)
+        return false;
+    const id = match[1];
+    if (ALLOW_ANY_EXTENSION) {
+        log(`Allowing extension origin without allowlist: ${id}`);
+        return true;
+    }
+    return ALLOWED_EXTENSION_IDS.includes(id);
+}
+function validateCdpOrigin(origin) {
+    if (!origin) {
+        // Node.js clients usually do not send Origin.
+        return true;
+    }
+    const match = origin.match(/^chrome-extension:\/\/([^/]+)/);
+    if (!match) {
+        return false;
+    }
+    const id = match[1];
+    if (ALLOW_ANY_EXTENSION) {
+        return true;
+    }
+    return ALLOWED_EXTENSION_IDS.includes(id);
+}
+function asRecord(value) {
+    if (!value || typeof value !== 'object') {
+        return undefined;
+    }
+    return value;
+}
+function asString(value) {
+    return typeof value === 'string' ? value : undefined;
+}
+function asNumber(value) {
+    return typeof value === 'number' ? value : undefined;
+}
+function parseForwardCommandParams(value) {
+    const record = asRecord(value);
+    if (!record) {
+        return undefined;
+    }
+    const method = asString(record.method);
+    if (!method) {
+        return undefined;
+    }
+    return {
+        method,
+        sessionId: asString(record.sessionId),
+        params: asRecord(record.params),
+    };
+}
+function isExtensionLogMessage(message) {
+    return message.method === 'log' && !!asRecord(message.params);
+}
+function isExtensionEventMessage(message) {
+    return message.method === 'forwardCDPEvent' && !!asRecord(message.params);
+}
+function rawDataToBuffer(data) {
+    if (Buffer.isBuffer(data)) {
+        return data;
+    }
+    if (Array.isArray(data)) {
+        return Buffer.concat(data.map((chunk) => (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))));
+    }
+    if (data instanceof ArrayBuffer) {
+        return Buffer.from(data);
+    }
+    return Buffer.from(String(data));
+}
+const DEFAULT_BROWSER_CONTEXT_ID = 'default-browser-context';
+function buildTargetInfo(target) {
+    const targetInfo = target.targetInfo ?? {};
+    return {
+        targetId: targetInfo.targetId ?? target.sessionId,
+        type: targetInfo.type ?? 'page',
+        title: targetInfo.title ?? '',
+        url: targetInfo.url ?? '',
+        tabId: target.tabId ?? targetInfo.tabId,
+        browserContextId: targetInfo.browserContextId ?? DEFAULT_BROWSER_CONTEXT_ID,
+    };
+}
+function sendCdpResponse(clientId, payload) {
+    sendToCDPClient(clientId, payload);
+}
+function sendCdpError(clientId, payload) {
+    sendToCDPClient(clientId, { id: payload.id, sessionId: payload.sessionId, error: { message: payload.error } });
+}
+function addPendingRequest(relayId, pending) {
+    const timeoutId = setTimeout(() => {
+        const timeoutPending = pendingRequests.get(relayId);
+        if (!timeoutPending) {
+            return;
+        }
+        pendingRequests.delete(relayId);
+        sendCdpError(timeoutPending.clientId, {
+            id: timeoutPending.clientMessageId,
+            sessionId: timeoutPending.sessionId,
+            error: 'Extension request timeout',
+        });
+    }, 30000);
+    pendingRequests.set(relayId, {
+        ...pending,
+        timeoutId,
+    });
+}
+function sendAttachedToTargetEvents(clientId) {
+    for (const target of attachedTargets.values()) {
+        const targetInfo = buildTargetInfo(target);
+        sendToCDPClient(clientId, {
+            method: 'Target.attachedToTarget',
+            params: {
+                sessionId: target.sessionId,
+                targetInfo: {
+                    ...targetInfo,
+                    attached: true,
+                },
+                waitingForDebugger: false,
+            },
+        });
+    }
+}
+function sendTargetCreatedEvents(clientId) {
+    for (const target of attachedTargets.values()) {
+        const targetInfo = buildTargetInfo(target);
+        sendToCDPClient(clientId, {
+            method: 'Target.targetCreated',
+            params: {
+                targetInfo: {
+                    ...targetInfo,
+                    attached: true,
+                },
+            },
+        });
+    }
+}
+function handleServerCdpCommand(clientId, message) {
+    const { id, method, params, sessionId } = message;
+    switch (method) {
+        case 'Browser.getVersion': {
+            sendCdpResponse(clientId, {
+                id,
+                sessionId,
+                result: {
+                    protocolVersion: '1.3',
+                    product: `spawriter/${VERSION}`,
+                    revision: VERSION,
+                    userAgent: 'spawriter-cdp-relay',
+                    jsVersion: 'V8',
+                },
+            });
+            return true;
+        }
+        case 'Browser.setDownloadBehavior': {
+            sendCdpResponse(clientId, { id, sessionId, result: {} });
+            return true;
+        }
+        case 'Target.setAutoAttach': {
+            if (!sessionId) {
+                sendAttachedToTargetEvents(clientId);
+            }
+            sendCdpResponse(clientId, { id, sessionId, result: {} });
+            return true;
+        }
+        case 'Target.setDiscoverTargets': {
+            if (params?.discover) {
+                sendTargetCreatedEvents(clientId);
+            }
+            sendCdpResponse(clientId, { id, sessionId, result: {} });
+            return true;
+        }
+        case 'Target.getTargets': {
+            const targetInfos = Array.from(attachedTargets.values()).map((target) => ({
+                ...buildTargetInfo(target),
+                attached: true,
+            }));
+            sendCdpResponse(clientId, { id, sessionId, result: { targetInfos } });
+            return true;
+        }
+        case 'Target.getTargetInfo': {
+            const requestedTargetId = params?.targetId;
+            const targetById = requestedTargetId
+                ? Array.from(attachedTargets.values()).find((target) => {
+                    const targetInfo = buildTargetInfo(target);
+                    return targetInfo.targetId === requestedTargetId;
+                })
+                : undefined;
+            const targetBySession = sessionId ? attachedTargets.get(sessionId) : undefined;
+            const target = targetById ?? targetBySession ?? Array.from(attachedTargets.values())[0];
+            if (!target) {
+                sendCdpError(clientId, { id, sessionId, error: 'No targets attached' });
+                return true;
+            }
+            sendCdpResponse(clientId, {
+                id,
+                sessionId,
+                result: { targetInfo: buildTargetInfo(target) },
+            });
+            return true;
+        }
+        case 'Target.attachToTarget': {
+            const requestedTargetId = params?.targetId;
+            if (!requestedTargetId) {
+                sendCdpError(clientId, { id, sessionId, error: 'Target.attachToTarget requires targetId' });
+                return true;
+            }
+            const target = Array.from(attachedTargets.values()).find((entry) => {
+                const targetInfo = buildTargetInfo(entry);
+                return targetInfo.targetId === requestedTargetId;
+            });
+            if (!target) {
+                sendCdpError(clientId, { id, sessionId, error: `Target ${requestedTargetId} not found` });
+                return true;
+            }
+            sendCdpResponse(clientId, {
+                id,
+                sessionId,
+                result: { sessionId: target.sessionId },
+            });
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+function handleExtensionMessage(data) {
+    try {
+        const message = JSON.parse(data.toString());
+        if (message.method === 'pong') {
+            log('Received pong from extension');
+            return;
+        }
+        if (isExtensionLogMessage(message)) {
+            const params = message.params;
+            const level = params.level ?? 'log';
+            const args = Array.isArray(params.args) ? params.args : [];
+            log(`[EXT LOG ${level}]`, ...args);
+            return;
+        }
+        if (isExtensionEventMessage(message)) {
+            const { sessionId, method, params } = message.params;
+            if (method === 'Target.attachedToTarget' && sessionId) {
+                const targetInfo = params.targetInfo;
+                attachedTargets.set(sessionId, {
+                    sessionId,
+                    tabId: targetInfo?.tabId,
+                    targetInfo,
+                });
+                const enrichedTargetInfo = buildTargetInfo(attachedTargets.get(sessionId));
+                broadcastToCDPClients({
+                    method,
+                    params: {
+                        ...params,
+                        sessionId,
+                        targetInfo: { ...enrichedTargetInfo, attached: true },
+                    },
+                    sessionId,
+                });
+                return;
+            }
+            if (method === 'Target.detachedFromTarget') {
+                const detachedSessionId = params.sessionId;
+                if (detachedSessionId) {
+                    attachedTargets.delete(detachedSessionId);
+                }
+            }
+            broadcastToCDPClients({ method, params, sessionId });
+            return;
+        }
+        if ('id' in message) {
+            const response = message;
+            const cmdPending = pendingExtensionCmdRequests.get(response.id);
+            if (cmdPending) {
+                clearTimeout(cmdPending.timeoutId);
+                pendingExtensionCmdRequests.delete(response.id);
+                try {
+                    cmdPending.ws.send(JSON.stringify(response.error ? { success: false, error: response.error } : { success: true, ...response.result }));
+                }
+                catch {
+                    // cmd ws may have closed
+                }
+                return;
+            }
+            const pending = pendingRequests.get(response.id);
+            if (!pending) {
+                error(`Received response for unknown request id: ${response.id}`);
+                return;
+            }
+            clearTimeout(pending.timeoutId);
+            pendingRequests.delete(response.id);
+            const payload = response.error
+                ? { id: pending.clientMessageId, sessionId: pending.sessionId, error: { message: response.error } }
+                : { id: pending.clientMessageId, sessionId: pending.sessionId, result: response.result };
+            sendToCDPClient(pending.clientId, payload);
+        }
+    }
+    catch (e) {
+        error('Error parsing extension message:', e);
+    }
+}
+function handleCDPMessage(data, clientId) {
+    try {
+        const parsed = JSON.parse(data.toString());
+        const method = asString(parsed.method);
+        const id = asNumber(parsed.id);
+        if (method === 'forwardCDPCommand') {
+            const params = parseForwardCommandParams(parsed.params);
+            if (!params || id === undefined) {
+                return;
+            }
+            const relayId = nextExtensionRequestId++;
+            if (!isExtensionConnected()) {
+                sendCdpError(clientId, {
+                    id,
+                    sessionId: params.sessionId,
+                    error: 'Extension not connected',
+                });
+                return;
+            }
+            addPendingRequest(relayId, {
+                clientId,
+                clientMessageId: id,
+                sessionId: params.sessionId,
+            });
+            sendToExtension({
+                id: relayId,
+                method: 'forwardCDPCommand',
+                params,
+            });
+            return;
+        }
+        if (!method || id === undefined) {
+            return;
+        }
+        const params = asRecord(parsed.params);
+        const sessionId = asString(parsed.sessionId);
+        const serverHandled = handleServerCdpCommand(clientId, {
+            id,
+            method,
+            params,
+            sessionId,
+        });
+        if (serverHandled) {
+            return;
+        }
+        const relayId = nextExtensionRequestId++;
+        if (!isExtensionConnected()) {
+            sendCdpError(clientId, {
+                id,
+                sessionId,
+                error: 'Extension not connected',
+            });
+            return;
+        }
+        addPendingRequest(relayId, {
+            clientId,
+            clientMessageId: id,
+            sessionId,
+        });
+        sendToExtension({
+            id: relayId,
+            method: 'forwardCDPCommand',
+            params: {
+                method,
+                sessionId,
+                params,
+            },
+        });
+    }
+    catch (e) {
+        error('Error parsing CDP message:', e);
+    }
+}
+export async function startRelayServer() {
+    const port = getRelayPort();
+    if (ALLOW_ANY_EXTENSION) {
+        error('No SSPA_EXTENSION_IDS configured. Allowing any chrome-extension origin.');
+    }
+    const server = http.createServer(async (req, res) => {
+        try {
+            const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+            const init = {
+                method: req.method,
+                headers: req.headers,
+            };
+            if (req.method && req.method !== 'GET' && req.method !== 'HEAD') {
+                const chunks = [];
+                for await (const chunk of req) {
+                    chunks.push(Buffer.from(chunk));
+                }
+                init.body = Buffer.concat(chunks);
+                init.duplex = 'half';
+            }
+            const request = new Request(url, init);
+            const response = await app.fetch(request);
+            const body = await response.text();
+            res.writeHead(response.status, Object.fromEntries(response.headers));
+            res.end(body);
+        }
+        catch {
+            res.writeHead(500);
+            res.end('Error');
+        }
+    });
+    const wss = new WebSocketServer({ server });
+    wss.on('connection', (ws, req) => {
+        const remoteAddr = req.socket?.remoteAddress || '';
+        const origin = req.headers.origin || '';
+        if (!isLocalhost(remoteAddr)) {
+            error(`Rejected connection from non-localhost: ${remoteAddr}`);
+            ws.close(1008, 'Connection only allowed from localhost');
+            return;
+        }
+        const pathname = req.url?.split('?')[0] || '';
+        if (pathname === '/extension') {
+            if (!validateExtensionOrigin(origin)) {
+                error(`Rejected extension connection with invalid origin: ${origin}. Allowed: ${ALLOWED_EXTENSION_IDS.join(', ') || 'none'}`);
+                ws.close(1008, 'Invalid origin');
+                return;
+            }
+            log('Extension WebSocket connected');
+            extensionWs = ws;
+            ws.on('message', (data) => {
+                handleExtensionMessage(rawDataToBuffer(data));
+            });
+            ws.on('close', () => {
+                log('Extension WebSocket disconnected');
+                if (extensionWs === ws) {
+                    extensionWs = null;
+                }
+                attachedTargets.clear();
+                for (const pending of pendingRequests.values()) {
+                    clearTimeout(pending.timeoutId);
+                    sendCdpError(pending.clientId, {
+                        id: pending.clientMessageId,
+                        sessionId: pending.sessionId,
+                        error: 'Extension disconnected',
+                    });
+                }
+                pendingRequests.clear();
+            });
+            ws.on('error', (err) => {
+                error('Extension WebSocket error:', err.message);
+            });
+            return;
+        }
+        if (pathname.startsWith('/cdp/')) {
+            const clientId = pathname.slice(5);
+            const token = getRelayToken();
+            if (!validateCdpOrigin(origin)) {
+                error(`Rejected CDP connection with invalid origin: ${origin}`);
+                ws.close(1008, 'Invalid origin');
+                return;
+            }
+            if (token) {
+                const url = new URL(req.url || '', `http://localhost:${port}`);
+                const providedToken = url.searchParams.get('token');
+                if (providedToken !== token) {
+                    error('Rejected CDP connection with invalid token');
+                    ws.close(1008, 'Invalid token');
+                    return;
+                }
+            }
+            log(`CDP WebSocket connected: ${clientId}`);
+            cdpClients.set(clientId, {
+                ws: ws,
+            });
+            ws.on('message', (data) => {
+                handleCDPMessage(rawDataToBuffer(data), clientId);
+            });
+            ws.on('close', () => {
+                log(`CDP WebSocket disconnected: ${clientId}`);
+                cdpClients.delete(clientId);
+                for (const [requestId, pending] of pendingRequests.entries()) {
+                    if (pending.clientId === clientId) {
+                        clearTimeout(pending.timeoutId);
+                        pendingRequests.delete(requestId);
+                    }
+                }
+            });
+            ws.on('error', (err) => {
+                error(`CDP WebSocket error (${clientId}):`, err.message);
+            });
+            return;
+        }
+        if (pathname === '/extension-cmd') {
+            log('Extension command WebSocket connected');
+            ws.on('message', (data) => {
+                try {
+                    const message = JSON.parse(rawDataToBuffer(data).toString());
+                    if (!isExtensionConnected()) {
+                        ws.send(JSON.stringify({ success: false, error: 'Extension not connected' }));
+                        return;
+                    }
+                    const relayId = nextExtensionRequestId++;
+                    const timeoutId = setTimeout(() => {
+                        pendingExtensionCmdRequests.delete(relayId);
+                        ws.send(JSON.stringify({ success: false, error: 'Extension request timeout' }));
+                    }, 15000);
+                    pendingExtensionCmdRequests.set(relayId, { ws: ws, timeoutId });
+                    sendToExtension({
+                        id: relayId,
+                        method: message.method,
+                        params: message,
+                    });
+                }
+                catch (e) {
+                    ws.send(JSON.stringify({ success: false, error: String(e) }));
+                }
+            });
+            ws.on('close', () => {
+                log('Extension command WebSocket disconnected');
+            });
+            return;
+        }
+        ws.close(1008, 'Unknown endpoint');
+    });
+    server.listen(port, () => {
+        log(`Relay server started on port ${port}`);
+        log(`Extension endpoint: ws://localhost:${port}/extension`);
+        log(`CDP endpoint: ws://localhost:${port}/cdp/:clientId`);
+    });
+    setInterval(() => {
+        if (extensionWs?.readyState === WebSocket.OPEN) {
+            extensionWs.send(JSON.stringify({ method: 'ping' }));
+        }
+    }, 30000);
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+    startRelayServer().catch((e) => {
+        error('Failed to start relay server:', e);
+        process.exit(1);
+    });
+}
+//# sourceMappingURL=relay.js.map

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "spawriter": {
+      "type": "local",
+      "command": [
+        "pnpm",
+        "--dir",
+        "D:\\dev\\side\\spawriter\\mcp",
+        "exec",
+        "tsx",
+        "src/mcp.ts"
+      ],
+      "enabled": true
+    }
+  }
+}
