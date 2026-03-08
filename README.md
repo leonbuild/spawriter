@@ -1,108 +1,152 @@
 # spawriter
 
-single-spa 的 DevTools 面板增强版，保留原有 Dashboard 调试体验，并新增 MCP 能力，让 AI 直接连接你正在使用的真实 Chrome Tab（而不是新开浏览器）。
+**The missing link between AI coding agents and single-spa micro-frontends.**
 
-> 项目版本：`v1.0.0`
+spawriter is an enhanced single-spa DevTools extension that adds MCP (Model Context Protocol) capabilities, enabling AI agents to connect to your **real, running Chrome tab** — not a sandboxed browser — to visually verify, debug, and manage micro-frontend applications.
+
+> Current version: `v1.0.0` · License: MIT
 
 ---
 
-## Part 1: Dashboard 使用
+## Why spawriter matters in the single-spa ecosystem
 
-这部分是“人类开发者”路径，不依赖 MCP，也不需要启动 MCP 进程。
+### The problem: micro-frontend dev ≠ normal web dev
 
-### 1) 主要功能
+In a typical web application, a developer runs `npm start`, opens `localhost:3000`, and sees the app. AI coding tools like Codex, Cursor, and Cline work well in this world — they edit code, and the dev server hot-reloads it.
 
-- DevTools 面板查看 single-spa 应用状态
-- 强制 mount / unmount
-- Overlay 高亮（On / Off / List Hover）
-- Import Map Overrides（编辑、保存、启停、导入导出）
-- Clear Cache & Refresh（面板按钮）
-- spawriter AI Bridge（工具栏按钮 per-tab 开关，点击 attach/detach 当前 tab；badge 显示 attached 数量与状态，绿色=本 tab 已连接，灰色+数字=其他 tab 已连接，无 badge=无连接）
+**Single-spa micro-frontends don't work that way.** Each micro-app is a module loaded by a shared root-config host via an [import map](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script/type/importmap). To develop locally, you must:
 
-### 2) 安装方式
+1. Run the micro-app dev server on a local port (e.g. `localhost:8080`)
+2. **Override the import map** in the host to point to your local module instead of the deployed one
+3. Visually verify that the override took effect and the app renders correctly **inside the host**
 
-#### 方式 A：使用发布包（推荐）
+This "override → verify" loop is the core workflow, and it relies on a browser extension — traditionally [import-map-overrides](https://github.com/single-spa/import-map-overrides) — to manage step 2. Without step 3 (visual verification in the actual host), you're flying blind.
 
-- Chrome：`spawriter-chrome-{version}.zip`
-- Firefox：`spawriter-firefox-{version}.zip`
+### The gap: AI agents can't do this today
 
-#### 方式 B：源码构建
+Current AI coding tools can edit source files, but they **cannot**:
+
+- **Toggle import-map-overrides** to swap a production module for a local one
+- **See the live page** to verify whether the override worked and the UI renders correctly
+- **Inspect single-spa app status** (mounted, not mounted, loading error, etc.)
+
+This means every AI-assisted code change in a micro-frontend project still requires a human to manually switch overrides, eyeball the browser, and report back. The feedback loop is broken.
+
+### The solution: spawriter
+
+spawriter closes this gap by providing:
+
+| Capability | How |
+|---|---|
+| **Override management** | Read, create, toggle, and delete import-map-overrides programmatically |
+| **Visual verification** | Take screenshots and read accessibility snapshots of the live page |
+| **App state inspection** | Query which single-spa apps are mounted, their status, and whether overrides point to localhost |
+| **Cache & reload** | Clear browser cache and reload the host to get a clean state |
+| **JS execution** | Run arbitrary JavaScript in the page context for deeper inspection |
+
+All of this is exposed as **MCP tools** that any compatible AI agent (Codex, Cursor, Cline, OpenCode, etc.) can call directly. The AI can now do: **code → override → screenshot → iterate** — entirely autonomously.
+
+spawriter is the **first and only open-source tool** in the single-spa ecosystem that gives AI agents both import-map-override control and visual feedback, directly in the developer's real browser session.
+
+---
+
+## Part 1: Dashboard (Human Developer Path)
+
+This part requires no MCP and no separate server process.
+
+### Features
+
+- View single-spa application status in the DevTools panel
+- Force mount / unmount applications
+- Overlay highlighting (On / Off / List Hover)
+- Import Map Overrides management (edit, save, enable/disable, import/export)
+- Clear Cache & Refresh (panel button)
+- spawriter AI Bridge (toolbar button, per-tab attach/detach; badge shows attached count & status: green = this tab connected, gray + number = other tab connected, no badge = no connection)
+
+### Installation
+
+#### Option A: Pre-built release (recommended)
+
+- Chrome: `spawriter-chrome-{version}.zip`
+- Firefox: `spawriter-firefox-{version}.zip`
+
+#### Option B: Build from source
 
 ```bash
 npm install
 npm run build
 ```
 
-默认会生成统一分发目录（推荐直接分发这一整个目录）：
+This generates a unified release directory (recommended for distribution):
 
 - `release/spawriter-v<version>/`
 
-该目录下包含：
+The directory contains:
 
-- `extension/dist-chrome/`（Chrome unpacked 安装）
-- `extension/spawriter-chrome-<version>.zip`（Chrome zip）
-- `mcp/dist/`（MCP 可执行产物）
-- `skills/spawriter/`（可复制的 skill）
-- `cursor-rules/`（Cursor IDE 规则模板）
-- `doc/`（安装与开发文档）
+- `extension/dist-chrome/` — Chrome unpacked extension
+- `extension/spawriter-chrome-<version>.zip` — Chrome zip
+- `mcp/dist/` — MCP server build artifacts
+- `skills/spawriter/` — Agent skill definitions
+- `cursor-rules/` — Cursor IDE rule templates
+- `doc/` — Installation and development guides
 
-`npm run build` 完成后会自动清理根目录中间产物目录（`build`、`dist-chrome`、`web-ext-artifacts`），避免与统一分发目录混淆。
+After `npm run build`, intermediate directories (`build`, `dist-chrome`, `web-ext-artifacts`) are automatically cleaned up to avoid confusion.
 
-> **构建约束**
+> **Build notes**
 >
-> - `release/` 是纯构建产物（已加入 `.gitignore`），可安全删除后 `npm run build` 完全重建。
-> - 版本号变更请使用 `npm run version:bump <patch|minor|major|x.y.z>`，该脚本会同步更新 `package.json`、`manifest.json`、`manifest.chrome.json`、`mcp/package.json` 四个文件。
-> - 编译流水线：`webpack → build-chrome → web-ext zip → mcp:build → package-release → clean:artifacts`。
-> - 旧版本 release 目录会被 `clean:artifacts` 自动清理，始终只保留当前版本。
+> - `release/` is a pure build artifact (in `.gitignore`) — safe to delete and fully rebuild with `npm run build`.
+> - To bump the version, use `npm run version:bump <patch|minor|major|x.y.z>`. This updates `package.json`, `manifest.json`, `manifest.chrome.json`, and `mcp/package.json` in sync.
+> - Build pipeline: `webpack → build-chrome → web-ext zip → mcp:build → package-release → clean:artifacts`.
+> - Old release directories are automatically cleaned by `clean:artifacts`; only the current version is kept.
 
-### 3) Chrome 本地加载（unpacked）
+### Chrome side-loading (unpacked)
 
-1. 打开 `chrome://extensions/`
-2. 开启“开发者模式”
-3. 点击“加载已解压的扩展程序”
-4. 选择 `release/spawriter-v<version>/extension/dist-chrome/`
+1. Open `chrome://extensions/`
+2. Enable "Developer mode"
+3. Click "Load unpacked"
+4. Select `release/spawriter-v<version>/extension/dist-chrome/`
 
-### 4) Dashboard 回归检查
+### Dashboard regression checklist
 
-- 面板能正常打开
-- mount/unmount 正常
-- overlay 正常
-- import-map-overrides 保存/开关/重载正常
-- 工具栏按钮 per-tab attach/detach 正常（badge 绿色+数字=本 tab 已连接，黄色+"..."=连接中，灰色+数字=其他 tab 已连接，无 badge=无连接，红色+"!"=错误）
+- Panel opens correctly
+- mount / unmount works
+- Overlay works
+- import-map-overrides save / toggle / reload works
+- Toolbar button per-tab attach/detach works (badge: green + number = this tab connected, yellow + "..." = connecting, gray + number = other tab connected, no badge = no connection, red + "!" = error)
 
 ---
 
-## Part 2: MCP 使用
+## Part 2: MCP (AI Automation Path)
 
-这部分是“AI 自动化”路径。你可以只用 Dashboard，也可以 Dashboard + MCP 同时使用。
+This part enables AI agents to interact with your browser. You can use the Dashboard alone, or Dashboard + MCP together.
 
-### 1) MCP 由哪几部分组成
+### Architecture
 
-- Chrome 扩展（包含 spawriter AI bridge，默认端口 `19989`）
-- Relay（CDP 转发，端口 `19989`，独立于 playwriter 的 `19988`，两个扩展可共存）
-- MCP Server（stdio tools）
+- **Chrome extension** — includes the spawriter AI Bridge (default port `19989`)
+- **Relay** — CDP forwarding on port `19989` (independent of playwriter's `19988`; both extensions can coexist)
+- **MCP Server** — stdio-based tool server
 
-### 2) 快速启动（开发仓库内）
+### Quick start (from the dev repo)
 
 ```bash
-# 1) 先构建 MCP
+# 1) Build the MCP server
 npm run mcp:build
 
-# 2) 启动 MCP Server（会处理 relay）
+# 2) Start the MCP server (also starts the relay)
 npm run mcp:serve
 ```
 
-你也可以直接运行兼容命令：
+You can also run directly:
 
 ```bash
 node dist/cli.js serve
 ```
 
-> 已添加根目录 `dist/cli.js` 兼容入口，修复了“在项目根目录执行 `node dist/cli.js serve` 找不到模块”的问题。
+> A compatibility entry point at `dist/cli.js` in the repo root is included to fix the "module not found when running from the project root" issue.
 
-### 3) 从统一分发目录启动（给最终用户）
+### Start from the release directory (for end users)
 
-假设你分发的是 `release/spawriter-v<version>/`：
+Assuming you are distributing `release/spawriter-v<version>/`:
 
 ```bash
 cd release/spawriter-v<version>/mcp
@@ -110,13 +154,13 @@ npm install
 node dist/cli.js serve
 ```
 
-完成一次 `mcp` 依赖安装后，也支持在分发目录根下直接执行：
+After the initial `npm install`, you can also run from the release root:
 
 ```bash
 node dist/cli.js serve
 ```
 
-### 4) 在 `mcp/` 目录单独启动（可选）
+### Start from the `mcp/` directory (optional)
 
 ```bash
 cd mcp
@@ -124,99 +168,109 @@ npm run build
 node dist/cli.js serve
 ```
 
-### 5) MCP 客户端配置示例
+### MCP client configuration
 
-可按你的客户端格式配置，核心是启动命令指向 `mcp/dist/cli.js serve`。
+Configure your AI client to point to `mcp/dist/cli.js serve`. Example:
 
 ```json
 {
   "mcpServers": {
     "spawriter": {
       "command": "node",
-      "args": ["D:/dev-side/spawriter/mcp/dist/cli.js", "serve"]
+      "args": ["D:/dev/side/spawriter/mcp/dist/cli.js", "serve"]
     }
   }
 }
 ```
 
-### 6) MCP 工具能力（当前）
+### MCP tools
 
-- `screenshot`
-- `accessibility_snapshot`
-- `execute`
-- `dashboard_state`（读取 dashboard 状态、app 状态、override 是否命中 localhost）
-- `reset`
-- `clear_cache_and_reload`
-- `ensure_fresh_render`
-- `navigate`
+| Tool | Description |
+|---|---|
+| `screenshot` | Capture a screenshot of the current page |
+| `accessibility_snapshot` | Read the accessibility tree of the current page |
+| `execute` | Run arbitrary JavaScript in the page context |
+| `dashboard_state` | Read dashboard status, app states, whether overrides hit localhost |
+| `reset` | Reset the MCP connection |
+| `clear_cache_and_reload` | Clear browser cache and reload the page |
+| `ensure_fresh_render` | Wait for the page to stabilize after navigation |
+| `navigate` | Navigate to a URL |
 
-### 7) Cursor Rule（给 AI Agent 的自动上下文）
+### Cursor Rules (auto-context for AI agents in Cursor IDE)
 
-在 Cursor IDE 中，可以通过 `.cursor/rules/*.mdc` 文件让 AI 自动获得 MCP 使用知识。
+In Cursor IDE, `.cursor/rules/*.mdc` files inject MCP usage knowledge into the AI automatically.
 
-统一分发目录中包含预置的规则模板：`cursor-rules/spawriter.mdc`
+A pre-built rule template is included: `cursor-rules/spawriter.mdc`
 
-#### 安装方式
+#### Installation
 
-将 `cursor-rules/spawriter.mdc` 复制到你工作区的 `.cursor/rules/` 目录下即可：
+Copy the rule file into your workspace:
 
 ```bash
 mkdir -p /path/to/workspace/.cursor/rules
 cp cursor-rules/spawriter.mdc /path/to/workspace/.cursor/rules/
 ```
 
-#### 作用域配置
+#### Scope configuration
 
-规则文件中的 `globs` 字段控制生效范围，可根据项目结构调整：
+The `globs` field in the rule file controls which files trigger the rule:
 
-| 场景 | globs 配置 |
-|------|------------|
-| 所有文件 | `**` |
-| 仅 journal 和 service | `journal/**,service/**` |
-| 仅特定子项目 | `my-project/**` |
+| Scenario | globs value |
+|---|---|
+| All files | `**` |
+| Only journal and service | `journal/**,service/**` |
+| A specific sub-project | `my-project/**` |
 
-修改 `.mdc` 文件头部的 `globs:` 行即可。
+Edit the `globs:` line at the top of the `.mdc` file.
 
-#### Rule vs Skill
+#### Rules vs Skills
 
 | | Cursor Rule (`.cursor/rules/*.mdc`) | Skill (`skills/SKILL.md`) |
 |---|---|---|
-| 触发方式 | 编辑匹配文件时自动注入 | 需要 agent 系统显式加载 |
-| 适用场景 | Cursor IDE 日常开发 | 分发给其他 AI Agent 系统 |
-| 位置 | 工作区 `.cursor/rules/` | 项目内 `skills/` |
+| Trigger | Auto-injected when editing matching files | Explicitly loaded by the agent system |
+| Best for | Day-to-day development in Cursor IDE | Distribution to other AI agent systems |
+| Location | Workspace `.cursor/rules/` | Project `skills/` |
 
-两者可以并存。建议 Cursor 用户使用 Rule，其他 AI Agent 系统使用 Skill。
+Both can coexist. Use Rules for Cursor; use Skills for other agent systems.
 
-### 8) Skill（给其他 Agent 系统的使用约束）
+### Skills (usage constraints for other agent systems)
 
-参考 `playwriter` 的“CLI + MCP + skill”方式，这个项目也建议给 Agent 配套一段固定使用规范（例如：先截图再执行、异常先 reset、只在普通网页 tab 操作等），以减少误操作与无效调用。
+Following the "CLI + MCP + Skill" pattern pioneered by [`remorses/playwriter`](https://github.com/remorses/playwriter), spawriter ships a set of structured usage rules (e.g., always screenshot before executing, reset on error, only operate on normal web tabs) to minimize invalid calls.
 
-- 参考项目：[`remorses/playwriter`](https://github.com/remorses/playwriter)
-- 本项目建议结合：
+- Reference project: [`remorses/playwriter`](https://github.com/remorses/playwriter)
+- Recommended reading:
   - `doc/MCP_DEV_GUIDE.md`
   - `doc/CHROME_INSTALL_TEST_GUIDE.md`
-- 统一分发目录中可直接复制：`skills/spawriter/SKILL.md`
-- 建议在所有自动化流程中先调用 `dashboard_state`，确认 override 与 dashboard 状态后再执行修改验证。
+- Ready-to-copy skill: `skills/spawriter/SKILL.md`
+- Best practice: always call `dashboard_state` first to confirm override & dashboard status before making changes.
 
-### 9) 常见问题排查
+### Troubleshooting
 
-- **`node dist/cli.js serve` 报找不到模块**
+- **`node dist/cli.js serve` — module not found**
+  - Use `npm run mcp:serve` instead
+  - Or run `npm run mcp:build` first, then `node dist/cli.js serve`
 
-  - 直接用：`npm run mcp:serve`
-  - 或先执行：`npm run mcp:build` 再执行 `node dist/cli.js serve`
+- **webpack OpenSSL error**
+  - The build scripts already include `--openssl-legacy-provider`
 
-- **webpack OpenSSL 报错**
-
-  - 当前脚本已内置 `--openssl-legacy-provider`
-
-- **MCP 连上但没有页面**
-  - 确认当前是普通网页 tab（不是 `chrome://` / `edge://` / `chrome-extension://`）
-  - 调用 `reset` 或重启 `npm run mcp:serve`
+- **MCP connected but no page**
+  - Make sure the active tab is a normal web page (not `chrome://`, `edge://`, or `chrome-extension://`)
+  - Call `reset` or restart `npm run mcp:serve`
 
 ---
 
-## 相关文档
+## Documentation
 
 - `doc/CHROME_INSTALL_TEST_GUIDE.md`
 - `doc/MCP_DEV_GUIDE.md`
 - `doc/PUBLISH_GUIDE.md`
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.
+
+## License
+
+[MIT](LICENSE)
