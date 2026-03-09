@@ -23,6 +23,7 @@ interface CdpSession {
 }
 
 let cdpSession: CdpSession | null = null;
+let sessionPromise: Promise<CdpSession> | null = null;
 
 async function ensureRelayServer(): Promise<void> {
   try {
@@ -131,6 +132,25 @@ function connectCdp(sessionId: string): Promise<CdpSession> {
         pendingRequests: new Map(),
       };
 
+      // Heartbeat: detect silent disconnects
+      let pongReceived = true;
+      const heartbeat = setInterval(() => {
+        if (!pongReceived) {
+          log('CDP heartbeat timeout, closing connection');
+          clearInterval(heartbeat);
+          ws.terminate();
+          return;
+        }
+        pongReceived = false;
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.ping();
+        }
+      }, 30000);
+
+      ws.on('pong', () => {
+        pongReceived = true;
+      });
+
       ws.on('message', (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString()) as { id?: number; result?: unknown; error?: { message: string } };
@@ -152,6 +172,7 @@ function connectCdp(sessionId: string): Promise<CdpSession> {
       });
 
       ws.on('close', () => {
+        clearInterval(heartbeat);
         for (const pending of session.pendingRequests.values()) {
           clearTimeout(pending.timer);
           pending.reject(new Error('CDP connection closed'));
@@ -205,6 +226,19 @@ async function ensureSession(): Promise<CdpSession> {
   if (cdpSession?.ws.readyState === WebSocket.OPEN) {
     return cdpSession;
   }
+  // Mutex: if another call is already establishing a session, piggyback on it
+  if (sessionPromise) {
+    return sessionPromise;
+  }
+  sessionPromise = doEnsureSession();
+  try {
+    return await sessionPromise;
+  } finally {
+    sessionPromise = null;
+  }
+}
+
+async function doEnsureSession(): Promise<CdpSession> {
   cdpSession = null;
 
   await ensureRelayServer();
@@ -230,6 +264,19 @@ async function ensureSession(): Promise<CdpSession> {
   return cdpSession;
 }
 
+const SLOW_CDP_COMMANDS = new Set([
+  'Accessibility.getFullAXTree',
+  'Page.captureScreenshot',
+  'Network.clearBrowserCache',
+  'Network.clearBrowserCookies',
+  'Page.reload',
+  'Page.navigate',
+]);
+
+function getCommandTimeout(method: string): number {
+  return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
+}
+
 async function evaluateJs(session: CdpSession, expression: string): Promise<unknown> {
   const result = await sendCdpCommand(session, 'Runtime.evaluate', {
     expression,
@@ -241,6 +288,66 @@ async function evaluateJs(session: CdpSession, expression: string): Promise<unkn
     throw new Error(`JS error: ${result.exceptionDetails.text}`);
   }
   return result.result?.value;
+}
+
+interface AXNode {
+  nodeId: string;
+  parentId?: string;
+  backendDOMNodeId?: number;
+  role?: { type: string; value: string };
+  name?: { type: string; value: string };
+  properties?: Array<{ name: string; value: { type: string; value: unknown } }>;
+  childIds?: string[];
+  ignored?: boolean;
+}
+
+function formatAXTreeAsText(nodes: AXNode[]): string {
+  const nodeMap = new Map<string, AXNode>();
+  for (const node of nodes) {
+    nodeMap.set(node.nodeId, node);
+  }
+
+  const lines: string[] = [];
+
+  function walk(nodeId: string, depth: number) {
+    const node = nodeMap.get(nodeId);
+    if (!node) return;
+    if (node.ignored) {
+      for (const childId of node.childIds ?? []) {
+        walk(childId, depth);
+      }
+      return;
+    }
+
+    const role = node.role?.value ?? '';
+    const name = node.name?.value ?? '';
+
+    const props: string[] = [];
+    for (const prop of node.properties ?? []) {
+      const v = prop.value?.value;
+      if (v === undefined || v === false || v === '') continue;
+      if (prop.name === 'focusable') continue;
+      props.push(`${prop.name}=${typeof v === 'string' ? v : JSON.stringify(v)}`);
+    }
+
+    const indent = '  '.repeat(depth);
+    const nameStr = name ? ` "${name}"` : '';
+    const propsStr = props.length > 0 ? ` [${props.join(', ')}]` : '';
+    if (role || name) {
+      lines.push(`${indent}${role}${nameStr}${propsStr}`);
+    }
+
+    for (const childId of node.childIds ?? []) {
+      walk(childId, depth + 1);
+    }
+  }
+
+  const rootNode = nodes.find((n) => !n.parentId);
+  if (rootNode) {
+    walk(rootNode.nodeId, 0);
+  }
+
+  return lines.join('\n') || '(empty accessibility tree)';
 }
 
 const server = new Server(
@@ -310,6 +417,31 @@ const tools = [
       required: ['url'],
     },
   },
+  {
+    name: 'override_app',
+    description: 'Manage import-map-overrides for single-spa apps: set a localhost override, remove it, toggle enable/disable, or reset all overrides',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['set', 'remove', 'enable', 'disable', 'reset_all'], description: 'Action to perform on the override' },
+        appName: { type: 'string', description: 'Module specifier (e.g. @cnic/main). Required for set/remove/enable/disable.' },
+        url: { type: 'string', description: 'Override URL (e.g. http://localhost:9100/app.js). Required for "set" action.' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'app_action',
+    description: 'Control single-spa application lifecycle: mount, unmount, or unload an app. After the action, triggers reroute to apply changes.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: { type: 'string', enum: ['mount', 'unmount', 'unload'], description: 'Lifecycle action to perform' },
+        appName: { type: 'string', description: 'Application name (e.g. @cnic/main)' },
+      },
+      required: ['action', 'appName'],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -332,17 +464,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     switch (name) {
       case 'screenshot': {
-        const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }) as { data: string };
+        const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot')) as { data: string };
         return {
           content: [{ type: 'image', data: result.data, mimeType: 'image/png' }],
         };
       }
 
       case 'accessibility_snapshot': {
-        await sendCdpCommand(session, 'Accessibility.enable');
-        const snapshot = await sendCdpCommand(session, 'Accessibility.getFullAXTree');
+        await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
+        const snapshot = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
+        const text = formatAXTreeAsText(snapshot.nodes ?? []);
         return {
-          content: [{ type: 'text', text: JSON.stringify(snapshot, null, 2) }],
+          content: [{ type: 'text', text }],
         };
       }
 
@@ -365,11 +498,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           var exposedMethods = devtools && devtools.exposedMethods;
           var hasSingleSpaDevtools = !!(exposedMethods && typeof exposedMethods.getRawAppData === 'function');
           var rawApps = hasSingleSpaDevtools ? (exposedMethods.getRawAppData() || []) : [];
+          var imo = window.importMapOverrides;
+          var overrideMap = imo && typeof imo.getOverrideMap === 'function' ? imo.getOverrideMap() : null;
+          var overrides = overrideMap && overrideMap.imports ? overrideMap.imports : {};
           var apps = Array.isArray(rawApps) ? rawApps.map(function(app) {
             var ad = app.devtools || {};
-            return { name: app.name || '', status: app.status || 'UNKNOWN', activeWhenForced: ad.activeWhenForced || null, hasOverlays: !!ad.overlays };
+            var name = app.name || '';
+            var overrideUrl = overrides[name] || null;
+            return { name: name, status: app.status || 'UNKNOWN', overrideUrl: overrideUrl, activeWhenForced: ad.activeWhenForced || null, hasOverlays: !!ad.overlays };
           }) : [];
-          return JSON.stringify({ pageUrl: location.href, hasSingleSpaDevtools: hasSingleSpaDevtools, appCount: apps.length, apps: apps });
+          var activeOverrides = {};
+          for (var key in overrides) { activeOverrides[key] = overrides[key]; }
+          return JSON.stringify({
+            pageUrl: location.href,
+            hasSingleSpaDevtools: hasSingleSpaDevtools,
+            hasImportMapOverrides: !!imo,
+            appCount: apps.length,
+            activeOverrides: activeOverrides,
+            apps: apps
+          });
         })(${targetAppName})`;
 
         const value = await evaluateJs(session, dashboardCode);
@@ -381,10 +528,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'clear_cache_and_reload': {
         const mode = (args.mode as string) || 'light';
         if (mode === 'aggressive') {
-          await sendCdpCommand(session, 'Network.clearBrowserCache');
-          await sendCdpCommand(session, 'Network.clearBrowserCookies');
+          await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
+          await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
         }
-        await sendCdpCommand(session, 'Page.reload', { ignoreCache: true });
+        await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
         await sleep(2000);
         return {
           content: [{ type: 'text', text: `Cache cleared with mode: ${mode}` }],
@@ -392,7 +539,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'ensure_fresh_render': {
-        await sendCdpCommand(session, 'Page.reload', { ignoreCache: true });
+        await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
         await sleep(2000);
         return {
           content: [{ type: 'text', text: 'Page reloaded with fresh cache' }],
@@ -400,10 +547,119 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'navigate': {
-        await sendCdpCommand(session, 'Page.navigate', { url: args.url as string });
+        await sendCdpCommand(session, 'Page.navigate', { url: args.url as string }, getCommandTimeout('Page.navigate'));
         await sleep(2000);
         return {
           content: [{ type: 'text', text: `Navigated to ${args.url}` }],
+        };
+      }
+
+      case 'override_app': {
+        const action = args.action as string;
+        const appName = args.appName as string | undefined;
+        const overrideUrl = args.url as string | undefined;
+
+        let code: string;
+        switch (action) {
+          case 'set':
+            if (!appName || !overrideUrl) {
+              return { content: [{ type: 'text', text: 'Error: "set" requires both appName and url' }] };
+            }
+            code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.addOverride(${JSON.stringify(appName)}, ${JSON.stringify(overrideUrl)});
+              return JSON.stringify({ success: true, action: 'set', appName: ${JSON.stringify(appName)}, url: ${JSON.stringify(overrideUrl)} });
+            })()`;
+            break;
+          case 'remove':
+            if (!appName) {
+              return { content: [{ type: 'text', text: 'Error: "remove" requires appName' }] };
+            }
+            code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.removeOverride(${JSON.stringify(appName)});
+              return JSON.stringify({ success: true, action: 'remove', appName: ${JSON.stringify(appName)} });
+            })()`;
+            break;
+          case 'enable':
+            if (!appName) {
+              return { content: [{ type: 'text', text: 'Error: "enable" requires appName' }] };
+            }
+            code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.enableOverride(${JSON.stringify(appName)});
+              return JSON.stringify({ success: true, action: 'enable', appName: ${JSON.stringify(appName)} });
+            })()`;
+            break;
+          case 'disable':
+            if (!appName) {
+              return { content: [{ type: 'text', text: 'Error: "disable" requires appName' }] };
+            }
+            code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.disableOverride(${JSON.stringify(appName)});
+              return JSON.stringify({ success: true, action: 'disable', appName: ${JSON.stringify(appName)} });
+            })()`;
+            break;
+          case 'reset_all':
+            code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.resetOverrides();
+              return JSON.stringify({ success: true, action: 'reset_all' });
+            })()`;
+            break;
+          default:
+            return { content: [{ type: 'text', text: 'Error: unknown action "' + action + '". Use: set, remove, enable, disable, reset_all' }] };
+        }
+
+        const value = await evaluateJs(session, code);
+        return {
+          content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+        };
+      }
+
+      case 'app_action': {
+        const action = args.action as string;
+        const appName = args.appName as string;
+
+        const actionCode = `(async function() {
+          var singleSpa = window.__SINGLE_SPA_DEVTOOLS__;
+          var exposedMethods = singleSpa && singleSpa.exposedMethods;
+          if (!exposedMethods) return JSON.stringify({ success: false, error: 'single-spa devtools not available' });
+
+          var rawApps = exposedMethods.getRawAppData() || [];
+          var app = rawApps.find(function(a) { return a.name === ${JSON.stringify(appName)}; });
+          if (!app) return JSON.stringify({ success: false, error: 'App not found: ${appName.replace(/'/g, "\\'")}' });
+
+          var action = ${JSON.stringify(action)};
+          try {
+            if (action === 'mount') {
+              if (typeof app.devtools?.activeWhenForced === 'function') {
+                app.devtools.activeWhenForced(true);
+              }
+              await exposedMethods.reroute();
+            } else if (action === 'unmount') {
+              if (typeof app.devtools?.activeWhenForced === 'function') {
+                app.devtools.activeWhenForced(false);
+              }
+              await exposedMethods.reroute();
+            } else if (action === 'unload') {
+              if (typeof exposedMethods.toLoadPromise === 'function') {
+                await exposedMethods.unregisterApplication(${JSON.stringify(appName)});
+              }
+              await exposedMethods.reroute();
+            }
+            var updatedApps = exposedMethods.getRawAppData() || [];
+            var updatedApp = updatedApps.find(function(a) { return a.name === ${JSON.stringify(appName)}; });
+            return JSON.stringify({ success: true, action: action, appName: ${JSON.stringify(appName)}, newStatus: updatedApp ? updatedApp.status : 'UNKNOWN' });
+          } catch (e) {
+            return JSON.stringify({ success: false, error: e.message || String(e) });
+          }
+        })()`;
+
+        const value = await evaluateJs(session, actionCode);
+        return {
+          content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
         };
       }
 

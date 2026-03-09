@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { getRelayPort, getRelayToken, log, error, sleep, VERSION, } from './utils.js';
 let relayServerProcess = null;
 let cdpSession = null;
+let sessionPromise = null;
 async function ensureRelayServer() {
     try {
         const response = await fetch(`http://localhost:${getRelayPort()}/version`, {
@@ -98,6 +99,23 @@ function connectCdp(sessionId) {
                 nextId: 1,
                 pendingRequests: new Map(),
             };
+            // Heartbeat: detect silent disconnects
+            let pongReceived = true;
+            const heartbeat = setInterval(() => {
+                if (!pongReceived) {
+                    log('CDP heartbeat timeout, closing connection');
+                    clearInterval(heartbeat);
+                    ws.terminate();
+                    return;
+                }
+                pongReceived = false;
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.ping();
+                }
+            }, 30000);
+            ws.on('pong', () => {
+                pongReceived = true;
+            });
             ws.on('message', (data) => {
                 try {
                     const msg = JSON.parse(data.toString());
@@ -120,6 +138,7 @@ function connectCdp(sessionId) {
                 }
             });
             ws.on('close', () => {
+                clearInterval(heartbeat);
                 for (const pending of session.pendingRequests.values()) {
                     clearTimeout(pending.timer);
                     pending.reject(new Error('CDP connection closed'));
@@ -166,6 +185,19 @@ async function ensureSession() {
     if (cdpSession?.ws.readyState === WebSocket.OPEN) {
         return cdpSession;
     }
+    // Mutex: if another call is already establishing a session, piggyback on it
+    if (sessionPromise) {
+        return sessionPromise;
+    }
+    sessionPromise = doEnsureSession();
+    try {
+        return await sessionPromise;
+    }
+    finally {
+        sessionPromise = null;
+    }
+}
+async function doEnsureSession() {
     cdpSession = null;
     await ensureRelayServer();
     let targets = await getTargets();
@@ -186,6 +218,17 @@ async function ensureSession() {
     log('CDP session established');
     return cdpSession;
 }
+const SLOW_CDP_COMMANDS = new Set([
+    'Accessibility.getFullAXTree',
+    'Page.captureScreenshot',
+    'Network.clearBrowserCache',
+    'Network.clearBrowserCookies',
+    'Page.reload',
+    'Page.navigate',
+]);
+function getCommandTimeout(method) {
+    return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
+}
 async function evaluateJs(session, expression) {
     const result = await sendCdpCommand(session, 'Runtime.evaluate', {
         expression,
@@ -196,6 +239,49 @@ async function evaluateJs(session, expression) {
         throw new Error(`JS error: ${result.exceptionDetails.text}`);
     }
     return result.result?.value;
+}
+function formatAXTreeAsText(nodes) {
+    const nodeMap = new Map();
+    for (const node of nodes) {
+        nodeMap.set(node.nodeId, node);
+    }
+    const lines = [];
+    function walk(nodeId, depth) {
+        const node = nodeMap.get(nodeId);
+        if (!node)
+            return;
+        if (node.ignored) {
+            for (const childId of node.childIds ?? []) {
+                walk(childId, depth);
+            }
+            return;
+        }
+        const role = node.role?.value ?? '';
+        const name = node.name?.value ?? '';
+        const props = [];
+        for (const prop of node.properties ?? []) {
+            const v = prop.value?.value;
+            if (v === undefined || v === false || v === '')
+                continue;
+            if (prop.name === 'focusable')
+                continue;
+            props.push(`${prop.name}=${typeof v === 'string' ? v : JSON.stringify(v)}`);
+        }
+        const indent = '  '.repeat(depth);
+        const nameStr = name ? ` "${name}"` : '';
+        const propsStr = props.length > 0 ? ` [${props.join(', ')}]` : '';
+        if (role || name) {
+            lines.push(`${indent}${role}${nameStr}${propsStr}`);
+        }
+        for (const childId of node.childIds ?? []) {
+            walk(childId, depth + 1);
+        }
+    }
+    const rootNode = nodes.find((n) => !n.parentId);
+    if (rootNode) {
+        walk(rootNode.nodeId, 0);
+    }
+    return lines.join('\n') || '(empty accessibility tree)';
 }
 const server = new Server({
     name: 'spawriter',
@@ -260,6 +346,31 @@ const tools = [
             required: ['url'],
         },
     },
+    {
+        name: 'override_app',
+        description: 'Manage import-map-overrides for single-spa apps: set a localhost override, remove it, toggle enable/disable, or reset all overrides',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                action: { type: 'string', enum: ['set', 'remove', 'enable', 'disable', 'reset_all'], description: 'Action to perform on the override' },
+                appName: { type: 'string', description: 'Module specifier (e.g. @cnic/main). Required for set/remove/enable/disable.' },
+                url: { type: 'string', description: 'Override URL (e.g. http://localhost:9100/app.js). Required for "set" action.' },
+            },
+            required: ['action'],
+        },
+    },
+    {
+        name: 'app_action',
+        description: 'Control single-spa application lifecycle: mount, unmount, or unload an app. After the action, triggers reroute to apply changes.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                action: { type: 'string', enum: ['mount', 'unmount', 'unload'], description: 'Lifecycle action to perform' },
+                appName: { type: 'string', description: 'Application name (e.g. @cnic/main)' },
+            },
+            required: ['action', 'appName'],
+        },
+    },
 ];
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return { tools };
@@ -277,16 +388,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const session = await ensureSession();
         switch (name) {
             case 'screenshot': {
-                const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' });
+                const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot'));
                 return {
                     content: [{ type: 'image', data: result.data, mimeType: 'image/png' }],
                 };
             }
             case 'accessibility_snapshot': {
-                await sendCdpCommand(session, 'Accessibility.enable');
-                const snapshot = await sendCdpCommand(session, 'Accessibility.getFullAXTree');
+                await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
+                const snapshot = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree'));
+                const text = formatAXTreeAsText(snapshot.nodes ?? []);
                 return {
-                    content: [{ type: 'text', text: JSON.stringify(snapshot, null, 2) }],
+                    content: [{ type: 'text', text }],
                 };
             }
             case 'execute': {
@@ -306,11 +418,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           var exposedMethods = devtools && devtools.exposedMethods;
           var hasSingleSpaDevtools = !!(exposedMethods && typeof exposedMethods.getRawAppData === 'function');
           var rawApps = hasSingleSpaDevtools ? (exposedMethods.getRawAppData() || []) : [];
+          var imo = window.importMapOverrides;
+          var overrideMap = imo && typeof imo.getOverrideMap === 'function' ? imo.getOverrideMap() : null;
+          var overrides = overrideMap && overrideMap.imports ? overrideMap.imports : {};
           var apps = Array.isArray(rawApps) ? rawApps.map(function(app) {
             var ad = app.devtools || {};
-            return { name: app.name || '', status: app.status || 'UNKNOWN', activeWhenForced: ad.activeWhenForced || null, hasOverlays: !!ad.overlays };
+            var name = app.name || '';
+            var overrideUrl = overrides[name] || null;
+            return { name: name, status: app.status || 'UNKNOWN', overrideUrl: overrideUrl, activeWhenForced: ad.activeWhenForced || null, hasOverlays: !!ad.overlays };
           }) : [];
-          return JSON.stringify({ pageUrl: location.href, hasSingleSpaDevtools: hasSingleSpaDevtools, appCount: apps.length, apps: apps });
+          var activeOverrides = {};
+          for (var key in overrides) { activeOverrides[key] = overrides[key]; }
+          return JSON.stringify({
+            pageUrl: location.href,
+            hasSingleSpaDevtools: hasSingleSpaDevtools,
+            hasImportMapOverrides: !!imo,
+            appCount: apps.length,
+            activeOverrides: activeOverrides,
+            apps: apps
+          });
         })(${targetAppName})`;
                 const value = await evaluateJs(session, dashboardCode);
                 return {
@@ -320,27 +446,130 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             case 'clear_cache_and_reload': {
                 const mode = args.mode || 'light';
                 if (mode === 'aggressive') {
-                    await sendCdpCommand(session, 'Network.clearBrowserCache');
-                    await sendCdpCommand(session, 'Network.clearBrowserCookies');
+                    await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
+                    await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
                 }
-                await sendCdpCommand(session, 'Page.reload', { ignoreCache: true });
+                await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
                 await sleep(2000);
                 return {
                     content: [{ type: 'text', text: `Cache cleared with mode: ${mode}` }],
                 };
             }
             case 'ensure_fresh_render': {
-                await sendCdpCommand(session, 'Page.reload', { ignoreCache: true });
+                await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
                 await sleep(2000);
                 return {
                     content: [{ type: 'text', text: 'Page reloaded with fresh cache' }],
                 };
             }
             case 'navigate': {
-                await sendCdpCommand(session, 'Page.navigate', { url: args.url });
+                await sendCdpCommand(session, 'Page.navigate', { url: args.url }, getCommandTimeout('Page.navigate'));
                 await sleep(2000);
                 return {
                     content: [{ type: 'text', text: `Navigated to ${args.url}` }],
+                };
+            }
+            case 'override_app': {
+                const action = args.action;
+                const appName = args.appName;
+                const overrideUrl = args.url;
+                let code;
+                switch (action) {
+                    case 'set':
+                        if (!appName || !overrideUrl) {
+                            return { content: [{ type: 'text', text: 'Error: "set" requires both appName and url' }] };
+                        }
+                        code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.addOverride(${JSON.stringify(appName)}, ${JSON.stringify(overrideUrl)});
+              return JSON.stringify({ success: true, action: 'set', appName: ${JSON.stringify(appName)}, url: ${JSON.stringify(overrideUrl)} });
+            })()`;
+                        break;
+                    case 'remove':
+                        if (!appName) {
+                            return { content: [{ type: 'text', text: 'Error: "remove" requires appName' }] };
+                        }
+                        code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.removeOverride(${JSON.stringify(appName)});
+              return JSON.stringify({ success: true, action: 'remove', appName: ${JSON.stringify(appName)} });
+            })()`;
+                        break;
+                    case 'enable':
+                        if (!appName) {
+                            return { content: [{ type: 'text', text: 'Error: "enable" requires appName' }] };
+                        }
+                        code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.enableOverride(${JSON.stringify(appName)});
+              return JSON.stringify({ success: true, action: 'enable', appName: ${JSON.stringify(appName)} });
+            })()`;
+                        break;
+                    case 'disable':
+                        if (!appName) {
+                            return { content: [{ type: 'text', text: 'Error: "disable" requires appName' }] };
+                        }
+                        code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.disableOverride(${JSON.stringify(appName)});
+              return JSON.stringify({ success: true, action: 'disable', appName: ${JSON.stringify(appName)} });
+            })()`;
+                        break;
+                    case 'reset_all':
+                        code = `(function() {
+              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
+              window.importMapOverrides.resetOverrides();
+              return JSON.stringify({ success: true, action: 'reset_all' });
+            })()`;
+                        break;
+                    default:
+                        return { content: [{ type: 'text', text: 'Error: unknown action "' + action + '". Use: set, remove, enable, disable, reset_all' }] };
+                }
+                const value = await evaluateJs(session, code);
+                return {
+                    content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+                };
+            }
+            case 'app_action': {
+                const action = args.action;
+                const appName = args.appName;
+                const actionCode = `(async function() {
+          var singleSpa = window.__SINGLE_SPA_DEVTOOLS__;
+          var exposedMethods = singleSpa && singleSpa.exposedMethods;
+          if (!exposedMethods) return JSON.stringify({ success: false, error: 'single-spa devtools not available' });
+
+          var rawApps = exposedMethods.getRawAppData() || [];
+          var app = rawApps.find(function(a) { return a.name === ${JSON.stringify(appName)}; });
+          if (!app) return JSON.stringify({ success: false, error: 'App not found: ${appName.replace(/'/g, "\\'")}' });
+
+          var action = ${JSON.stringify(action)};
+          try {
+            if (action === 'mount') {
+              if (typeof app.devtools?.activeWhenForced === 'function') {
+                app.devtools.activeWhenForced(true);
+              }
+              await exposedMethods.reroute();
+            } else if (action === 'unmount') {
+              if (typeof app.devtools?.activeWhenForced === 'function') {
+                app.devtools.activeWhenForced(false);
+              }
+              await exposedMethods.reroute();
+            } else if (action === 'unload') {
+              if (typeof exposedMethods.toLoadPromise === 'function') {
+                await exposedMethods.unregisterApplication(${JSON.stringify(appName)});
+              }
+              await exposedMethods.reroute();
+            }
+            var updatedApps = exposedMethods.getRawAppData() || [];
+            var updatedApp = updatedApps.find(function(a) { return a.name === ${JSON.stringify(appName)}; });
+            return JSON.stringify({ success: true, action: action, appName: ${JSON.stringify(appName)}, newStatus: updatedApp ? updatedApp.status : 'UNKNOWN' });
+          } catch (e) {
+            return JSON.stringify({ success: false, error: e.message || String(e) });
+          }
+        })()`;
+                const value = await evaluateJs(session, actionCode);
+                return {
+                    content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
                 };
             }
             default:

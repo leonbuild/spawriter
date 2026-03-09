@@ -185,6 +185,7 @@ function sendCdpResponse(clientId, payload) {
 function sendCdpError(clientId, payload) {
     sendToCDPClient(clientId, { id: payload.id, sessionId: payload.sessionId, error: { message: payload.error } });
 }
+const RELAY_REQUEST_TIMEOUT_MS = 90000;
 function addPendingRequest(relayId, pending) {
     const timeoutId = setTimeout(() => {
         const timeoutPending = pendingRequests.get(relayId);
@@ -197,7 +198,7 @@ function addPendingRequest(relayId, pending) {
             sessionId: timeoutPending.sessionId,
             error: 'Extension request timeout',
         });
-    }, 30000);
+    }, RELAY_REQUEST_TIMEOUT_MS);
     pendingRequests.set(relayId, {
         ...pending,
         timeoutId,

@@ -305,7 +305,7 @@ import browser from "webextension-polyfill";
       };
     });
 
-    ws.onmessage = async (event) => {
+    ws.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
 
@@ -315,7 +315,21 @@ import browser from "webextension-polyfill";
         }
 
         if (message.method === "forwardCDPCommand") {
-          await handleCDPCommand(message);
+          // Fire-and-forget: allow concurrent CDP commands instead of
+          // serializing through await, which caused head-of-line blocking
+          // when slow commands (e.g. Accessibility.getFullAXTree) blocked
+          // faster ones (e.g. Runtime.evaluate).
+          handleCDPCommand(message).catch((e) => {
+            error("Unhandled error in CDP command:", e);
+            sendMessage({ id: message.id, error: e.message || String(e) });
+          });
+          return;
+        }
+
+        if (message.method === "connectActiveTab") {
+          handleRelayMessage(message)
+            .then((result) => sendMessage({ id: message.id, ...result }))
+            .catch((e) => sendMessage({ id: message.id, success: false, error: e.message }));
           return;
         }
 

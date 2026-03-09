@@ -698,6 +698,44 @@ export default function useImportMapOverrides() {
 
   // ========== 初始化 ==========
 
+  // Import any page-level overrides that exist but aren't in savedOverrides.
+  // This handles the case where the extension was reinstalled (clearing browser.storage.local)
+  // but the page still has active overrides in localStorage.
+  async function importPageOverridesIfNeeded(saved) {
+    try {
+      const pageMap = await getCurrentOverrideMap();
+      if (!pageMap) return saved;
+
+      const pageKeys = Object.keys(pageMap);
+      if (pageKeys.length === 0) return saved;
+
+      const effectiveSaved = saved || {};
+      let hasNewOverrides = false;
+      const merged = { ...effectiveSaved };
+
+      for (const appName of pageKeys) {
+        const pageUrl = pageMap[appName];
+        if (pageUrl && !effectiveSaved[appName]) {
+          merged[appName] = { url: pageUrl, enabled: true };
+          hasNewOverrides = true;
+          console.debug(`[spawriter] Imported existing page override: ${appName} -> ${pageUrl}`);
+        }
+      }
+
+      if (hasNewOverrides) {
+        await browser.storage.local.set({ savedOverrides: merged });
+        setSavedOverrides(merged);
+        console.debug("[spawriter] Synced page overrides into savedOverrides on init");
+        return merged;
+      }
+
+      return saved;
+    } catch (err) {
+      console.warn("[spawriter] Error importing page overrides:", err);
+      return saved;
+    }
+  }
+
   // 初始化时加载 importMapOverrides 和已保存的配置
   useEffect(() => {
     async function initImportMapsOverrides() {
@@ -705,7 +743,9 @@ export default function useImportMapOverrides() {
       if (hasImportMapsEnabled) {
         setImportMapEnabled(hasImportMapsEnabled);
         await getImportMapOverrides();
-        const saved = await loadSavedOverrides();
+        let saved = await loadSavedOverrides();
+        // Sync page-level overrides into savedOverrides (handles fresh extension install)
+        saved = await importPageOverridesIfNeeded(saved);
         await ensureSavedOverridesApplied("init", saved);
       }
     }
@@ -733,6 +773,68 @@ export default function useImportMapOverrides() {
     // 监听从 background script 通过 port 转发的事件
     window.addEventListener("ext-content-script", handler);
     return () => window.removeEventListener("ext-content-script", handler);
+  }, [importMapsEnabled, savedOverrides]);
+
+  // Detect external override changes (e.g. from MCP tools) and sync savedOverrides.
+  // Polls the page's importMapOverrides.getOverrideMap() and compares with savedOverrides.
+  useEffect(() => {
+    if (!importMapsEnabled) return;
+
+    let cancelled = false;
+    const POLL_INTERVAL_MS = 3000;
+
+    async function detectExternalChanges() {
+      if (cancelled) return;
+      try {
+        const pageMap = await getCurrentOverrideMap();
+        if (cancelled || pageMap === null) return;
+
+        const pageKeys = new Set(Object.keys(pageMap));
+        const savedKeys = new Set(Object.keys(savedOverrides));
+
+        let hasChanges = false;
+        const newSavedOverrides = { ...savedOverrides };
+
+        // Detect new overrides added externally (e.g. by MCP)
+        for (const appName of pageKeys) {
+          const pageUrl = pageMap[appName];
+          const saved = savedOverrides[appName];
+          if (!saved || saved.url !== pageUrl) {
+            newSavedOverrides[appName] = { url: pageUrl, enabled: true };
+            hasChanges = true;
+          } else if (saved && !saved.enabled && pageUrl) {
+            newSavedOverrides[appName] = { ...saved, enabled: true };
+            hasChanges = true;
+          }
+        }
+
+        // Detect overrides removed externally
+        for (const appName of savedKeys) {
+          if (savedOverrides[appName]?.enabled && !pageKeys.has(appName)) {
+            newSavedOverrides[appName] = { ...savedOverrides[appName], enabled: false };
+            hasChanges = true;
+          }
+        }
+
+        if (hasChanges && !cancelled) {
+          console.debug("[spawriter] External override change detected, syncing savedOverrides");
+          await browser.storage.local.set({ savedOverrides: newSavedOverrides });
+          setSavedOverrides(newSavedOverrides);
+        }
+      } catch (err) {
+        if (!isRecoverableProtocolError(err)) {
+          console.debug("[spawriter] External change detection error:", err?.message || err);
+        }
+      }
+    }
+
+    const timerId = setInterval(detectExternalChanges, POLL_INTERVAL_MS);
+    detectExternalChanges();
+
+    return () => {
+      cancelled = true;
+      clearInterval(timerId);
+    };
   }, [importMapsEnabled, savedOverrides]);
 
   // ========== 原有方法 ==========

@@ -261,6 +261,8 @@ function sendCdpError(clientId: string, payload: { id: number; sessionId?: strin
   sendToCDPClient(clientId, { id: payload.id, sessionId: payload.sessionId, error: { message: payload.error } });
 }
 
+const RELAY_REQUEST_TIMEOUT_MS = 90000;
+
 function addPendingRequest(
   relayId: number,
   pending: Omit<PendingRequest, 'timeoutId'>
@@ -276,7 +278,7 @@ function addPendingRequest(
       sessionId: timeoutPending.sessionId,
       error: 'Extension request timeout',
     });
-  }, 30000);
+  }, RELAY_REQUEST_TIMEOUT_MS);
 
   pendingRequests.set(relayId, {
     ...pending,

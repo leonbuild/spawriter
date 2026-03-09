@@ -1,25 +1,24 @@
 ---
-description: spawriter - AI-assisted browser automation for single-spa projects
+description: spawriter - AI-assisted browser automation & debugging for single-spa micro-frontend projects
 globs: "**"
 alwaysApply: false
 ---
 
-# spawriter
+# spawriter MCP Tools
 
-You have access to MCP tools from `spawriter` that control the user's real
-Chrome tab (not a headless browser).
+You have access to **spawriter** MCP tools that control the user's real Chrome tab via CDP (Chrome DevTools Protocol). This is NOT a headless browser — all actions affect the user's visible browser.
 
 ## Prerequisites
 
-Before using MCP tools, ensure:
+Before using any MCP tool:
 
-1. The browser extension is installed and at least one tab is attached (green badge visible on the toolbar).
-2. The MCP server `spawriter` is registered in Cursor's MCP config and running.
+1. The **spawriter browser extension** must be installed and connected (green badge on toolbar).
+2. The MCP server `spawriter` must be registered and running in Cursor.
+3. At least one Chrome tab must be attached for CDP communication.
 
-If tools like `screenshot` or `dashboard_state` are not available, the MCP server may not be running.
-Ask the user to verify at least one tab is attached (green badge) and the MCP server is active.
+If tools return errors or are unavailable, ask the user to verify the extension connection (green badge) and MCP server status.
 
-## Cursor MCP configuration
+## MCP Configuration
 
 Add to `.cursor/mcp.json` or `~/.cursor/mcp.json`:
 
@@ -28,37 +27,160 @@ Add to `.cursor/mcp.json` or `~/.cursor/mcp.json`:
   "mcpServers": {
     "spawriter": {
       "command": "node",
-      "args": ["<path-to>/mcp/dist/cli.js", "serve"]
+      "args": ["<path-to-spawriter>/mcp/dist/cli.js", "serve"]
     }
   }
 }
 ```
 
-Relay port: `19989` (independent from playwriter's `19988`).
+Relay port: `19989`.
 
-## Available MCP tools
+---
 
-- `dashboard_state` - read single-spa app states, override status, localhost override detection
-- `screenshot` - capture current Chrome tab rendering (including import-map-overrides)
-- `execute` - run JavaScript in the real page context
-- `accessibility_snapshot` - get accessibility tree
-- `navigate` - navigate to URL
-- `ensure_fresh_render` - clear cache and reload if state looks stale
-- `clear_cache_and_reload` - explicit cache reset
-- `reset` - reset CDP/session connection
+## Available Tools (10)
 
-## Recommended workflow
+### Inspection & State
 
-1. `dashboard_state` first - check override status and app state.
-2. `screenshot` - confirm visible UI matches expected state.
-3. `execute` - small runtime checks (URL, selector existence, values).
-4. If state looks stale after code changes, call `ensure_fresh_render`.
-5. `clear_cache_and_reload` only when explicit cache reset is needed.
-6. `reset` if CDP/session is unstable.
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `dashboard_state` | Get single-spa app list, statuses, active import-map-overrides, and per-app override URLs | `appName?` (optional filter) |
+| `screenshot` | Capture the current visible page as an image | — |
+| `accessibility_snapshot` | Get condensed accessibility tree (text format) | — |
+| `execute` | Run arbitrary JavaScript in the page context and return result | `code` (string) |
 
-## Safety rules
+### Navigation & Refresh
 
-- Only operate on normal web pages; avoid `chrome://`, `edge://`, extension pages.
-- Verify single-spa state via runtime checks, not static HTML.
-- Keep operations incremental; screenshot between major actions.
-- Do not assume code changes are active until `dashboard_state` confirms localhost override is effective.
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `navigate` | Navigate the attached tab to a URL | `url` |
+| `ensure_fresh_render` | Reload page with fresh cache | — |
+| `clear_cache_and_reload` | Explicit cache reset + reload | `mode`: `"light"` or `"aggressive"` |
+
+### Import-Map Override Management
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `override_app` | Manage import-map-overrides | `action`: `set` / `remove` / `enable` / `disable` / `reset_all`; `appName`; `url` (for set) |
+
+### App Lifecycle Control
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `app_action` | Control single-spa app lifecycle | `action`: `mount` / `unmount` / `unload`; `appName` |
+
+### Connection
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `reset` | Reset CDP connection (use when session is unstable) | — |
+
+---
+
+## Recommended Workflow
+
+### 1. Understand current state first
+
+```
+dashboard_state  →  see all apps, their statuses, active overrides
+screenshot       →  confirm the visible UI
+```
+
+### 2. Set up overrides for local development
+
+```
+override_app { action: "set", appName: "@cnic/main", url: "http://localhost:9100/app.js" }
+```
+
+After setting an override, the extension panel will auto-sync within ~3 seconds.
+
+### 3. Verify changes are effective
+
+```
+dashboard_state  →  confirm overrideUrl shows your localhost URL
+screenshot       →  confirm the UI reflects your local code
+```
+
+### 4. Make code changes, then verify
+
+```
+ensure_fresh_render  →  reload with fresh cache after code changes
+dashboard_state      →  re-confirm state
+screenshot           →  visual check
+```
+
+### 5. Cleanup when done
+
+```
+override_app { action: "remove", appName: "@cnic/main" }
+   — or —
+override_app { action: "reset_all" }    ← removes ALL overrides at once
+```
+
+---
+
+## Journal Project App Registry
+
+This project uses a single-spa micro-frontend architecture with these registered apps:
+
+| App Name (single-spa) | Package Name | Dev Port | Entry | Route |
+|------------------------|-------------|----------|-------|-------|
+| `@cnic/main` | `@cnic/main` | 9100 | `http://localhost:9100/app.js` | `/j` (always active) |
+| `@journal/submit` | `@journal/submit` | 9110 | `http://localhost:9110/app.js` | `/j/:id/my/submit` |
+| `@journal/review` | `@journal/review` | 9120 | `http://localhost:9120/app.js` | `/j/:id/my/review` & `/j/:id/quick-review` |
+| `@journal/edit` | `@journal/edit` | 9130 | `http://localhost:9130/app.js` | `/j/:id/my/edit` |
+| `@journal/publish` | `@journal/publish` | 9140 | `http://localhost:9140/app.js` | `/j/:id/my/publish` |
+| `@journal/manage` | `@journal/manage` | 9150 | `http://localhost:9150/app.js` | `/j/:id/my/manage` |
+| `@cnic/root-config` | `@cnic/root-config` | 9000 | `http://localhost:9000/cnic-root-config.js` | (root) |
+
+**Note:** The root-config's local import map uses `@cnic/*` aliases for some apps (e.g., `@cnic/submit` maps to port 9110). When setting overrides, use the **single-spa app name** from the layout definition (`@journal/*` for child apps, `@cnic/main` for the main app).
+
+### Override example for developing @journal/edit locally:
+
+```
+override_app { action: "set", appName: "@journal/edit", url: "http://localhost:9130/app.js" }
+```
+
+---
+
+## override_app Actions Reference
+
+| Action | Required Args | What It Does |
+|--------|--------------|--------------|
+| `set` | `appName`, `url` | Add or update an import-map override (sets localStorage, syncs to panel) |
+| `remove` | `appName` | Remove the override from localStorage (panel keeps URL for re-enable) |
+| `enable` | `appName` | Re-enable a previously disabled override |
+| `disable` | `appName` | Disable an override without removing its URL |
+| `reset_all` | — | Clear ALL overrides at once |
+
+After any override change, the extension DevTools panel auto-detects and syncs within ~3 seconds.
+
+## app_action Lifecycle Reference
+
+| Action | What It Does |
+|--------|--------------|
+| `mount` | Force-mount an app (calls `activeWhenForced(true)` + `reroute()`) |
+| `unmount` | Force-unmount an app (calls `activeWhenForced(false)` + `reroute()`) |
+| `unload` | Unregister and unload an app completely |
+
+---
+
+## Safety Rules
+
+1. **Only operate on normal web pages** — never target `chrome://`, `edge://`, or extension pages.
+2. **Verify state via runtime checks** — use `dashboard_state` and `execute`, not static HTML assumptions.
+3. **Screenshot between major actions** — maintain visual awareness of what the user sees.
+4. **Don't assume code changes are live** — always confirm via `dashboard_state` that the override is effective.
+5. **Use incremental operations** — prefer targeted `override_app` over broad `reset_all`.
+6. **Handle page reloads gracefully** — after `clear_cache_and_reload` or `ensure_fresh_render`, wait before querying state.
+7. **Parallel calls are safe** — `dashboard_state` + `screenshot` can run concurrently without timeout issues.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Tool timeout | Call `reset` to re-establish CDP session |
+| Override not reflected | Use `ensure_fresh_render` or `clear_cache_and_reload { mode: "aggressive" }` |
+| Panel not syncing | Extension detects changes via 3s polling; wait a few seconds or refresh the panel |
+| App not mounting after override | Navigate to the app's route first (e.g., `/j/:journalId/my/edit`) then check status |
+| `importMapOverrides not available` | Page may not have loaded yet; wait and retry |
+| Stale cached bundle | `clear_cache_and_reload { mode: "aggressive" }` clears service workers too |
