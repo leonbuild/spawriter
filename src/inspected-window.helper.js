@@ -58,7 +58,7 @@ export async function evalCmd(commandString, options = {}) {
           // 如果还有重试次数，等待后重试
           if (attempt < retries) {
             console.debug(
-              `[single-spa-inspector-pro-mcp] Recoverable error on attempt ${attempt + 1}, retrying in ${retryDelay}ms... Code: ${errorInfo.code}, Details: ${JSON.stringify(errorInfo.details)}`
+              `[spawriter] Recoverable error on attempt ${attempt + 1}, retrying in ${retryDelay}ms... Code: ${errorInfo.code}, Details: ${JSON.stringify(errorInfo.details)}`
             );
             await delay(retryDelay);
             continue;
@@ -88,7 +88,7 @@ export async function evalCmd(commandString, options = {}) {
       // 其他未预期的错误，如果还有重试次数，尝试重试
       if (attempt < retries) {
         console.debug(
-          `[single-spa-inspector-pro-mcp] Unexpected error on attempt ${attempt + 1}, retrying... Error: ${err.message || err}`
+          `[spawriter] Unexpected error on attempt ${attempt + 1}, retrying... Error: ${err.message || err}`
         );
         await delay(retryDelay);
         continue;

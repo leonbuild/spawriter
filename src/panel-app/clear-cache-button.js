@@ -54,7 +54,7 @@ const ClearCacheButton = React.forwardRef(({ sharedState, setSharedState }, ref)
     } catch (error) {
       // Silently handle extension context invalidation
       if (error.message && error.message.includes("Extension context invalidated")) {
-        console.debug("[single-spa-inspector-pro-mcp] Service worker terminated during clear cache");
+        console.debug("[spawriter] Service worker terminated during clear cache");
         setStatus("error");
       } else {
         setStatus("error");

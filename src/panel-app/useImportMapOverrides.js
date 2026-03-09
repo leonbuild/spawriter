@@ -18,7 +18,7 @@ async function reloadWithBypassCache() {
   } catch (err) {
     // Silently handle extension context invalidation
     if (err.message && err.message.includes("Extension context invalidated")) {
-      console.debug("[single-spa-inspector-pro-mcp] Service worker terminated during reload, this is expected");
+      console.debug("[spawriter] Service worker terminated during reload, this is expected");
       return;
     }
     throw err;
@@ -50,7 +50,7 @@ async function waitForPageLoad(maxWaitMs = 30000) {
         
         // 超时检查
         if (Date.now() - startTime > maxWaitMs) {
-          console.warn("[single-spa-inspector-pro-mcp] Page load timeout, proceeding anyway");
+          console.warn("[spawriter] Page load timeout, proceeding anyway");
           resolve(false);
           return;
         }
@@ -60,11 +60,11 @@ async function waitForPageLoad(maxWaitMs = 30000) {
       } catch (err) {
         // Silently handle extension context invalidation
         if (err.message && err.message.includes("Extension context invalidated")) {
-          console.debug("[single-spa-inspector-pro-mcp] Service worker terminated during status check");
+          console.debug("[spawriter] Service worker terminated during status check");
           resolve(false);
           return;
         }
-        console.warn("[single-spa-inspector-pro-mcp] Error checking tab status:", err);
+        console.warn("[spawriter] Error checking tab status:", err);
         resolve(false);
       }
     };
@@ -90,7 +90,7 @@ async function ensureImportMapOverridesReady(maxWaitMs = 5000) {
     } catch (err) {
       // 对于协议错误交由上层处理；这里仅作为存在性检查
       if (!isRecoverableProtocolError(err)) {
-        console.debug("[single-spa-inspector-pro-mcp] ensureImportMapOverridesReady non-recoverable:", err?.message || err);
+        console.debug("[spawriter] ensureImportMapOverridesReady non-recoverable:", err?.message || err);
       }
     }
     await delay(200);
@@ -141,7 +141,7 @@ export default function useImportMapOverrides() {
       })()`);
       return result;
     } catch (err) {
-      console.warn("[single-spa-inspector-pro-mcp] Error getting page override state:", err);
+      console.warn("[spawriter] Error getting page override state:", err);
       return null;
     }
   }
@@ -156,7 +156,7 @@ export default function useImportMapOverrides() {
       })()`);
       return result;
     } catch (err) {
-      console.warn("[single-spa-inspector-pro-mcp] Error getting current override map:", err);
+      console.warn("[spawriter] Error getting current override map:", err);
       return null;
     }
   }
@@ -171,7 +171,7 @@ export default function useImportMapOverrides() {
       return;
     }
     if (isApplyingSavedRef.current) {
-      console.debug("[single-spa-inspector-pro-mcp] Skipping ensureSavedOverridesApplied - already running");
+      console.debug("[spawriter] Skipping ensureSavedOverridesApplied - already running");
       return;
     }
 
@@ -182,14 +182,14 @@ export default function useImportMapOverrides() {
 
       const ready = await ensureImportMapOverridesReady();
       if (!ready) {
-        console.debug("[single-spa-inspector-pro-mcp] importMapOverrides not ready, schedule retry ensureSavedOverridesApplied");
+        console.debug("[spawriter] importMapOverrides not ready, schedule retry ensureSavedOverridesApplied");
         needsRetry = true;
         return;
       }
 
       const pageMap = await getCurrentOverrideMap();
       if (pageMap === null) {
-        console.debug("[single-spa-inspector-pro-mcp] importMapOverrides not ready, skip ensure step");
+        console.debug("[spawriter] importMapOverrides not ready, skip ensure step");
         needsRetry = true;
         return;
       }
@@ -204,14 +204,14 @@ export default function useImportMapOverrides() {
 
         if (expectedEnabled) {
           if (pageUrl !== expectedUrl) {
-            console.debug(`[single-spa-inspector-pro-mcp] Applying saved override for ${appName} (reason=${reason})`);
+            console.debug(`[spawriter] Applying saved override for ${appName} (reason=${reason})`);
             const ok = await addOverride(appName, expectedUrl);
             changed = changed || ok;
             if (!ok) needsRetry = true;
           }
         } else {
           if (pageUrl) {
-            console.debug(`[single-spa-inspector-pro-mcp] Removing stale override for ${appName} (reason=${reason})`);
+            console.debug(`[spawriter] Removing stale override for ${appName} (reason=${reason})`);
             const ok = await removeOverride(appName);
             changed = changed || ok;
             if (!ok) needsRetry = true;
@@ -222,7 +222,7 @@ export default function useImportMapOverrides() {
       // 如果页面上有额外的 override 但未在 savedOverrides 中，也移除以保持一致
       for (const pageAppName of Object.keys(pageMap)) {
         if (!effectiveOverrides[pageAppName]) {
-          console.debug(`[single-spa-inspector-pro-mcp] Removing extra override ${pageAppName} not in savedOverrides (reason=${reason})`);
+          console.debug(`[spawriter] Removing extra override ${pageAppName} not in savedOverrides (reason=${reason})`);
           const ok = await removeOverride(pageAppName);
           changed = changed || ok;
           if (!ok) needsRetry = true;
@@ -233,7 +233,7 @@ export default function useImportMapOverrides() {
         await reloadWithBypassCache();
       }
     } catch (err) {
-      console.warn("[single-spa-inspector-pro-mcp] Error ensuring saved overrides applied:", err);
+      console.warn("[spawriter] Error ensuring saved overrides applied:", err);
     } finally {
       isApplyingSavedRef.current = false;
     }
@@ -250,13 +250,13 @@ export default function useImportMapOverrides() {
   async function verifyAndSyncState(appName, expectedEnabled, expectedUrl, operationVersion) {
     // 如果不是最新操作，跳过验证
     if (operationVersion !== currentOperationRef.current) {
-      console.debug(`[single-spa-inspector-pro-mcp] Skipping verification for outdated operation (v${operationVersion}, current: v${currentOperationRef.current})`);
+      console.debug(`[spawriter] Skipping verification for outdated operation (v${operationVersion}, current: v${currentOperationRef.current})`);
       return;
     }
 
     // 避免验证时的无限循环
     if (isVerifyingRef.current) {
-      console.debug("[single-spa-inspector-pro-mcp] Skipping verification - already verifying");
+      console.debug("[spawriter] Skipping verification - already verifying");
       return;
     }
 
@@ -268,7 +268,7 @@ export default function useImportMapOverrides() {
       
       // 再次检查是否仍是最新操作
       if (operationVersion !== currentOperationRef.current) {
-        console.debug(`[single-spa-inspector-pro-mcp] Operation outdated after page load (v${operationVersion}, current: v${currentOperationRef.current})`);
+        console.debug(`[spawriter] Operation outdated after page load (v${operationVersion}, current: v${currentOperationRef.current})`);
         return;
       }
 
@@ -282,7 +282,7 @@ export default function useImportMapOverrides() {
       const pageHasOverride = !!pageOverrideUrl;
       const shouldHaveOverride = expectedEnabled && !!expectedUrl;
 
-      console.debug(`[single-spa-inspector-pro-mcp] Verifying state for ${appName}:`, {
+      console.debug(`[spawriter] Verifying state for ${appName}:`, {
         pageHasOverride,
         pageOverrideUrl,
         shouldHaveOverride,
@@ -293,11 +293,11 @@ export default function useImportMapOverrides() {
 
       // 如果状态不一致，需要修复
       if (pageHasOverride !== shouldHaveOverride) {
-        console.warn(`[single-spa-inspector-pro-mcp] State mismatch detected for ${appName}! Page: ${pageHasOverride}, Expected: ${shouldHaveOverride}. Resyncing...`);
+        console.warn(`[spawriter] State mismatch detected for ${appName}! Page: ${pageHasOverride}, Expected: ${shouldHaveOverride}. Resyncing...`);
         
         // 再次检查是否仍是最新操作
         if (operationVersion !== currentOperationRef.current) {
-          console.debug("[single-spa-inspector-pro-mcp] Operation outdated, skipping resync");
+          console.debug("[spawriter] Operation outdated, skipping resync");
           return;
         }
 
@@ -323,7 +323,7 @@ export default function useImportMapOverrides() {
         // 注意：这里不再递归验证，因为我们已经设置了 isVerifyingRef
       }
     } catch (err) {
-      console.warn("[single-spa-inspector-pro-mcp] Error during state verification:", err);
+      console.warn("[spawriter] Error during state verification:", err);
     } finally {
       isVerifyingRef.current = false;
     }
@@ -341,7 +341,7 @@ export default function useImportMapOverrides() {
     } catch (err) {
       // 对于可恢复的协议错误，不抛出，只记录
       if (isRecoverableProtocolError(err)) {
-        console.debug("[single-spa-inspector-pro-mcp] Recoverable error during checkImportMapOverrides:", err.message);
+        console.debug("[spawriter] Recoverable error during checkImportMapOverrides:", err.message);
         setProtocolError(err);
         return false;
       }
@@ -360,7 +360,7 @@ export default function useImportMapOverrides() {
     } catch (err) {
       // 对于可恢复的协议错误，不抛出，只记录
       if (isRecoverableProtocolError(err)) {
-        console.debug("[single-spa-inspector-pro-mcp] Recoverable error during getImportMapOverrides:", err.message);
+        console.debug("[spawriter] Recoverable error during getImportMapOverrides:", err.message);
         setProtocolError(err);
         return;
       }
@@ -373,7 +373,7 @@ export default function useImportMapOverrides() {
     try {
       const ready = await ensureImportMapOverridesReady();
       if (!ready) {
-        console.warn("[single-spa-inspector-pro-mcp] addOverride skipped because importMapOverrides not ready");
+        console.warn("[spawriter] addOverride skipped because importMapOverrides not ready");
         return false;
       }
       await evalCmd(`(function() {
@@ -382,7 +382,7 @@ export default function useImportMapOverrides() {
       return true;
     } catch (err) {
       if (isMissingImportMapOverrides(err)) {
-        console.warn("[single-spa-inspector-pro-mcp] addOverride failed because importMapOverrides missing (will retry later)");
+        console.warn("[spawriter] addOverride failed because importMapOverrides missing (will retry later)");
         return false;
       }
       err.message = `Error during addOverride. ${err.message}`;
@@ -395,7 +395,7 @@ export default function useImportMapOverrides() {
     try {
       const ready = await ensureImportMapOverridesReady();
       if (!ready) {
-        console.warn("[single-spa-inspector-pro-mcp] removeOverride skipped because importMapOverrides not ready");
+        console.warn("[spawriter] removeOverride skipped because importMapOverrides not ready");
         // Fallback: directly remove from localStorage as backup
         await removeOverrideFromLocalStorage(currentMap);
         return false;
@@ -406,7 +406,7 @@ export default function useImportMapOverrides() {
       return true;
     } catch (err) {
       if (isMissingImportMapOverrides(err)) {
-        console.warn("[single-spa-inspector-pro-mcp] removeOverride failed because importMapOverrides missing (will retry later)");
+        console.warn("[spawriter] removeOverride failed because importMapOverrides missing (will retry later)");
         // Fallback: directly remove from localStorage as backup
         await removeOverrideFromLocalStorage(currentMap);
         return false;
@@ -424,10 +424,10 @@ export default function useImportMapOverrides() {
       await evalCmd(`(function() {
         // import-map-overrides stores overrides with key format: import-map-override:${appName}
         localStorage.removeItem("import-map-override:${appName}");
-        console.debug("[single-spa-inspector-pro-mcp] Directly removed localStorage key: import-map-override:${appName}");
+        console.debug("[spawriter] Directly removed localStorage key: import-map-override:${appName}");
       })()`);
     } catch (err) {
-      console.warn("[single-spa-inspector-pro-mcp] Failed to directly remove from localStorage:", err);
+      console.warn("[spawriter] Failed to directly remove from localStorage:", err);
     }
   }
 
@@ -446,12 +446,12 @@ export default function useImportMapOverrides() {
         }
         keysToRemove.forEach(key => {
           localStorage.removeItem(key);
-          console.debug("[single-spa-inspector-pro-mcp] Directly removed localStorage key:", key);
+          console.debug("[spawriter] Directly removed localStorage key:", key);
         });
-        console.debug("[single-spa-inspector-pro-mcp] Cleared " + keysToRemove.length + " import-map-override entries from localStorage");
+        console.debug("[spawriter] Cleared " + keysToRemove.length + " import-map-override entries from localStorage");
       })()`);
     } catch (err) {
-      console.warn("[single-spa-inspector-pro-mcp] Failed to clear all overrides from localStorage:", err);
+      console.warn("[spawriter] Failed to clear all overrides from localStorage:", err);
     }
   }
 
@@ -494,7 +494,7 @@ export default function useImportMapOverrides() {
       const thisOperationVersion = globalOperationVersion;
       currentOperationRef.current = thisOperationVersion;
       
-      console.debug(`[single-spa-inspector-pro-mcp] Save override for ${appName}: url=${url}, version=${thisOperationVersion}`);
+      console.debug(`[spawriter] Save override for ${appName}: url=${url}, version=${thisOperationVersion}`);
 
       const newSavedOverrides = {
         ...savedOverrides,
@@ -505,7 +505,7 @@ export default function useImportMapOverrides() {
       
       // 检查这是否仍是最新操作
       if (thisOperationVersion !== currentOperationRef.current) {
-        console.debug(`[single-spa-inspector-pro-mcp] Operation ${thisOperationVersion} superseded, skipping page update`);
+        console.debug(`[spawriter] Operation ${thisOperationVersion} superseded, skipping page update`);
         return;
       }
 
@@ -548,7 +548,7 @@ export default function useImportMapOverrides() {
       const thisOperationVersion = globalOperationVersion;
       currentOperationRef.current = thisOperationVersion;
       
-      console.debug(`[single-spa-inspector-pro-mcp] Toggle override for ${appName}: enabled=${enabled}, version=${thisOperationVersion}`);
+      console.debug(`[spawriter] Toggle override for ${appName}: enabled=${enabled}, version=${thisOperationVersion}`);
 
       // 更新 storage 中的 enabled 状态
       const newSavedOverrides = {
@@ -560,7 +560,7 @@ export default function useImportMapOverrides() {
 
       // 检查这是否仍是最新操作
       if (thisOperationVersion !== currentOperationRef.current) {
-        console.debug(`[single-spa-inspector-pro-mcp] Operation ${thisOperationVersion} superseded by ${currentOperationRef.current}, skipping page update`);
+        console.debug(`[spawriter] Operation ${thisOperationVersion} superseded by ${currentOperationRef.current}, skipping page update`);
         return;
       }
 
@@ -582,7 +582,7 @@ export default function useImportMapOverrides() {
 
       // 再次检查是否仍是最新操作
       if (thisOperationVersion !== currentOperationRef.current) {
-        console.debug(`[single-spa-inspector-pro-mcp] Operation ${thisOperationVersion} superseded before reload, skipping`);
+        console.debug(`[spawriter] Operation ${thisOperationVersion} superseded before reload, skipping`);
         return;
       }
 
@@ -608,7 +608,7 @@ export default function useImportMapOverrides() {
     const thisOperationVersion = globalOperationVersion;
     currentOperationRef.current = thisOperationVersion;
     
-    console.debug(`[single-spa-inspector-pro-mcp] Clear override for ${appName}, version=${thisOperationVersion}`);
+    console.debug(`[spawriter] Clear override for ${appName}, version=${thisOperationVersion}`);
 
     try {
       const newSavedOverrides = { ...savedOverrides };
@@ -658,7 +658,7 @@ export default function useImportMapOverrides() {
     const thisOperationVersion = globalOperationVersion;
     currentOperationRef.current = thisOperationVersion;
     
-    console.debug(`[single-spa-inspector-pro-mcp] Clear all overrides, version=${thisOperationVersion}`);
+    console.debug(`[spawriter] Clear all overrides, version=${thisOperationVersion}`);
 
     try {
       // 移除页面上所有的 overrides (通过 importMapOverrides API)

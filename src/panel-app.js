@@ -53,7 +53,7 @@ function PanelRoot(props) {
     } catch (err) {
       // 对于可恢复的协议错误，不抛出，只记录并等待
       if (isRecoverableProtocolError(err)) {
-        console.debug("[single-spa-inspector-pro-mcp] Recoverable error during getApps:", err.message);
+        console.debug("[spawriter] Recoverable error during getApps:", err.message);
         // 可能是页面导航中，设置导航状态
         if (isMountedRef.current) {
           setIsNavigating(true);
@@ -94,11 +94,11 @@ function PanelRoot(props) {
         if (isMountedRef.current && results) {
           setApps(results);
           setIsNavigating(false);
-          console.log(`[single-spa-inspector-pro-mcp] Apps loaded successfully on attempt ${i + 1}`);
+          console.log(`[spawriter] Apps loaded successfully on attempt ${i + 1}`);
           return;
         }
       } catch (err) {
-        console.debug(`[single-spa-inspector-pro-mcp] Attempt ${i + 1}/${maxRetries} failed:`, err.message);
+        console.debug(`[spawriter] Attempt ${i + 1}/${maxRetries} failed:`, err.message);
       }
       
       // 等待一段时间再重试
@@ -110,14 +110,14 @@ function PanelRoot(props) {
     // 所有重试都失败了，清除导航状态让用户可以手动重试
     if (isMountedRef.current) {
       setIsNavigating(false);
-      console.warn("[single-spa-inspector-pro-mcp] All retry attempts failed, waiting for manual reload");
+      console.warn("[spawriter] All retry attempts failed, waiting for manual reload");
     }
   }, []);
 
   // 监听页面导航事件
   useEffect(() => {
     function onNavigated(url) {
-      console.log("[single-spa-inspector-pro-mcp] Page navigated to:", url);
+      console.log("[spawriter] Page navigated to:", url);
       if (isMountedRef.current) {
         // 不清除 apps 状态，保持界面稳定，避免闪烁
         // 只在后台静默重试获取新的应用列表
@@ -181,7 +181,7 @@ function PanelRoot(props) {
   // This ensures we get the latest state after the panel was hidden for a while
   useEffect(() => {
     const handlePanelShown = () => {
-      console.debug("[single-spa-inspector-pro-mcp] Panel shown, refreshing apps state");
+      console.debug("[spawriter] Panel shown, refreshing apps state");
       fetchApps();
       // 触发一次短暂刷新
       setRefreshTick(t => t + 1);
@@ -222,7 +222,7 @@ function PanelRoot(props) {
         }
       } catch (err) {
         // 导航中可能报错，忽略
-        console.debug("[single-spa-inspector-pro-mcp] Burst refresh error:", err.message);
+        console.debug("[spawriter] Burst refresh error:", err.message);
       }
 
       if (!cancelled && isMountedRef.current && Date.now() - start < BURST_MS) {
@@ -256,7 +256,7 @@ function PanelRoot(props) {
         } catch (err) {
           // Silently handle extension context invalidation
           if (err.message && err.message.includes("Extension context invalidated")) {
-            console.debug("[single-spa-inspector-pro-mcp] Service worker terminated during ping");
+            console.debug("[spawriter] Service worker terminated during ping");
           }
           // 忽略：若失败，突发刷新仍会尝试
         }
@@ -379,7 +379,7 @@ async function getApps(setAppsFn) {
   } catch (err) {
       // 对于可恢复的协议错误，不抛出
       if (isRecoverableProtocolError(err)) {
-        console.debug("[single-spa-inspector-pro-mcp] Recoverable error in getApps:", err.message);
+        console.debug("[spawriter] Recoverable error in getApps:", err.message);
       return;
     }
     throw err;
@@ -391,7 +391,7 @@ function contentScriptListener(setApps, setIsNavigating, triggerRefresh, msg) {
     getApps(setApps).catch((err) => {
       // 对于可恢复的协议错误，设置导航状态
       if (isRecoverableProtocolError(err)) {
-        console.debug("[single-spa-inspector-pro-mcp] Recoverable error after routing event:", err.message);
+        console.debug("[spawriter] Recoverable error after routing event:", err.message);
         setIsNavigating(true);
         return;
       }

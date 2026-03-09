@@ -73,7 +73,7 @@ export default function Apps(props) {
     evalDevtoolsCmd(`mcpDashboardState = ${JSON.stringify(dashboardSnapshot)}`).catch(
       (err) => {
         console.debug(
-          "[single-spa-inspector-pro-mcp] Failed syncing dashboard snapshot for MCP:",
+          "[spawriter] Failed syncing dashboard snapshot for MCP:",
           err?.message || err
         );
       }
