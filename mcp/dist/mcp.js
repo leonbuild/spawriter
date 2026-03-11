@@ -442,12 +442,13 @@ const SLOW_CDP_COMMANDS = new Set([
 function getCommandTimeout(method) {
     return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
 }
-async function evaluateJs(session, expression) {
+async function evaluateJs(session, expression, evalTimeout = 30000) {
     const result = await sendCdpCommand(session, 'Runtime.evaluate', {
         expression,
         returnByValue: true,
         awaitPromise: true,
-    });
+        timeout: evalTimeout,
+    }, evalTimeout + 5000);
     if (result.exceptionDetails) {
         throw new Error(`JS error: ${result.exceptionDetails.text}`);
     }
@@ -989,218 +990,231 @@ Actions: get_html, get_text, get_metadata, search_dom.`,
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     return { tools };
 });
+const MCP_REQUEST_TIMEOUT = 120000; // 2 minutes hard cap for any tool call
+function withTimeout(promise, ms, toolName) {
+    let timer;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                reject(new Error(`Tool "${toolName}" timed out after ${ms / 1000}s. The browser may be busy or unreachable. Try again or call reset.`));
+            }, ms);
+        }),
+    ]).finally(() => clearTimeout(timer));
+}
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
-    if (name === 'reset') {
-        if (cdpSession) {
-            cdpSession.ws.close();
-            cdpSession = null;
-        }
-        clearConsoleLogs();
-        clearNetworkLog();
-        clearInterceptState();
-        lastSnapshot = null;
-        await pwExecutor.reset();
-        debuggerEnabled = false;
-        breakpoints.clear();
-        debuggerPaused = false;
-        currentCallFrameId = null;
-        knownScripts.clear();
-        await executorManager.resetAll();
-        return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, and sessions cleared.' }] };
-    }
-    if (name === 'playwright_execute') {
-        try {
-            await ensureRelayServer();
-            const code = args.code;
-            const timeout = args.timeout || 30000;
-            const result = await pwExecutor.execute(code, timeout);
-            return {
-                content: [{ type: 'text', text: result.text }],
-                isError: result.isError || undefined,
-            };
-        }
-        catch (e) {
-            error('Error in playwright_execute:', e);
-            return {
-                content: [{ type: 'text', text: `Error: ${String(e)}` }],
-                isError: true,
-            };
-        }
-    }
-    if (name === 'console_logs') {
-        const logs = getConsoleLogs({
-            count: args.count,
-            level: args.level,
-            search: args.search,
-        });
-        const text = formatConsoleLogs(logs, consoleLogs.length);
-        if (args.clear)
+    const handleToolCall = async () => {
+        if (name === 'reset') {
+            if (cdpSession) {
+                cdpSession.ws.close();
+                cdpSession = null;
+            }
             clearConsoleLogs();
-        return { content: [{ type: 'text', text }] };
-    }
-    if (name === 'network_log') {
-        const entries = getNetworkEntries({
-            count: args.count,
-            urlFilter: args.url_filter,
-            statusFilter: args.status_filter,
-        });
-        const text = formatNetworkEntries(entries, networkLog.size);
-        if (args.clear)
             clearNetworkLog();
-        return { content: [{ type: 'text', text }] };
-    }
-    if (name === 'network_detail') {
-        const requestId = args.requestId;
-        const entry = networkLog.get(requestId);
-        if (!entry)
-            return { content: [{ type: 'text', text: `Request "${requestId}" not found. Use network_log to list available requests.` }] };
-        const includeStr = (args.include || 'all').toLowerCase();
-        const sections = includeStr === 'all'
-            ? ['request_headers', 'request_body', 'response_headers', 'response_body']
-            : includeStr.split(',').map(s => s.trim());
-        const maxBodySize = args.max_body_size ?? 10000;
-        const parts = [];
-        const dur = entry.endTime && entry.startTime ? `${entry.endTime - entry.startTime}ms` : 'pending';
-        parts.push(`Request: ${entry.method} ${entry.url}`);
-        parts.push(`Status: ${entry.status ?? '(pending)'} ${entry.statusText || ''}`);
-        parts.push(`Type: ${entry.resourceType || 'unknown'} | MIME: ${entry.mimeType || 'unknown'} | Duration: ${dur} | Size: ${entry.size ? `${(entry.size / 1024).toFixed(1)}KB` : 'unknown'}`);
-        if (entry.error)
-            parts.push(`Error: ${entry.error}`);
-        if (sections.includes('request_headers') && entry.requestHeaders) {
-            const hdrs = Object.entries(entry.requestHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
-            parts.push(`\nRequest Headers:\n${hdrs}`);
+            clearInterceptState();
+            lastSnapshot = null;
+            await pwExecutor.reset();
+            debuggerEnabled = false;
+            breakpoints.clear();
+            debuggerPaused = false;
+            currentCallFrameId = null;
+            knownScripts.clear();
+            await executorManager.resetAll();
+            return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, and sessions cleared.' }] };
         }
-        if (sections.includes('request_body')) {
-            if (entry.postData) {
-                let bodyText = entry.postData;
-                if (bodyText.length > maxBodySize && maxBodySize > 0)
-                    bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
-                parts.push(`\nRequest Body:\n${bodyText}`);
-            }
-            else if (entry.hasPostData) {
-                try {
-                    const session = await ensureSession();
-                    const result = await sendCdpCommand(session, 'Network.getRequestPostData', { requestId });
-                    if (result?.postData) {
-                        let bodyText = result.base64Encoded ? Buffer.from(result.postData, 'base64').toString('utf-8') : result.postData;
-                        if (bodyText.length > maxBodySize && maxBodySize > 0)
-                            bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
-                        parts.push(`\nRequest Body:\n${bodyText}`);
-                    }
-                    else {
-                        parts.push('\nRequest Body: (not available)');
-                    }
-                }
-                catch {
-                    parts.push('\nRequest Body: (not available - request may have been evicted from buffer)');
-                }
-            }
-            else {
-                parts.push('\nRequest Body: (none - GET or no body)');
-            }
-        }
-        if (sections.includes('response_headers') && entry.responseHeaders) {
-            const hdrs = Object.entries(entry.responseHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
-            parts.push(`\nResponse Headers:\n${hdrs}`);
-        }
-        if (sections.includes('response_body') && maxBodySize > 0) {
+        if (name === 'playwright_execute') {
             try {
-                const session = await ensureSession();
-                const result = await sendCdpCommand(session, 'Network.getResponseBody', { requestId });
-                if (result?.body !== undefined) {
-                    let bodyText = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf-8') : result.body;
-                    if (bodyText.length > maxBodySize)
-                        bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
-                    parts.push(`\nResponse Body:\n${bodyText}`);
-                }
-                else {
-                    parts.push('\nResponse Body: (empty)');
-                }
+                await ensureRelayServer();
+                const code = args.code;
+                const timeout = args.timeout || 30000;
+                const result = await pwExecutor.execute(code, timeout);
+                return {
+                    content: [{ type: 'text', text: result.text }],
+                    isError: result.isError || undefined,
+                };
             }
-            catch {
-                parts.push('\nResponse Body: (not available - may have been evicted from browser buffer. Try requesting sooner after the network call.)');
+            catch (e) {
+                error('Error in playwright_execute:', e);
+                return {
+                    content: [{ type: 'text', text: `Error: ${String(e)}` }],
+                    isError: true,
+                };
             }
         }
-        return { content: [{ type: 'text', text: parts.join('\n') }] };
-    }
-    try {
-        const session = await ensureSession();
-        switch (name) {
-            case 'screenshot': {
-                const withLabels = args.labels;
-                if (!withLabels) {
-                    const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot'));
-                    return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
+        if (name === 'console_logs') {
+            const logs = getConsoleLogs({
+                count: args.count,
+                level: args.level,
+                search: args.search,
+            });
+            const text = formatConsoleLogs(logs, consoleLogs.length);
+            if (args.clear)
+                clearConsoleLogs();
+            return { content: [{ type: 'text', text }] };
+        }
+        if (name === 'network_log') {
+            const entries = getNetworkEntries({
+                count: args.count,
+                urlFilter: args.url_filter,
+                statusFilter: args.status_filter,
+            });
+            const text = formatNetworkEntries(entries, networkLog.size);
+            if (args.clear)
+                clearNetworkLog();
+            return { content: [{ type: 'text', text }] };
+        }
+        if (name === 'network_detail') {
+            const requestId = args.requestId;
+            const entry = networkLog.get(requestId);
+            if (!entry)
+                return { content: [{ type: 'text', text: `Request "${requestId}" not found. Use network_log to list available requests.` }] };
+            const includeStr = (args.include || 'all').toLowerCase();
+            const sections = includeStr === 'all'
+                ? ['request_headers', 'request_body', 'response_headers', 'response_body']
+                : includeStr.split(',').map(s => s.trim());
+            const maxBodySize = args.max_body_size ?? 10000;
+            const parts = [];
+            const dur = entry.endTime && entry.startTime ? `${entry.endTime - entry.startTime}ms` : 'pending';
+            parts.push(`Request: ${entry.method} ${entry.url}`);
+            parts.push(`Status: ${entry.status ?? '(pending)'} ${entry.statusText || ''}`);
+            parts.push(`Type: ${entry.resourceType || 'unknown'} | MIME: ${entry.mimeType || 'unknown'} | Duration: ${dur} | Size: ${entry.size ? `${(entry.size / 1024).toFixed(1)}KB` : 'unknown'}`);
+            if (entry.error)
+                parts.push(`Error: ${entry.error}`);
+            if (sections.includes('request_headers') && entry.requestHeaders) {
+                const hdrs = Object.entries(entry.requestHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+                parts.push(`\nRequest Headers:\n${hdrs}`);
+            }
+            if (sections.includes('request_body')) {
+                if (entry.postData) {
+                    let bodyText = entry.postData;
+                    if (bodyText.length > maxBodySize && maxBodySize > 0)
+                        bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
+                    parts.push(`\nRequest Body:\n${bodyText}`);
                 }
-                await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
-                await sendCdpCommand(session, 'DOM.enable', undefined, getCommandTimeout('DOM.enable'));
-                const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree'));
-                const interactive = getInteractiveElements(axResult.nodes ?? []);
-                const labelPositions = [];
-                for (const el of interactive) {
+                else if (entry.hasPostData) {
                     try {
-                        const boxModel = await sendCdpCommand(session, 'DOM.getBoxModel', { backendNodeId: el.backendDOMNodeId });
-                        if (boxModel?.model) {
-                            const b = boxModel.model.border;
-                            const x = Math.min(b[0], b[2], b[4], b[6]);
-                            const y = Math.min(b[1], b[3], b[5], b[7]);
-                            const maxX = Math.max(b[0], b[2], b[4], b[6]);
-                            const maxY = Math.max(b[1], b[3], b[5], b[7]);
-                            labelPositions.push({ index: el.index, x, y, width: maxX - x, height: maxY - y });
+                        const session = await ensureSession();
+                        const result = await sendCdpCommand(session, 'Network.getRequestPostData', { requestId });
+                        if (result?.postData) {
+                            let bodyText = result.base64Encoded ? Buffer.from(result.postData, 'base64').toString('utf-8') : result.postData;
+                            if (bodyText.length > maxBodySize && maxBodySize > 0)
+                                bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
+                            parts.push(`\nRequest Body:\n${bodyText}`);
+                        }
+                        else {
+                            parts.push('\nRequest Body: (not available)');
                         }
                     }
                     catch {
-                        // Element might not be visible
+                        parts.push('\nRequest Body: (not available - request may have been evicted from buffer)');
                     }
                 }
-                if (labelPositions.length > 0) {
-                    await evaluateJs(session, buildLabelInjectionScript(labelPositions));
+                else {
+                    parts.push('\nRequest Body: (none - GET or no body)');
                 }
-                const screenshotResult = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot'));
-                if (labelPositions.length > 0) {
-                    await evaluateJs(session, REMOVE_LABELS_SCRIPT).catch(() => { });
-                }
-                const legend = formatLabelLegend(interactive);
-                return {
-                    content: [
-                        { type: 'image', data: screenshotResult.data, mimeType: 'image/png' },
-                        { type: 'text', text: legend },
-                    ],
-                };
             }
-            case 'accessibility_snapshot': {
-                await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
-                const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree'));
-                const fullText = formatAXTreeAsText(axResult.nodes ?? []);
-                const searchQuery = args.search;
-                const showDiff = args.diff;
-                if (searchQuery) {
+            if (sections.includes('response_headers') && entry.responseHeaders) {
+                const hdrs = Object.entries(entry.responseHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+                parts.push(`\nResponse Headers:\n${hdrs}`);
+            }
+            if (sections.includes('response_body') && maxBodySize > 0) {
+                try {
+                    const session = await ensureSession();
+                    const result = await sendCdpCommand(session, 'Network.getResponseBody', { requestId });
+                    if (result?.body !== undefined) {
+                        let bodyText = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf-8') : result.body;
+                        if (bodyText.length > maxBodySize)
+                            bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
+                        parts.push(`\nResponse Body:\n${bodyText}`);
+                    }
+                    else {
+                        parts.push('\nResponse Body: (empty)');
+                    }
+                }
+                catch {
+                    parts.push('\nResponse Body: (not available - may have been evicted from browser buffer. Try requesting sooner after the network call.)');
+                }
+            }
+            return { content: [{ type: 'text', text: parts.join('\n') }] };
+        }
+        try {
+            const session = await ensureSession();
+            switch (name) {
+                case 'screenshot': {
+                    const withLabels = args.labels;
+                    if (!withLabels) {
+                        const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot'));
+                        return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
+                    }
+                    await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
+                    await sendCdpCommand(session, 'DOM.enable', undefined, getCommandTimeout('DOM.enable'));
+                    const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree'));
+                    const interactive = getInteractiveElements(axResult.nodes ?? []);
+                    const labelPositions = [];
+                    for (const el of interactive) {
+                        try {
+                            const boxModel = await sendCdpCommand(session, 'DOM.getBoxModel', { backendNodeId: el.backendDOMNodeId });
+                            if (boxModel?.model) {
+                                const b = boxModel.model.border;
+                                const x = Math.min(b[0], b[2], b[4], b[6]);
+                                const y = Math.min(b[1], b[3], b[5], b[7]);
+                                const maxX = Math.max(b[0], b[2], b[4], b[6]);
+                                const maxY = Math.max(b[1], b[3], b[5], b[7]);
+                                labelPositions.push({ index: el.index, x, y, width: maxX - x, height: maxY - y });
+                            }
+                        }
+                        catch {
+                            // Element might not be visible
+                        }
+                    }
+                    if (labelPositions.length > 0) {
+                        await evaluateJs(session, buildLabelInjectionScript(labelPositions));
+                    }
+                    const screenshotResult = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot'));
+                    if (labelPositions.length > 0) {
+                        await evaluateJs(session, REMOVE_LABELS_SCRIPT).catch(() => { });
+                    }
+                    const legend = formatLabelLegend(interactive);
+                    return {
+                        content: [
+                            { type: 'image', data: screenshotResult.data, mimeType: 'image/png' },
+                            { type: 'text', text: legend },
+                        ],
+                    };
+                }
+                case 'accessibility_snapshot': {
+                    await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
+                    const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree'));
+                    const fullText = formatAXTreeAsText(axResult.nodes ?? []);
+                    const searchQuery = args.search;
+                    const showDiff = args.diff;
+                    if (searchQuery) {
+                        lastSnapshot = fullText;
+                        return { content: [{ type: 'text', text: searchSnapshot(fullText, searchQuery) }] };
+                    }
+                    const shouldDiff = showDiff !== false && lastSnapshot !== null;
+                    if (shouldDiff && lastSnapshot) {
+                        const diffText = computeSnapshotDiff(lastSnapshot, fullText);
+                        lastSnapshot = fullText;
+                        return { content: [{ type: 'text', text: diffText }] };
+                    }
                     lastSnapshot = fullText;
-                    return { content: [{ type: 'text', text: searchSnapshot(fullText, searchQuery) }] };
+                    return { content: [{ type: 'text', text: fullText }] };
                 }
-                const shouldDiff = showDiff !== false && lastSnapshot !== null;
-                if (shouldDiff && lastSnapshot) {
-                    const diffText = computeSnapshotDiff(lastSnapshot, fullText);
-                    lastSnapshot = fullText;
-                    return { content: [{ type: 'text', text: diffText }] };
+                case 'execute': {
+                    const code = args.code;
+                    const value = await evaluateJs(session, code);
+                    const textResult = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+                    return {
+                        content: [{ type: 'text', text: textResult ?? 'undefined' }],
+                    };
                 }
-                lastSnapshot = fullText;
-                return { content: [{ type: 'text', text: fullText }] };
-            }
-            case 'execute': {
-                const code = args.code;
-                const value = await evaluateJs(session, code);
-                const textResult = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-                return {
-                    content: [{ type: 'text', text: textResult ?? 'undefined' }],
-                };
-            }
-            case 'dashboard_state': {
-                const targetAppName = typeof args.appName === 'string' && args.appName.trim().length > 0
-                    ? JSON.stringify(args.appName.trim())
-                    : 'null';
-                const dashboardCode = `(function(requestedAppName) {
+                case 'dashboard_state': {
+                    const targetAppName = typeof args.appName === 'string' && args.appName.trim().length > 0
+                        ? JSON.stringify(args.appName.trim())
+                        : 'null';
+                    const dashboardCode = `(function(requestedAppName) {
           var devtools = window.__SINGLE_SPA_DEVTOOLS__;
           var exposedMethods = devtools && devtools.exposedMethods;
           var hasSingleSpaDevtools = !!(exposedMethods && typeof exposedMethods.getRawAppData === 'function');
@@ -1225,102 +1239,102 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             apps: apps
           });
         })(${targetAppName})`;
-                const value = await evaluateJs(session, dashboardCode);
-                return {
-                    content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
-                };
-            }
-            case 'clear_cache_and_reload': {
-                const mode = args.mode || 'light';
-                if (mode === 'aggressive') {
-                    await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
-                    await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
+                    const value = await evaluateJs(session, dashboardCode);
+                    return {
+                        content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
+                    };
                 }
-                await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
-                await sleep(2000);
-                return {
-                    content: [{ type: 'text', text: `Cache cleared with mode: ${mode}` }],
-                };
-            }
-            case 'ensure_fresh_render': {
-                await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
-                await sleep(2000);
-                return {
-                    content: [{ type: 'text', text: 'Page reloaded with fresh cache' }],
-                };
-            }
-            case 'navigate': {
-                await sendCdpCommand(session, 'Page.navigate', { url: args.url }, getCommandTimeout('Page.navigate'));
-                await sleep(2000);
-                return {
-                    content: [{ type: 'text', text: `Navigated to ${args.url}` }],
-                };
-            }
-            case 'override_app': {
-                const action = args.action;
-                const appName = args.appName;
-                const overrideUrl = args.url;
-                let code;
-                switch (action) {
-                    case 'set':
-                        if (!appName || !overrideUrl) {
-                            return { content: [{ type: 'text', text: 'Error: "set" requires both appName and url' }] };
-                        }
-                        code = `(function() {
+                case 'clear_cache_and_reload': {
+                    const mode = args.mode || 'light';
+                    if (mode === 'aggressive') {
+                        await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
+                        await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
+                    }
+                    await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+                    await sleep(2000);
+                    return {
+                        content: [{ type: 'text', text: `Cache cleared with mode: ${mode}` }],
+                    };
+                }
+                case 'ensure_fresh_render': {
+                    await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+                    await sleep(2000);
+                    return {
+                        content: [{ type: 'text', text: 'Page reloaded with fresh cache' }],
+                    };
+                }
+                case 'navigate': {
+                    await sendCdpCommand(session, 'Page.navigate', { url: args.url }, getCommandTimeout('Page.navigate'));
+                    await sleep(2000);
+                    return {
+                        content: [{ type: 'text', text: `Navigated to ${args.url}` }],
+                    };
+                }
+                case 'override_app': {
+                    const action = args.action;
+                    const appName = args.appName;
+                    const overrideUrl = args.url;
+                    let code;
+                    switch (action) {
+                        case 'set':
+                            if (!appName || !overrideUrl) {
+                                return { content: [{ type: 'text', text: 'Error: "set" requires both appName and url' }] };
+                            }
+                            code = `(function() {
               if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
               window.importMapOverrides.addOverride(${JSON.stringify(appName)}, ${JSON.stringify(overrideUrl)});
               return JSON.stringify({ success: true, action: 'set', appName: ${JSON.stringify(appName)}, url: ${JSON.stringify(overrideUrl)} });
             })()`;
-                        break;
-                    case 'remove':
-                        if (!appName) {
-                            return { content: [{ type: 'text', text: 'Error: "remove" requires appName' }] };
-                        }
-                        code = `(function() {
+                            break;
+                        case 'remove':
+                            if (!appName) {
+                                return { content: [{ type: 'text', text: 'Error: "remove" requires appName' }] };
+                            }
+                            code = `(function() {
               if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
               window.importMapOverrides.removeOverride(${JSON.stringify(appName)});
               return JSON.stringify({ success: true, action: 'remove', appName: ${JSON.stringify(appName)} });
             })()`;
-                        break;
-                    case 'enable':
-                        if (!appName) {
-                            return { content: [{ type: 'text', text: 'Error: "enable" requires appName' }] };
-                        }
-                        code = `(function() {
+                            break;
+                        case 'enable':
+                            if (!appName) {
+                                return { content: [{ type: 'text', text: 'Error: "enable" requires appName' }] };
+                            }
+                            code = `(function() {
               if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
               window.importMapOverrides.enableOverride(${JSON.stringify(appName)});
               return JSON.stringify({ success: true, action: 'enable', appName: ${JSON.stringify(appName)} });
             })()`;
-                        break;
-                    case 'disable':
-                        if (!appName) {
-                            return { content: [{ type: 'text', text: 'Error: "disable" requires appName' }] };
-                        }
-                        code = `(function() {
+                            break;
+                        case 'disable':
+                            if (!appName) {
+                                return { content: [{ type: 'text', text: 'Error: "disable" requires appName' }] };
+                            }
+                            code = `(function() {
               if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
               window.importMapOverrides.disableOverride(${JSON.stringify(appName)});
               return JSON.stringify({ success: true, action: 'disable', appName: ${JSON.stringify(appName)} });
             })()`;
-                        break;
-                    case 'reset_all':
-                        code = `(function() {
+                            break;
+                        case 'reset_all':
+                            code = `(function() {
               if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
               window.importMapOverrides.resetOverrides();
               return JSON.stringify({ success: true, action: 'reset_all' });
             })()`;
-                        break;
-                    default:
-                        return { content: [{ type: 'text', text: 'Error: unknown action "' + action + '". Use: set, remove, enable, disable, reset_all' }] };
+                            break;
+                        default:
+                            return { content: [{ type: 'text', text: 'Error: unknown action "' + action + '". Use: set, remove, enable, disable, reset_all' }] };
+                    }
+                    const value = await evaluateJs(session, code);
+                    return {
+                        content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+                    };
                 }
-                const value = await evaluateJs(session, code);
-                return {
-                    content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
-                };
-            }
-            case 'app_action': {
-                const action = args.action;
-                const appName = args.appName;
-                const actionCode = `(async function() {
+                case 'app_action': {
+                    const action = args.action;
+                    const appName = args.appName;
+                    const actionCode = `(async function() {
           var singleSpa = window.__SINGLE_SPA_DEVTOOLS__;
           var exposedMethods = singleSpa && singleSpa.exposedMethods;
           if (!exposedMethods) return JSON.stringify({ success: false, error: 'single-spa devtools not available' });
@@ -1354,155 +1368,155 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return JSON.stringify({ success: false, error: e.message || String(e) });
           }
         })()`;
-                const value = await evaluateJs(session, actionCode);
-                return {
-                    content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
-                };
-            }
-            case 'debugger': {
-                const action = args.action;
-                switch (action) {
-                    case 'enable': {
-                        await sendCdpCommand(session, 'Debugger.enable');
-                        await sendCdpCommand(session, 'Runtime.enable');
-                        debuggerEnabled = true;
-                        return { content: [{ type: 'text', text: 'Debugger enabled. Scripts will be parsed and breakpoints can be set.' }] };
-                    }
-                    case 'set_breakpoint': {
-                        const file = args.file;
-                        const line = args.line;
-                        const condition = args.condition;
-                        if (!file || !line)
-                            return { content: [{ type: 'text', text: 'Error: set_breakpoint requires file and line' }] };
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            await sendCdpCommand(session, 'Runtime.enable');
-                            debuggerEnabled = true;
-                        }
-                        const result = await sendCdpCommand(session, 'Debugger.setBreakpointByUrl', {
-                            lineNumber: line - 1,
-                            urlRegex: file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-                            columnNumber: 0,
-                            ...(condition ? { condition } : {}),
-                        });
-                        breakpoints.set(result.breakpointId, { id: result.breakpointId, file, line });
-                        return { content: [{ type: 'text', text: `Breakpoint set: ${result.breakpointId} at ${file}:${line}${condition ? ` (condition: ${condition})` : ''}` }] };
-                    }
-                    case 'remove_breakpoint': {
-                        const bpId = args.breakpointId;
-                        if (!bpId)
-                            return { content: [{ type: 'text', text: 'Error: remove_breakpoint requires breakpointId' }] };
-                        await sendCdpCommand(session, 'Debugger.removeBreakpoint', { breakpointId: bpId });
-                        breakpoints.delete(bpId);
-                        return { content: [{ type: 'text', text: `Breakpoint removed: ${bpId}` }] };
-                    }
-                    case 'list_breakpoints': {
-                        const bps = Array.from(breakpoints.values());
-                        if (bps.length === 0)
-                            return { content: [{ type: 'text', text: 'No active breakpoints.' }] };
-                        const lines = bps.map(bp => `${bp.id}: ${bp.file}:${bp.line}`);
-                        return { content: [{ type: 'text', text: `Active breakpoints (${bps.length}):\n${lines.join('\n')}` }] };
-                    }
-                    case 'resume': {
-                        if (!debuggerPaused)
-                            return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-                        await sendCdpCommand(session, 'Debugger.resume');
-                        return { content: [{ type: 'text', text: 'Resumed execution.' }] };
-                    }
-                    case 'step_over': {
-                        if (!debuggerPaused)
-                            return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-                        await sendCdpCommand(session, 'Debugger.stepOver');
-                        return { content: [{ type: 'text', text: 'Stepped over.' }] };
-                    }
-                    case 'step_into': {
-                        if (!debuggerPaused)
-                            return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-                        await sendCdpCommand(session, 'Debugger.stepInto');
-                        return { content: [{ type: 'text', text: 'Stepped into.' }] };
-                    }
-                    case 'step_out': {
-                        if (!debuggerPaused)
-                            return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-                        await sendCdpCommand(session, 'Debugger.stepOut');
-                        return { content: [{ type: 'text', text: 'Stepped out.' }] };
-                    }
-                    case 'inspect_variables': {
-                        if (!debuggerPaused || !currentCallFrameId)
-                            return { content: [{ type: 'text', text: 'Debugger is not paused at a breakpoint.' }] };
-                        const evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
-                            callFrameId: currentCallFrameId,
-                            expression: '(function(){ var __r = {}; try { var __s = arguments.callee.caller; } catch(e) {} return JSON.stringify(__r); })()',
-                            returnByValue: true,
-                        });
-                        return { content: [{ type: 'text', text: evalResult?.result?.value ?? 'Unable to inspect variables (try using evaluate action instead)' }] };
-                    }
-                    case 'evaluate': {
-                        const expression = args.expression;
-                        if (!expression)
-                            return { content: [{ type: 'text', text: 'Error: evaluate requires expression' }] };
-                        let evalResult;
-                        if (debuggerPaused && currentCallFrameId) {
-                            evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
-                                callFrameId: currentCallFrameId,
-                                expression,
-                                returnByValue: true,
-                                generatePreview: true,
-                            });
-                        }
-                        else {
-                            evalResult = await sendCdpCommand(session, 'Runtime.evaluate', {
-                                expression,
-                                returnByValue: true,
-                                awaitPromise: true,
-                            });
-                        }
-                        const val = evalResult?.result?.value;
-                        const text = val !== undefined ? (typeof val === 'string' ? val : JSON.stringify(val, null, 2)) : (evalResult?.result?.description || 'undefined');
-                        return { content: [{ type: 'text', text }] };
-                    }
-                    case 'list_scripts': {
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            await sendCdpCommand(session, 'Runtime.enable');
-                            debuggerEnabled = true;
-                            await new Promise(r => setTimeout(r, 200));
-                        }
-                        const searchStr = (args.search || '').toLowerCase();
-                        let scripts = Array.from(knownScripts.values());
-                        if (searchStr)
-                            scripts = scripts.filter(s => s.url.toLowerCase().includes(searchStr));
-                        scripts = scripts.slice(0, 30);
-                        if (scripts.length === 0)
-                            return { content: [{ type: 'text', text: 'No scripts found.' }] };
-                        const scriptLines = scripts.map(s => `${s.scriptId}: ${s.url}`);
-                        return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${scriptLines.join('\n')}` }] };
-                    }
-                    case 'pause_on_exceptions': {
-                        const state = args.state || 'none';
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            debuggerEnabled = true;
-                        }
-                        await sendCdpCommand(session, 'Debugger.setPauseOnExceptions', { state });
-                        return { content: [{ type: 'text', text: `Pause on exceptions: ${state}` }] };
-                    }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown debugger action: ${action}` }] };
+                    const value = await evaluateJs(session, actionCode);
+                    return {
+                        content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+                    };
                 }
-            }
-            case 'css_inspect': {
-                const selector = args.selector;
-                const requestedProps = (args.properties || '').split(',').map(p => p.trim()).filter(Boolean);
-                const defaultProps = [
-                    'display', 'position', 'width', 'height', 'margin', 'padding',
-                    'color', 'background-color', 'font-size', 'font-weight', 'font-family',
-                    'border', 'border-radius', 'opacity', 'visibility', 'overflow',
-                    'flex-direction', 'justify-content', 'align-items', 'gap',
-                    'z-index', 'box-shadow', 'text-align',
-                ];
-                const propsToGet = requestedProps.length > 0 ? requestedProps : defaultProps;
-                const code = `(function() {
+                case 'debugger': {
+                    const action = args.action;
+                    switch (action) {
+                        case 'enable': {
+                            await sendCdpCommand(session, 'Debugger.enable');
+                            await sendCdpCommand(session, 'Runtime.enable');
+                            debuggerEnabled = true;
+                            return { content: [{ type: 'text', text: 'Debugger enabled. Scripts will be parsed and breakpoints can be set.' }] };
+                        }
+                        case 'set_breakpoint': {
+                            const file = args.file;
+                            const line = args.line;
+                            const condition = args.condition;
+                            if (!file || !line)
+                                return { content: [{ type: 'text', text: 'Error: set_breakpoint requires file and line' }] };
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                await sendCdpCommand(session, 'Runtime.enable');
+                                debuggerEnabled = true;
+                            }
+                            const result = await sendCdpCommand(session, 'Debugger.setBreakpointByUrl', {
+                                lineNumber: line - 1,
+                                urlRegex: file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+                                columnNumber: 0,
+                                ...(condition ? { condition } : {}),
+                            });
+                            breakpoints.set(result.breakpointId, { id: result.breakpointId, file, line });
+                            return { content: [{ type: 'text', text: `Breakpoint set: ${result.breakpointId} at ${file}:${line}${condition ? ` (condition: ${condition})` : ''}` }] };
+                        }
+                        case 'remove_breakpoint': {
+                            const bpId = args.breakpointId;
+                            if (!bpId)
+                                return { content: [{ type: 'text', text: 'Error: remove_breakpoint requires breakpointId' }] };
+                            await sendCdpCommand(session, 'Debugger.removeBreakpoint', { breakpointId: bpId });
+                            breakpoints.delete(bpId);
+                            return { content: [{ type: 'text', text: `Breakpoint removed: ${bpId}` }] };
+                        }
+                        case 'list_breakpoints': {
+                            const bps = Array.from(breakpoints.values());
+                            if (bps.length === 0)
+                                return { content: [{ type: 'text', text: 'No active breakpoints.' }] };
+                            const lines = bps.map(bp => `${bp.id}: ${bp.file}:${bp.line}`);
+                            return { content: [{ type: 'text', text: `Active breakpoints (${bps.length}):\n${lines.join('\n')}` }] };
+                        }
+                        case 'resume': {
+                            if (!debuggerPaused)
+                                return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+                            await sendCdpCommand(session, 'Debugger.resume');
+                            return { content: [{ type: 'text', text: 'Resumed execution.' }] };
+                        }
+                        case 'step_over': {
+                            if (!debuggerPaused)
+                                return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+                            await sendCdpCommand(session, 'Debugger.stepOver');
+                            return { content: [{ type: 'text', text: 'Stepped over.' }] };
+                        }
+                        case 'step_into': {
+                            if (!debuggerPaused)
+                                return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+                            await sendCdpCommand(session, 'Debugger.stepInto');
+                            return { content: [{ type: 'text', text: 'Stepped into.' }] };
+                        }
+                        case 'step_out': {
+                            if (!debuggerPaused)
+                                return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+                            await sendCdpCommand(session, 'Debugger.stepOut');
+                            return { content: [{ type: 'text', text: 'Stepped out.' }] };
+                        }
+                        case 'inspect_variables': {
+                            if (!debuggerPaused || !currentCallFrameId)
+                                return { content: [{ type: 'text', text: 'Debugger is not paused at a breakpoint.' }] };
+                            const evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
+                                callFrameId: currentCallFrameId,
+                                expression: '(function(){ var __r = {}; try { var __s = arguments.callee.caller; } catch(e) {} return JSON.stringify(__r); })()',
+                                returnByValue: true,
+                            });
+                            return { content: [{ type: 'text', text: evalResult?.result?.value ?? 'Unable to inspect variables (try using evaluate action instead)' }] };
+                        }
+                        case 'evaluate': {
+                            const expression = args.expression;
+                            if (!expression)
+                                return { content: [{ type: 'text', text: 'Error: evaluate requires expression' }] };
+                            let evalResult;
+                            if (debuggerPaused && currentCallFrameId) {
+                                evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
+                                    callFrameId: currentCallFrameId,
+                                    expression,
+                                    returnByValue: true,
+                                    generatePreview: true,
+                                });
+                            }
+                            else {
+                                evalResult = await sendCdpCommand(session, 'Runtime.evaluate', {
+                                    expression,
+                                    returnByValue: true,
+                                    awaitPromise: true,
+                                });
+                            }
+                            const val = evalResult?.result?.value;
+                            const text = val !== undefined ? (typeof val === 'string' ? val : JSON.stringify(val, null, 2)) : (evalResult?.result?.description || 'undefined');
+                            return { content: [{ type: 'text', text }] };
+                        }
+                        case 'list_scripts': {
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                await sendCdpCommand(session, 'Runtime.enable');
+                                debuggerEnabled = true;
+                                await new Promise(r => setTimeout(r, 200));
+                            }
+                            const searchStr = (args.search || '').toLowerCase();
+                            let scripts = Array.from(knownScripts.values());
+                            if (searchStr)
+                                scripts = scripts.filter(s => s.url.toLowerCase().includes(searchStr));
+                            scripts = scripts.slice(0, 30);
+                            if (scripts.length === 0)
+                                return { content: [{ type: 'text', text: 'No scripts found.' }] };
+                            const scriptLines = scripts.map(s => `${s.scriptId}: ${s.url}`);
+                            return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${scriptLines.join('\n')}` }] };
+                        }
+                        case 'pause_on_exceptions': {
+                            const state = args.state || 'none';
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                debuggerEnabled = true;
+                            }
+                            await sendCdpCommand(session, 'Debugger.setPauseOnExceptions', { state });
+                            return { content: [{ type: 'text', text: `Pause on exceptions: ${state}` }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown debugger action: ${action}` }] };
+                    }
+                }
+                case 'css_inspect': {
+                    const selector = args.selector;
+                    const requestedProps = (args.properties || '').split(',').map(p => p.trim()).filter(Boolean);
+                    const defaultProps = [
+                        'display', 'position', 'width', 'height', 'margin', 'padding',
+                        'color', 'background-color', 'font-size', 'font-weight', 'font-family',
+                        'border', 'border-radius', 'opacity', 'visibility', 'overflow',
+                        'flex-direction', 'justify-content', 'align-items', 'gap',
+                        'z-index', 'box-shadow', 'text-align',
+                    ];
+                    const propsToGet = requestedProps.length > 0 ? requestedProps : defaultProps;
+                    const code = `(function() {
           var el = document.querySelector(${JSON.stringify(selector)});
           if (!el) return JSON.stringify({ error: 'Element not found: ' + ${JSON.stringify(selector)} });
           var cs = getComputedStyle(el);
@@ -1515,204 +1529,204 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           result.__bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
           return JSON.stringify(result);
         })()`;
-                const value = await evaluateJs(session, code);
-                const parsed = typeof value === 'string' ? JSON.parse(value) : value;
-                if (parsed?.error)
-                    return { content: [{ type: 'text', text: parsed.error }] };
-                const tag = parsed.__tagName;
-                const id = parsed.__id ? `#${parsed.__id}` : '';
-                const cls = parsed.__className ? `.${parsed.__className.split(' ').join('.')}` : '';
-                const bounds = parsed.__bounds;
-                const header = `Element: <${tag}${id}${cls}> (${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y})`;
-                delete parsed.__tagName;
-                delete parsed.__className;
-                delete parsed.__id;
-                delete parsed.__bounds;
-                const propLines = Object.entries(parsed)
-                    .filter(([, v]) => v !== '' && v !== 'none' && v !== 'normal' && v !== 'auto' && v !== 'visible' && v !== '0px')
-                    .map(([k, v]) => `  ${k}: ${v}`);
-                return { content: [{ type: 'text', text: `${header}\n\nComputed styles:\n${propLines.join('\n') || '  (no non-default styles)'}` }] };
-            }
-            case 'session_manager': {
-                const action = args.action;
-                const sessionId = args.sessionId;
-                switch (action) {
-                    case 'list': {
-                        const sessions = executorManager.listSessions();
-                        if (sessions.length === 0)
-                            return { content: [{ type: 'text', text: 'No active sessions.' }] };
-                        const lines = sessions.map(s => `${s.id}: connected=${s.connected}, stateKeys=[${s.stateKeys.join(', ')}]`);
-                        return { content: [{ type: 'text', text: `Sessions (${sessions.length}):\n${lines.join('\n')}` }] };
-                    }
-                    case 'create': {
-                        if (!sessionId)
-                            return { content: [{ type: 'text', text: 'Error: create requires sessionId' }] };
-                        const existing = executorManager.get(sessionId);
-                        if (existing)
-                            return { content: [{ type: 'text', text: `Session "${sessionId}" already exists.` }] };
-                        executorManager.getOrCreate(sessionId);
-                        return { content: [{ type: 'text', text: `Session "${sessionId}" created.` }] };
-                    }
-                    case 'switch': {
-                        if (!sessionId)
-                            return { content: [{ type: 'text', text: 'Error: switch requires sessionId' }] };
-                        const executor = executorManager.get(sessionId);
-                        if (!executor)
-                            return { content: [{ type: 'text', text: `Session "${sessionId}" not found. Use "create" first.` }] };
-                        return { content: [{ type: 'text', text: `Switched to session "${sessionId}". Use playwright_execute with this session context.` }] };
-                    }
-                    case 'remove': {
-                        if (!sessionId)
-                            return { content: [{ type: 'text', text: 'Error: remove requires sessionId' }] };
-                        const removed = await executorManager.remove(sessionId);
-                        return { content: [{ type: 'text', text: removed ? `Session "${sessionId}" removed.` : `Session "${sessionId}" not found.` }] };
-                    }
-                    case 'remove_all': {
-                        const count = executorManager.size;
-                        await executorManager.resetAll();
-                        return { content: [{ type: 'text', text: `All ${count} sessions removed.` }] };
-                    }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown session action: ${action}. Use: list, create, switch, remove, remove_all` }] };
+                    const value = await evaluateJs(session, code);
+                    const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+                    if (parsed?.error)
+                        return { content: [{ type: 'text', text: parsed.error }] };
+                    const tag = parsed.__tagName;
+                    const id = parsed.__id ? `#${parsed.__id}` : '';
+                    const cls = parsed.__className ? `.${parsed.__className.split(' ').join('.')}` : '';
+                    const bounds = parsed.__bounds;
+                    const header = `Element: <${tag}${id}${cls}> (${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y})`;
+                    delete parsed.__tagName;
+                    delete parsed.__className;
+                    delete parsed.__id;
+                    delete parsed.__bounds;
+                    const propLines = Object.entries(parsed)
+                        .filter(([, v]) => v !== '' && v !== 'none' && v !== 'normal' && v !== 'auto' && v !== 'visible' && v !== '0px')
+                        .map(([k, v]) => `  ${k}: ${v}`);
+                    return { content: [{ type: 'text', text: `${header}\n\nComputed styles:\n${propLines.join('\n') || '  (no non-default styles)'}` }] };
                 }
-            }
-            case 'storage': {
-                const action = args.action;
-                switch (action) {
-                    case 'get_cookies': {
-                        const result = await sendCdpCommand(session, 'Network.getCookies');
-                        const cookies = result?.cookies || [];
-                        if (cookies.length === 0)
-                            return { content: [{ type: 'text', text: 'No cookies found.' }] };
-                        const lines = cookies.map(c => `${c.name}=${String(c.value).slice(0, 80)}${String(c.value).length > 80 ? '...' : ''} (domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'})`);
-                        return { content: [{ type: 'text', text: `Cookies (${cookies.length}):\n${lines.join('\n')}` }] };
-                    }
-                    case 'set_cookie': {
-                        const cookieName = args.name;
-                        const cookieValue = args.value;
-                        if (!cookieName || cookieValue === undefined)
-                            return { content: [{ type: 'text', text: 'Error: set_cookie requires name and value' }] };
-                        const cookieParams = { name: cookieName, value: cookieValue };
-                        if (args.domain)
-                            cookieParams.domain = args.domain;
-                        if (args.url)
-                            cookieParams.url = args.url;
-                        if (args.path)
-                            cookieParams.path = args.path;
-                        if (args.secure !== undefined)
-                            cookieParams.secure = args.secure;
-                        if (args.httpOnly !== undefined)
-                            cookieParams.httpOnly = args.httpOnly;
-                        if (args.sameSite)
-                            cookieParams.sameSite = args.sameSite;
-                        if (args.expires)
-                            cookieParams.expires = args.expires;
-                        if (!cookieParams.url && !cookieParams.domain) {
-                            const pageUrl = await evaluateJs(session, 'window.location.href');
-                            cookieParams.url = pageUrl;
+                case 'session_manager': {
+                    const action = args.action;
+                    const sessionId = args.sessionId;
+                    switch (action) {
+                        case 'list': {
+                            const sessions = executorManager.listSessions();
+                            if (sessions.length === 0)
+                                return { content: [{ type: 'text', text: 'No active sessions.' }] };
+                            const lines = sessions.map(s => `${s.id}: connected=${s.connected}, stateKeys=[${s.stateKeys.join(', ')}]`);
+                            return { content: [{ type: 'text', text: `Sessions (${sessions.length}):\n${lines.join('\n')}` }] };
                         }
-                        const result = await sendCdpCommand(session, 'Network.setCookie', cookieParams);
-                        return { content: [{ type: 'text', text: result?.success ? `Cookie "${cookieName}" set.` : `Failed to set cookie "${cookieName}".` }] };
-                    }
-                    case 'delete_cookie': {
-                        const cookieName = args.name;
-                        if (!cookieName)
-                            return { content: [{ type: 'text', text: 'Error: delete_cookie requires name' }] };
-                        const delParams = { name: cookieName };
-                        if (args.domain)
-                            delParams.domain = args.domain;
-                        if (args.url)
-                            delParams.url = args.url;
-                        if (args.path)
-                            delParams.path = args.path;
-                        if (!delParams.url && !delParams.domain) {
-                            const pageUrl = await evaluateJs(session, 'window.location.href');
-                            delParams.url = pageUrl;
+                        case 'create': {
+                            if (!sessionId)
+                                return { content: [{ type: 'text', text: 'Error: create requires sessionId' }] };
+                            const existing = executorManager.get(sessionId);
+                            if (existing)
+                                return { content: [{ type: 'text', text: `Session "${sessionId}" already exists.` }] };
+                            executorManager.getOrCreate(sessionId);
+                            return { content: [{ type: 'text', text: `Session "${sessionId}" created.` }] };
                         }
-                        await sendCdpCommand(session, 'Network.deleteCookies', delParams);
-                        return { content: [{ type: 'text', text: `Cookie "${cookieName}" deleted.` }] };
-                    }
-                    case 'get_local_storage':
-                    case 'get_session_storage': {
-                        const isLocal = action === 'get_local_storage';
-                        const storageType = isLocal ? 'localStorage' : 'sessionStorage';
-                        const key = args.key;
-                        if (key) {
-                            const val = await evaluateJs(session, `${storageType}.getItem(${JSON.stringify(key)})`);
-                            return { content: [{ type: 'text', text: val !== null ? `${storageType}[${key}] = ${String(val)}` : `${storageType}[${key}] = (not set)` }] };
+                        case 'switch': {
+                            if (!sessionId)
+                                return { content: [{ type: 'text', text: 'Error: switch requires sessionId' }] };
+                            const executor = executorManager.get(sessionId);
+                            if (!executor)
+                                return { content: [{ type: 'text', text: `Session "${sessionId}" not found. Use "create" first.` }] };
+                            return { content: [{ type: 'text', text: `Switched to session "${sessionId}". Use playwright_execute with this session context.` }] };
                         }
-                        const result = await evaluateJs(session, `JSON.stringify(Object.fromEntries(Object.entries(${storageType})))`);
-                        const parsed = typeof result === 'string' ? JSON.parse(result) : {};
-                        const entries = Object.entries(parsed);
-                        if (entries.length === 0)
-                            return { content: [{ type: 'text', text: `${storageType} is empty.` }] };
-                        const lines = entries.map(([k, v]) => {
-                            const vs = String(v);
-                            return `  ${k}: ${vs.slice(0, 200)}${vs.length > 200 ? '...' : ''}`;
-                        });
-                        return { content: [{ type: 'text', text: `${storageType} (${entries.length} entries):\n${lines.join('\n')}` }] };
+                        case 'remove': {
+                            if (!sessionId)
+                                return { content: [{ type: 'text', text: 'Error: remove requires sessionId' }] };
+                            const removed = await executorManager.remove(sessionId);
+                            return { content: [{ type: 'text', text: removed ? `Session "${sessionId}" removed.` : `Session "${sessionId}" not found.` }] };
+                        }
+                        case 'remove_all': {
+                            const count = executorManager.size;
+                            await executorManager.resetAll();
+                            return { content: [{ type: 'text', text: `All ${count} sessions removed.` }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown session action: ${action}. Use: list, create, switch, remove, remove_all` }] };
                     }
-                    case 'set_local_storage': {
-                        const key = args.key;
-                        const val = args.value;
-                        if (!key || val === undefined)
-                            return { content: [{ type: 'text', text: 'Error: set_local_storage requires key and value' }] };
-                        await evaluateJs(session, `localStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(val)})`);
-                        return { content: [{ type: 'text', text: `localStorage[${key}] set.` }] };
-                    }
-                    case 'remove_local_storage': {
-                        const key = args.key;
-                        if (!key)
-                            return { content: [{ type: 'text', text: 'Error: remove_local_storage requires key' }] };
-                        await evaluateJs(session, `localStorage.removeItem(${JSON.stringify(key)})`);
-                        return { content: [{ type: 'text', text: `localStorage[${key}] removed.` }] };
-                    }
-                    case 'clear_storage': {
-                        const origin = args.origin || await evaluateJs(session, 'window.location.origin');
-                        const types = args.storage_types || 'all';
-                        await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: types });
-                        return { content: [{ type: 'text', text: `Storage cleared for ${origin} (types: ${types}).` }] };
-                    }
-                    case 'get_storage_usage': {
-                        const origin = args.origin || await evaluateJs(session, 'window.location.origin');
-                        const result = await sendCdpCommand(session, 'Storage.getUsageAndQuota', { origin });
-                        const total = `Usage: ${(result.usage / 1024).toFixed(1)}KB / ${(result.quota / (1024 * 1024)).toFixed(1)}MB (${((result.usage / result.quota) * 100).toFixed(1)}%)`;
-                        const breakdown = (result.usageBreakdown || [])
-                            .filter(b => b.usage > 0)
-                            .map(b => `  ${b.storageType}: ${(b.usage / 1024).toFixed(1)}KB`)
-                            .join('\n');
-                        return { content: [{ type: 'text', text: `${total}${breakdown ? '\n\nBreakdown:\n' + breakdown : ''}` }] };
-                    }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown storage action: ${action}` }] };
                 }
-            }
-            case 'performance': {
-                const action = args.action;
-                switch (action) {
-                    case 'get_metrics': {
-                        await sendCdpCommand(session, 'Performance.enable');
-                        const result = await sendCdpCommand(session, 'Performance.getMetrics');
-                        await sendCdpCommand(session, 'Performance.disable');
-                        const metrics = result?.metrics || [];
-                        if (metrics.length === 0)
-                            return { content: [{ type: 'text', text: 'No metrics available.' }] };
-                        const keyMetrics = ['Timestamp', 'Documents', 'Frames', 'JSEventListeners', 'Nodes', 'LayoutCount',
-                            'RecalcStyleCount', 'LayoutDuration', 'RecalcStyleDuration', 'ScriptDuration', 'TaskDuration',
-                            'JSHeapUsedSize', 'JSHeapTotalSize'];
-                        const lines = metrics
-                            .filter(m => keyMetrics.includes(m.name))
-                            .map(m => {
-                            if (m.name.includes('HeapUsedSize') || m.name.includes('HeapTotalSize'))
-                                return `  ${m.name}: ${(m.value / (1024 * 1024)).toFixed(2)}MB`;
-                            if (m.name.includes('Duration'))
-                                return `  ${m.name}: ${(m.value * 1000).toFixed(1)}ms`;
-                            return `  ${m.name}: ${m.value}`;
-                        });
-                        return { content: [{ type: 'text', text: `Performance Metrics:\n${lines.join('\n')}` }] };
+                case 'storage': {
+                    const action = args.action;
+                    switch (action) {
+                        case 'get_cookies': {
+                            const result = await sendCdpCommand(session, 'Network.getCookies');
+                            const cookies = result?.cookies || [];
+                            if (cookies.length === 0)
+                                return { content: [{ type: 'text', text: 'No cookies found.' }] };
+                            const lines = cookies.map(c => `${c.name}=${String(c.value).slice(0, 80)}${String(c.value).length > 80 ? '...' : ''} (domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'})`);
+                            return { content: [{ type: 'text', text: `Cookies (${cookies.length}):\n${lines.join('\n')}` }] };
+                        }
+                        case 'set_cookie': {
+                            const cookieName = args.name;
+                            const cookieValue = args.value;
+                            if (!cookieName || cookieValue === undefined)
+                                return { content: [{ type: 'text', text: 'Error: set_cookie requires name and value' }] };
+                            const cookieParams = { name: cookieName, value: cookieValue };
+                            if (args.domain)
+                                cookieParams.domain = args.domain;
+                            if (args.url)
+                                cookieParams.url = args.url;
+                            if (args.path)
+                                cookieParams.path = args.path;
+                            if (args.secure !== undefined)
+                                cookieParams.secure = args.secure;
+                            if (args.httpOnly !== undefined)
+                                cookieParams.httpOnly = args.httpOnly;
+                            if (args.sameSite)
+                                cookieParams.sameSite = args.sameSite;
+                            if (args.expires)
+                                cookieParams.expires = args.expires;
+                            if (!cookieParams.url && !cookieParams.domain) {
+                                const pageUrl = await evaluateJs(session, 'window.location.href');
+                                cookieParams.url = pageUrl;
+                            }
+                            const result = await sendCdpCommand(session, 'Network.setCookie', cookieParams);
+                            return { content: [{ type: 'text', text: result?.success ? `Cookie "${cookieName}" set.` : `Failed to set cookie "${cookieName}".` }] };
+                        }
+                        case 'delete_cookie': {
+                            const cookieName = args.name;
+                            if (!cookieName)
+                                return { content: [{ type: 'text', text: 'Error: delete_cookie requires name' }] };
+                            const delParams = { name: cookieName };
+                            if (args.domain)
+                                delParams.domain = args.domain;
+                            if (args.url)
+                                delParams.url = args.url;
+                            if (args.path)
+                                delParams.path = args.path;
+                            if (!delParams.url && !delParams.domain) {
+                                const pageUrl = await evaluateJs(session, 'window.location.href');
+                                delParams.url = pageUrl;
+                            }
+                            await sendCdpCommand(session, 'Network.deleteCookies', delParams);
+                            return { content: [{ type: 'text', text: `Cookie "${cookieName}" deleted.` }] };
+                        }
+                        case 'get_local_storage':
+                        case 'get_session_storage': {
+                            const isLocal = action === 'get_local_storage';
+                            const storageType = isLocal ? 'localStorage' : 'sessionStorage';
+                            const key = args.key;
+                            if (key) {
+                                const val = await evaluateJs(session, `${storageType}.getItem(${JSON.stringify(key)})`);
+                                return { content: [{ type: 'text', text: val !== null ? `${storageType}[${key}] = ${String(val)}` : `${storageType}[${key}] = (not set)` }] };
+                            }
+                            const result = await evaluateJs(session, `JSON.stringify(Object.fromEntries(Object.entries(${storageType})))`);
+                            const parsed = typeof result === 'string' ? JSON.parse(result) : {};
+                            const entries = Object.entries(parsed);
+                            if (entries.length === 0)
+                                return { content: [{ type: 'text', text: `${storageType} is empty.` }] };
+                            const lines = entries.map(([k, v]) => {
+                                const vs = String(v);
+                                return `  ${k}: ${vs.slice(0, 200)}${vs.length > 200 ? '...' : ''}`;
+                            });
+                            return { content: [{ type: 'text', text: `${storageType} (${entries.length} entries):\n${lines.join('\n')}` }] };
+                        }
+                        case 'set_local_storage': {
+                            const key = args.key;
+                            const val = args.value;
+                            if (!key || val === undefined)
+                                return { content: [{ type: 'text', text: 'Error: set_local_storage requires key and value' }] };
+                            await evaluateJs(session, `localStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(val)})`);
+                            return { content: [{ type: 'text', text: `localStorage[${key}] set.` }] };
+                        }
+                        case 'remove_local_storage': {
+                            const key = args.key;
+                            if (!key)
+                                return { content: [{ type: 'text', text: 'Error: remove_local_storage requires key' }] };
+                            await evaluateJs(session, `localStorage.removeItem(${JSON.stringify(key)})`);
+                            return { content: [{ type: 'text', text: `localStorage[${key}] removed.` }] };
+                        }
+                        case 'clear_storage': {
+                            const origin = args.origin || await evaluateJs(session, 'window.location.origin');
+                            const types = args.storage_types || 'all';
+                            await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: types });
+                            return { content: [{ type: 'text', text: `Storage cleared for ${origin} (types: ${types}).` }] };
+                        }
+                        case 'get_storage_usage': {
+                            const origin = args.origin || await evaluateJs(session, 'window.location.origin');
+                            const result = await sendCdpCommand(session, 'Storage.getUsageAndQuota', { origin });
+                            const total = `Usage: ${(result.usage / 1024).toFixed(1)}KB / ${(result.quota / (1024 * 1024)).toFixed(1)}MB (${((result.usage / result.quota) * 100).toFixed(1)}%)`;
+                            const breakdown = (result.usageBreakdown || [])
+                                .filter(b => b.usage > 0)
+                                .map(b => `  ${b.storageType}: ${(b.usage / 1024).toFixed(1)}KB`)
+                                .join('\n');
+                            return { content: [{ type: 'text', text: `${total}${breakdown ? '\n\nBreakdown:\n' + breakdown : ''}` }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown storage action: ${action}` }] };
                     }
-                    case 'get_web_vitals': {
-                        const code = `JSON.stringify({
+                }
+                case 'performance': {
+                    const action = args.action;
+                    switch (action) {
+                        case 'get_metrics': {
+                            await sendCdpCommand(session, 'Performance.enable');
+                            const result = await sendCdpCommand(session, 'Performance.getMetrics');
+                            await sendCdpCommand(session, 'Performance.disable');
+                            const metrics = result?.metrics || [];
+                            if (metrics.length === 0)
+                                return { content: [{ type: 'text', text: 'No metrics available.' }] };
+                            const keyMetrics = ['Timestamp', 'Documents', 'Frames', 'JSEventListeners', 'Nodes', 'LayoutCount',
+                                'RecalcStyleCount', 'LayoutDuration', 'RecalcStyleDuration', 'ScriptDuration', 'TaskDuration',
+                                'JSHeapUsedSize', 'JSHeapTotalSize'];
+                            const lines = metrics
+                                .filter(m => keyMetrics.includes(m.name))
+                                .map(m => {
+                                if (m.name.includes('HeapUsedSize') || m.name.includes('HeapTotalSize'))
+                                    return `  ${m.name}: ${(m.value / (1024 * 1024)).toFixed(2)}MB`;
+                                if (m.name.includes('Duration'))
+                                    return `  ${m.name}: ${(m.value * 1000).toFixed(1)}ms`;
+                                return `  ${m.name}: ${m.value}`;
+                            });
+                            return { content: [{ type: 'text', text: `Performance Metrics:\n${lines.join('\n')}` }] };
+                        }
+                        case 'get_web_vitals': {
+                            const code = `JSON.stringify({
               lcp: window.__spawriter_lcp || null,
               cls: window.__spawriter_cls || null,
               inp: window.__spawriter_inp || null,
@@ -1722,26 +1736,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               domComplete: performance.getEntriesByType('navigation')[0]?.domComplete || null,
               loadTime: performance.getEntriesByType('navigation')[0]?.loadEventEnd || null,
             })`;
-                        const raw = await evaluateJs(session, code);
-                        const vitals = typeof raw === 'string' ? JSON.parse(raw) : {};
-                        const fmt = (val, unit, good, poor) => {
-                            if (val === null || val === undefined)
-                                return '(not measured)';
-                            const s = unit === 'ms' ? `${val.toFixed(0)}ms` : val.toFixed(3);
-                            const grade = val <= good ? '✅ Good' : val <= poor ? '⚠️ Needs Improvement' : '❌ Poor';
-                            return `${s} ${grade}`;
-                        };
-                        const lines = [
-                            `  LCP: ${fmt(vitals.lcp, 'ms', 2500, 4000)}`,
-                            `  CLS: ${fmt(vitals.cls, '', 0.1, 0.25)}`,
-                            `  INP: ${fmt(vitals.inp, 'ms', 200, 500)}`,
-                            `  FCP: ${vitals.fcp ? `${vitals.fcp.toFixed(0)}ms` : '(not available)'}`,
-                            `  TTFB: ${vitals.ttfb ? `${vitals.ttfb.toFixed(0)}ms` : '(not available)'}`,
-                            `  DOM Interactive: ${vitals.domInteractive ? `${vitals.domInteractive.toFixed(0)}ms` : '(n/a)'}`,
-                            `  DOM Complete: ${vitals.domComplete ? `${vitals.domComplete.toFixed(0)}ms` : '(n/a)'}`,
-                            `  Load: ${vitals.loadTime ? `${vitals.loadTime.toFixed(0)}ms` : '(n/a)'}`,
-                        ];
-                        const observerCode = `
+                            const raw = await evaluateJs(session, code);
+                            const vitals = typeof raw === 'string' ? JSON.parse(raw) : {};
+                            const fmt = (val, unit, good, poor) => {
+                                if (val === null || val === undefined)
+                                    return '(not measured)';
+                                const s = unit === 'ms' ? `${val.toFixed(0)}ms` : val.toFixed(3);
+                                const grade = val <= good ? '✅ Good' : val <= poor ? '⚠️ Needs Improvement' : '❌ Poor';
+                                return `${s} ${grade}`;
+                            };
+                            const lines = [
+                                `  LCP: ${fmt(vitals.lcp, 'ms', 2500, 4000)}`,
+                                `  CLS: ${fmt(vitals.cls, '', 0.1, 0.25)}`,
+                                `  INP: ${fmt(vitals.inp, 'ms', 200, 500)}`,
+                                `  FCP: ${vitals.fcp ? `${vitals.fcp.toFixed(0)}ms` : '(not available)'}`,
+                                `  TTFB: ${vitals.ttfb ? `${vitals.ttfb.toFixed(0)}ms` : '(not available)'}`,
+                                `  DOM Interactive: ${vitals.domInteractive ? `${vitals.domInteractive.toFixed(0)}ms` : '(n/a)'}`,
+                                `  DOM Complete: ${vitals.domComplete ? `${vitals.domComplete.toFixed(0)}ms` : '(n/a)'}`,
+                                `  Load: ${vitals.loadTime ? `${vitals.loadTime.toFixed(0)}ms` : '(n/a)'}`,
+                            ];
+                            const observerCode = `
               if (!window.__spawriter_lcp_obs) {
                 window.__spawriter_lcp = 0; window.__spawriter_cls = 0; window.__spawriter_inp = Infinity;
                 new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_lcp = e.startTime; }).observe({type:'largest-contentful-paint',buffered:true});
@@ -1750,179 +1764,179 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 window.__spawriter_lcp_obs = true;
               }
               'observers_active'`;
-                        await evaluateJs(session, observerCode);
-                        return { content: [{ type: 'text', text: `Web Vitals:\n${lines.join('\n')}\n\n(Note: LCP/CLS/INP require observers — run this tool again for updated values after page interaction.)` }] };
-                    }
-                    case 'get_memory': {
-                        await sendCdpCommand(session, 'Performance.enable');
-                        const result = await sendCdpCommand(session, 'Performance.getMetrics');
-                        await sendCdpCommand(session, 'Performance.disable');
-                        const m = Object.fromEntries((result?.metrics || []).map(x => [x.name, x.value]));
-                        const heapUsed = m['JSHeapUsedSize'] || 0;
-                        const heapTotal = m['JSHeapTotalSize'] || 0;
-                        const nodes = m['Nodes'] || 0;
-                        const listeners = m['JSEventListeners'] || 0;
-                        const docs = m['Documents'] || 0;
-                        const frames = m['Frames'] || 0;
-                        return { content: [{ type: 'text', text: `Memory:\n  JS Heap: ${(heapUsed / (1024 * 1024)).toFixed(2)}MB / ${(heapTotal / (1024 * 1024)).toFixed(2)}MB (${heapTotal > 0 ? ((heapUsed / heapTotal) * 100).toFixed(1) : 0}%)\n  DOM Nodes: ${nodes}\n  Event Listeners: ${listeners}\n  Documents: ${docs}\n  Frames: ${frames}` }] };
-                    }
-                    case 'get_resource_timing': {
-                        const count = args.count || 20;
-                        const typeFilter = args.type_filter || '';
-                        const code = `JSON.stringify(performance.getEntriesByType('resource').map(e => ({
+                            await evaluateJs(session, observerCode);
+                            return { content: [{ type: 'text', text: `Web Vitals:\n${lines.join('\n')}\n\n(Note: LCP/CLS/INP require observers — run this tool again for updated values after page interaction.)` }] };
+                        }
+                        case 'get_memory': {
+                            await sendCdpCommand(session, 'Performance.enable');
+                            const result = await sendCdpCommand(session, 'Performance.getMetrics');
+                            await sendCdpCommand(session, 'Performance.disable');
+                            const m = Object.fromEntries((result?.metrics || []).map(x => [x.name, x.value]));
+                            const heapUsed = m['JSHeapUsedSize'] || 0;
+                            const heapTotal = m['JSHeapTotalSize'] || 0;
+                            const nodes = m['Nodes'] || 0;
+                            const listeners = m['JSEventListeners'] || 0;
+                            const docs = m['Documents'] || 0;
+                            const frames = m['Frames'] || 0;
+                            return { content: [{ type: 'text', text: `Memory:\n  JS Heap: ${(heapUsed / (1024 * 1024)).toFixed(2)}MB / ${(heapTotal / (1024 * 1024)).toFixed(2)}MB (${heapTotal > 0 ? ((heapUsed / heapTotal) * 100).toFixed(1) : 0}%)\n  DOM Nodes: ${nodes}\n  Event Listeners: ${listeners}\n  Documents: ${docs}\n  Frames: ${frames}` }] };
+                        }
+                        case 'get_resource_timing': {
+                            const count = args.count || 20;
+                            const typeFilter = args.type_filter || '';
+                            const code = `JSON.stringify(performance.getEntriesByType('resource').map(e => ({
               name: e.name, type: e.initiatorType, duration: e.duration,
               transferSize: e.transferSize, decodedBodySize: e.decodedBodySize,
               startTime: e.startTime
             })))`;
-                        const raw = await evaluateJs(session, code);
-                        let resources = typeof raw === 'string' ? JSON.parse(raw) : [];
-                        if (typeFilter)
-                            resources = resources.filter(r => r.type.toLowerCase().includes(typeFilter.toLowerCase()));
-                        resources.sort((a, b) => b.duration - a.duration);
-                        resources = resources.slice(0, count);
-                        if (resources.length === 0)
-                            return { content: [{ type: 'text', text: 'No resource timing entries found.' }] };
-                        const lines = resources.map(r => {
-                            const url = r.name.length > 80 ? '...' + r.name.slice(-77) : r.name;
-                            return `  ${r.duration.toFixed(0).padStart(6)}ms  ${(r.transferSize / 1024).toFixed(1).padStart(7)}KB  ${r.type.padEnd(12)}  ${url}`;
-                        });
-                        return { content: [{ type: 'text', text: `Resource Timing (top ${resources.length} by duration):\n  ${' '.padEnd(6)}ms  ${' '.padEnd(7)}KB  ${'type'.padEnd(12)}  URL\n${lines.join('\n')}` }] };
+                            const raw = await evaluateJs(session, code);
+                            let resources = typeof raw === 'string' ? JSON.parse(raw) : [];
+                            if (typeFilter)
+                                resources = resources.filter(r => r.type.toLowerCase().includes(typeFilter.toLowerCase()));
+                            resources.sort((a, b) => b.duration - a.duration);
+                            resources = resources.slice(0, count);
+                            if (resources.length === 0)
+                                return { content: [{ type: 'text', text: 'No resource timing entries found.' }] };
+                            const lines = resources.map(r => {
+                                const url = r.name.length > 80 ? '...' + r.name.slice(-77) : r.name;
+                                return `  ${r.duration.toFixed(0).padStart(6)}ms  ${(r.transferSize / 1024).toFixed(1).padStart(7)}KB  ${r.type.padEnd(12)}  ${url}`;
+                            });
+                            return { content: [{ type: 'text', text: `Resource Timing (top ${resources.length} by duration):\n  ${' '.padEnd(6)}ms  ${' '.padEnd(7)}KB  ${'type'.padEnd(12)}  URL\n${lines.join('\n')}` }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown performance action: ${action}` }] };
                     }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown performance action: ${action}` }] };
                 }
-            }
-            case 'editor': {
-                const action = args.action;
-                switch (action) {
-                    case 'list_sources': {
-                        const search = (args.search || '').toLowerCase();
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            await sendCdpCommand(session, 'Runtime.enable');
-                            debuggerEnabled = true;
-                            await new Promise(r => setTimeout(r, 200));
+                case 'editor': {
+                    const action = args.action;
+                    switch (action) {
+                        case 'list_sources': {
+                            const search = (args.search || '').toLowerCase();
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                await sendCdpCommand(session, 'Runtime.enable');
+                                debuggerEnabled = true;
+                                await new Promise(r => setTimeout(r, 200));
+                            }
+                            let scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
+                            if (search)
+                                scripts = scripts.filter(s => s.url.toLowerCase().includes(search));
+                            scripts = scripts.slice(0, 50);
+                            if (scripts.length === 0)
+                                return { content: [{ type: 'text', text: 'No scripts found.' }] };
+                            const lines = scripts.map(s => `  [${s.scriptId}] ${s.url}`);
+                            return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${lines.join('\n')}` }] };
                         }
-                        let scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
-                        if (search)
-                            scripts = scripts.filter(s => s.url.toLowerCase().includes(search));
-                        scripts = scripts.slice(0, 50);
-                        if (scripts.length === 0)
-                            return { content: [{ type: 'text', text: 'No scripts found.' }] };
-                        const lines = scripts.map(s => `  [${s.scriptId}] ${s.url}`);
-                        return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${lines.join('\n')}` }] };
-                    }
-                    case 'get_source': {
-                        const scriptId = args.scriptId;
-                        if (!scriptId)
-                            return { content: [{ type: 'text', text: 'Error: get_source requires scriptId' }] };
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            debuggerEnabled = true;
+                        case 'get_source': {
+                            const scriptId = args.scriptId;
+                            if (!scriptId)
+                                return { content: [{ type: 'text', text: 'Error: get_source requires scriptId' }] };
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                debuggerEnabled = true;
+                            }
+                            const result = await sendCdpCommand(session, 'Debugger.getScriptSource', { scriptId });
+                            let source = result?.scriptSource || '(empty)';
+                            const lineStart = args.line_start;
+                            const lineEnd = args.line_end;
+                            if (lineStart || lineEnd) {
+                                const srcLines = source.split('\n');
+                                const start = Math.max(1, lineStart || 1) - 1;
+                                const end = Math.min(srcLines.length, lineEnd || srcLines.length);
+                                source = srcLines.slice(start, end).map((l, i) => `${(start + i + 1).toString().padStart(5)}| ${l}`).join('\n');
+                            }
+                            else if (source.length > 50000) {
+                                source = source.slice(0, 50000) + `\n[Truncated to 50000 chars. Use line_start/line_end for specific ranges.]`;
+                            }
+                            return { content: [{ type: 'text', text: source }] };
                         }
-                        const result = await sendCdpCommand(session, 'Debugger.getScriptSource', { scriptId });
-                        let source = result?.scriptSource || '(empty)';
-                        const lineStart = args.line_start;
-                        const lineEnd = args.line_end;
-                        if (lineStart || lineEnd) {
-                            const srcLines = source.split('\n');
-                            const start = Math.max(1, lineStart || 1) - 1;
-                            const end = Math.min(srcLines.length, lineEnd || srcLines.length);
-                            source = srcLines.slice(start, end).map((l, i) => `${(start + i + 1).toString().padStart(5)}| ${l}`).join('\n');
-                        }
-                        else if (source.length > 50000) {
-                            source = source.slice(0, 50000) + `\n[Truncated to 50000 chars. Use line_start/line_end for specific ranges.]`;
-                        }
-                        return { content: [{ type: 'text', text: source }] };
-                    }
-                    case 'edit_source': {
-                        const scriptId = args.scriptId;
-                        const content = args.content;
-                        if (!scriptId || !content)
-                            return { content: [{ type: 'text', text: 'Error: edit_source requires scriptId and content' }] };
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            debuggerEnabled = true;
-                        }
-                        try {
-                            await sendCdpCommand(session, 'Debugger.setScriptSource', { scriptId, scriptSource: content });
-                            return { content: [{ type: 'text', text: `Script ${scriptId} updated (hot-reload applied).` }] };
-                        }
-                        catch (e) {
-                            const code = `
+                        case 'edit_source': {
+                            const scriptId = args.scriptId;
+                            const content = args.content;
+                            if (!scriptId || !content)
+                                return { content: [{ type: 'text', text: 'Error: edit_source requires scriptId and content' }] };
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                debuggerEnabled = true;
+                            }
+                            try {
+                                await sendCdpCommand(session, 'Debugger.setScriptSource', { scriptId, scriptSource: content });
+                                return { content: [{ type: 'text', text: `Script ${scriptId} updated (hot-reload applied).` }] };
+                            }
+                            catch (e) {
+                                const code = `
                 try {
                   const s = document.createElement('script');
                   s.textContent = ${JSON.stringify(content)};
                   document.head.appendChild(s);
                   'Script injected via DOM.'
                 } catch(e) { 'Fallback failed: ' + e.message }`;
-                            const fb = await evaluateJs(session, code);
-                            return { content: [{ type: 'text', text: `setScriptSource failed (${String(e)}). Fallback: ${fb}` }] };
-                        }
-                    }
-                    case 'search_source': {
-                        const search = args.search;
-                        if (!search)
-                            return { content: [{ type: 'text', text: 'Error: search_source requires search string' }] };
-                        if (!debuggerEnabled) {
-                            await sendCdpCommand(session, 'Debugger.enable');
-                            debuggerEnabled = true;
-                            await new Promise(r => setTimeout(r, 200));
-                        }
-                        const scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
-                        const matches = [];
-                        for (const s of scripts.slice(0, 30)) {
-                            try {
-                                const result = await sendCdpCommand(session, 'Debugger.searchInContent', { scriptId: s.scriptId, query: search });
-                                if (result?.result?.length) {
-                                    matches.push(`${s.url} (${result.result.length} matches):`);
-                                    for (const m of result.result.slice(0, 5)) {
-                                        matches.push(`  L${m.lineNumber + 1}: ${m.lineContent.trim().slice(0, 120)}`);
-                                    }
-                                    if (result.result.length > 5)
-                                        matches.push(`  ... and ${result.result.length - 5} more`);
-                                }
+                                const fb = await evaluateJs(session, code);
+                                return { content: [{ type: 'text', text: `setScriptSource failed (${String(e)}). Fallback: ${fb}` }] };
                             }
-                            catch { /* skip scripts that can't be searched */ }
                         }
-                        return { content: [{ type: 'text', text: matches.length > 0 ? `Search results for "${search}":\n${matches.join('\n')}` : `No results for "${search}" in loaded scripts.` }] };
-                    }
-                    case 'list_stylesheets': {
-                        await sendCdpCommand(session, 'CSS.enable');
-                        await sendCdpCommand(session, 'DOM.enable');
-                        const result = await sendCdpCommand(session, 'CSS.getStyleSheets' in {} ? 'CSS.getStyleSheets' : 'Runtime.evaluate', {
-                            expression: `JSON.stringify(Array.from(document.styleSheets).map((s, i) => ({ id: i, href: s.href || '(inline)', disabled: s.disabled, rules: s.cssRules?.length || 0 })))`,
-                            returnByValue: true,
-                        });
-                        const sheets = typeof result?.result?.value === 'string'
-                            ? JSON.parse((result?.result).value)
-                            : [];
-                        if (sheets.length === 0)
-                            return { content: [{ type: 'text', text: 'No stylesheets found.' }] };
-                        const lines = sheets.map((s) => `  [${s.id}] ${s.href} (${s.rules} rules${s.disabled ? ', disabled' : ''})`);
-                        return { content: [{ type: 'text', text: `Stylesheets (${sheets.length}):\n${lines.join('\n')}` }] };
-                    }
-                    case 'get_stylesheet': {
-                        const idx = args.styleSheetId;
-                        if (idx === undefined)
-                            return { content: [{ type: 'text', text: 'Error: get_stylesheet requires styleSheetId' }] };
-                        const code = `(() => {
+                        case 'search_source': {
+                            const search = args.search;
+                            if (!search)
+                                return { content: [{ type: 'text', text: 'Error: search_source requires search string' }] };
+                            if (!debuggerEnabled) {
+                                await sendCdpCommand(session, 'Debugger.enable');
+                                debuggerEnabled = true;
+                                await new Promise(r => setTimeout(r, 200));
+                            }
+                            const scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
+                            const matches = [];
+                            for (const s of scripts.slice(0, 30)) {
+                                try {
+                                    const result = await sendCdpCommand(session, 'Debugger.searchInContent', { scriptId: s.scriptId, query: search });
+                                    if (result?.result?.length) {
+                                        matches.push(`${s.url} (${result.result.length} matches):`);
+                                        for (const m of result.result.slice(0, 5)) {
+                                            matches.push(`  L${m.lineNumber + 1}: ${m.lineContent.trim().slice(0, 120)}`);
+                                        }
+                                        if (result.result.length > 5)
+                                            matches.push(`  ... and ${result.result.length - 5} more`);
+                                    }
+                                }
+                                catch { /* skip scripts that can't be searched */ }
+                            }
+                            return { content: [{ type: 'text', text: matches.length > 0 ? `Search results for "${search}":\n${matches.join('\n')}` : `No results for "${search}" in loaded scripts.` }] };
+                        }
+                        case 'list_stylesheets': {
+                            await sendCdpCommand(session, 'CSS.enable');
+                            await sendCdpCommand(session, 'DOM.enable');
+                            const result = await sendCdpCommand(session, 'CSS.getStyleSheets' in {} ? 'CSS.getStyleSheets' : 'Runtime.evaluate', {
+                                expression: `JSON.stringify(Array.from(document.styleSheets).map((s, i) => ({ id: i, href: s.href || '(inline)', disabled: s.disabled, rules: s.cssRules?.length || 0 })))`,
+                                returnByValue: true,
+                            });
+                            const sheets = typeof result?.result?.value === 'string'
+                                ? JSON.parse((result?.result).value)
+                                : [];
+                            if (sheets.length === 0)
+                                return { content: [{ type: 'text', text: 'No stylesheets found.' }] };
+                            const lines = sheets.map((s) => `  [${s.id}] ${s.href} (${s.rules} rules${s.disabled ? ', disabled' : ''})`);
+                            return { content: [{ type: 'text', text: `Stylesheets (${sheets.length}):\n${lines.join('\n')}` }] };
+                        }
+                        case 'get_stylesheet': {
+                            const idx = args.styleSheetId;
+                            if (idx === undefined)
+                                return { content: [{ type: 'text', text: 'Error: get_stylesheet requires styleSheetId' }] };
+                            const code = `(() => {
               const s = document.styleSheets[${parseInt(idx, 10)}];
               if (!s) return 'Stylesheet not found.';
               try { return Array.from(s.cssRules).map(r => r.cssText).join('\\n'); }
               catch(e) { return 'Cannot read rules (CORS): ' + e.message; }
             })()`;
-                        let cssText = await evaluateJs(session, code);
-                        if (cssText.length > 50000)
-                            cssText = cssText.slice(0, 50000) + '\n[Truncated]';
-                        return { content: [{ type: 'text', text: cssText }] };
-                    }
-                    case 'edit_stylesheet': {
-                        const idx = args.styleSheetId;
-                        const content = args.content;
-                        if (idx === undefined || !content)
-                            return { content: [{ type: 'text', text: 'Error: edit_stylesheet requires styleSheetId and content' }] };
-                        const code = `(() => {
+                            let cssText = await evaluateJs(session, code);
+                            if (cssText.length > 50000)
+                                cssText = cssText.slice(0, 50000) + '\n[Truncated]';
+                            return { content: [{ type: 'text', text: cssText }] };
+                        }
+                        case 'edit_stylesheet': {
+                            const idx = args.styleSheetId;
+                            const content = args.content;
+                            if (idx === undefined || !content)
+                                return { content: [{ type: 'text', text: 'Error: edit_stylesheet requires styleSheetId and content' }] };
+                            const code = `(() => {
               const s = document.styleSheets[${parseInt(idx, 10)}];
               if (!s) return 'Stylesheet not found.';
               while (s.cssRules.length > 0) s.deleteRule(0);
@@ -1930,172 +1944,172 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               rules.forEach(r => { try { s.insertRule(r.trim() + '}', s.cssRules.length); } catch(e) {} });
               return 'Stylesheet updated (' + s.cssRules.length + ' rules applied).';
             })()`;
-                        const result = await evaluateJs(session, code);
-                        return { content: [{ type: 'text', text: String(result) }] };
-                    }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown editor action: ${action}` }] };
-                }
-            }
-            case 'network_intercept': {
-                const action = args.action;
-                switch (action) {
-                    case 'enable': {
-                        const patterns = [{ urlPattern: args.url_pattern || '*', requestStage: 'Request' }];
-                        await sendCdpCommand(session, 'Fetch.enable', { patterns });
-                        interceptEnabled = true;
-                        return { content: [{ type: 'text', text: `Network interception enabled. ${interceptRules.size} rules active.` }] };
-                    }
-                    case 'disable': {
-                        await sendCdpCommand(session, 'Fetch.disable');
-                        interceptEnabled = false;
-                        return { content: [{ type: 'text', text: 'Network interception disabled.' }] };
-                    }
-                    case 'list_rules': {
-                        const rules = Array.from(interceptRules.values());
-                        if (rules.length === 0)
-                            return { content: [{ type: 'text', text: `No intercept rules. Interception is ${interceptEnabled ? 'enabled' : 'disabled'}.` }] };
-                        const lines = rules.map(r => {
-                            const parts = [`[${r.id}] pattern="${r.urlPattern}"`];
-                            if (r.resourceType)
-                                parts.push(`type=${r.resourceType}`);
-                            if (r.block)
-                                parts.push('→ BLOCK');
-                            else if (r.mockStatus !== undefined)
-                                parts.push(`→ mock ${r.mockStatus}`);
-                            return parts.join(' ');
-                        });
-                        return { content: [{ type: 'text', text: `Intercept rules (${rules.length}, ${interceptEnabled ? 'enabled' : 'disabled'}):\n${lines.join('\n')}` }] };
-                    }
-                    case 'add_rule': {
-                        const urlPattern = args.url_pattern;
-                        if (!urlPattern)
-                            return { content: [{ type: 'text', text: 'Error: add_rule requires url_pattern' }] };
-                        const ruleId = `rule_${interceptNextId++}`;
-                        const rule = { id: ruleId, urlPattern, resourceType: args.resource_type };
-                        if (args.block) {
-                            rule.block = true;
+                            const result = await evaluateJs(session, code);
+                            return { content: [{ type: 'text', text: String(result) }] };
                         }
-                        else if (args.mock_status !== undefined) {
-                            rule.mockStatus = args.mock_status;
-                            if (args.mock_headers)
-                                rule.mockHeaders = JSON.parse(args.mock_headers);
-                            if (args.mock_body !== undefined)
-                                rule.mockBody = args.mock_body;
-                        }
-                        interceptRules.set(ruleId, rule);
-                        return { content: [{ type: 'text', text: `Rule added: ${ruleId} (pattern="${urlPattern}"${rule.block ? ', block' : ''}${rule.mockStatus !== undefined ? `, mock ${rule.mockStatus}` : ''})` }] };
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown editor action: ${action}` }] };
                     }
-                    case 'remove_rule': {
-                        const ruleId = args.rule_id;
-                        if (!ruleId)
-                            return { content: [{ type: 'text', text: 'Error: remove_rule requires rule_id' }] };
-                        const removed = interceptRules.delete(ruleId);
-                        return { content: [{ type: 'text', text: removed ? `Rule ${ruleId} removed.` : `Rule ${ruleId} not found.` }] };
-                    }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown intercept action: ${action}` }] };
                 }
-            }
-            case 'emulation': {
-                const action = args.action;
-                switch (action) {
-                    case 'set_device': {
-                        const width = args.width || 375;
-                        const height = args.height || 812;
-                        const dpr = args.device_scale_factor || 1;
-                        const mobile = args.mobile ?? false;
-                        await sendCdpCommand(session, 'Emulation.setDeviceMetricsOverride', {
-                            width, height, deviceScaleFactor: dpr, mobile,
-                        });
-                        return { content: [{ type: 'text', text: `Device emulation: ${width}x${height} @${dpr}x${mobile ? ' (mobile)' : ''}` }] };
+                case 'network_intercept': {
+                    const action = args.action;
+                    switch (action) {
+                        case 'enable': {
+                            const patterns = [{ urlPattern: args.url_pattern || '*', requestStage: 'Request' }];
+                            await sendCdpCommand(session, 'Fetch.enable', { patterns });
+                            interceptEnabled = true;
+                            return { content: [{ type: 'text', text: `Network interception enabled. ${interceptRules.size} rules active.` }] };
+                        }
+                        case 'disable': {
+                            await sendCdpCommand(session, 'Fetch.disable');
+                            interceptEnabled = false;
+                            return { content: [{ type: 'text', text: 'Network interception disabled.' }] };
+                        }
+                        case 'list_rules': {
+                            const rules = Array.from(interceptRules.values());
+                            if (rules.length === 0)
+                                return { content: [{ type: 'text', text: `No intercept rules. Interception is ${interceptEnabled ? 'enabled' : 'disabled'}.` }] };
+                            const lines = rules.map(r => {
+                                const parts = [`[${r.id}] pattern="${r.urlPattern}"`];
+                                if (r.resourceType)
+                                    parts.push(`type=${r.resourceType}`);
+                                if (r.block)
+                                    parts.push('→ BLOCK');
+                                else if (r.mockStatus !== undefined)
+                                    parts.push(`→ mock ${r.mockStatus}`);
+                                return parts.join(' ');
+                            });
+                            return { content: [{ type: 'text', text: `Intercept rules (${rules.length}, ${interceptEnabled ? 'enabled' : 'disabled'}):\n${lines.join('\n')}` }] };
+                        }
+                        case 'add_rule': {
+                            const urlPattern = args.url_pattern;
+                            if (!urlPattern)
+                                return { content: [{ type: 'text', text: 'Error: add_rule requires url_pattern' }] };
+                            const ruleId = `rule_${interceptNextId++}`;
+                            const rule = { id: ruleId, urlPattern, resourceType: args.resource_type };
+                            if (args.block) {
+                                rule.block = true;
+                            }
+                            else if (args.mock_status !== undefined) {
+                                rule.mockStatus = args.mock_status;
+                                if (args.mock_headers)
+                                    rule.mockHeaders = JSON.parse(args.mock_headers);
+                                if (args.mock_body !== undefined)
+                                    rule.mockBody = args.mock_body;
+                            }
+                            interceptRules.set(ruleId, rule);
+                            return { content: [{ type: 'text', text: `Rule added: ${ruleId} (pattern="${urlPattern}"${rule.block ? ', block' : ''}${rule.mockStatus !== undefined ? `, mock ${rule.mockStatus}` : ''})` }] };
+                        }
+                        case 'remove_rule': {
+                            const ruleId = args.rule_id;
+                            if (!ruleId)
+                                return { content: [{ type: 'text', text: 'Error: remove_rule requires rule_id' }] };
+                            const removed = interceptRules.delete(ruleId);
+                            return { content: [{ type: 'text', text: removed ? `Rule ${ruleId} removed.` : `Rule ${ruleId} not found.` }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown intercept action: ${action}` }] };
                     }
-                    case 'set_user_agent': {
-                        const ua = args.user_agent;
-                        if (!ua)
-                            return { content: [{ type: 'text', text: 'Error: set_user_agent requires user_agent' }] };
-                        await sendCdpCommand(session, 'Emulation.setUserAgentOverride', { userAgent: ua });
-                        return { content: [{ type: 'text', text: `User agent set.` }] };
-                    }
-                    case 'set_geolocation': {
-                        const lat = args.latitude;
-                        const lng = args.longitude;
-                        if (lat === undefined || lng === undefined)
-                            return { content: [{ type: 'text', text: 'Error: set_geolocation requires latitude and longitude' }] };
-                        await sendCdpCommand(session, 'Emulation.setGeolocationOverride', {
-                            latitude: lat, longitude: lng, accuracy: args.accuracy || 1,
-                        });
-                        return { content: [{ type: 'text', text: `Geolocation: ${lat}, ${lng}` }] };
-                    }
-                    case 'set_timezone': {
-                        const tz = args.timezone_id;
-                        if (!tz)
-                            return { content: [{ type: 'text', text: 'Error: set_timezone requires timezone_id' }] };
-                        await sendCdpCommand(session, 'Emulation.setTimezoneOverride', { timezoneId: tz });
-                        return { content: [{ type: 'text', text: `Timezone: ${tz}` }] };
-                    }
-                    case 'set_locale': {
-                        const loc = args.locale;
-                        if (!loc)
-                            return { content: [{ type: 'text', text: 'Error: set_locale requires locale' }] };
-                        await sendCdpCommand(session, 'Emulation.setLocaleOverride', { locale: loc });
-                        return { content: [{ type: 'text', text: `Locale: ${loc}` }] };
-                    }
-                    case 'set_network_conditions': {
-                        const presets = {
-                            'offline': { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
-                            'slow-3g': { offline: false, latency: 2000, downloadThroughput: 50 * 1024, uploadThroughput: 50 * 1024 },
-                            'fast-3g': { offline: false, latency: 562, downloadThroughput: 180 * 1024, uploadThroughput: 84 * 1024 },
-                            '4g': { offline: false, latency: 170, downloadThroughput: 1.5 * 1024 * 1024, uploadThroughput: 750 * 1024 },
-                            'wifi': { offline: false, latency: 28, downloadThroughput: 30 * 1024 * 1024, uploadThroughput: 15 * 1024 * 1024 },
-                        };
-                        const preset = args.preset;
-                        const params = preset && presets[preset]
-                            ? presets[preset]
-                            : {
-                                offline: false,
-                                latency: args.latency || 0,
-                                downloadThroughput: args.download || -1,
-                                uploadThroughput: args.upload || -1,
+                }
+                case 'emulation': {
+                    const action = args.action;
+                    switch (action) {
+                        case 'set_device': {
+                            const width = args.width || 375;
+                            const height = args.height || 812;
+                            const dpr = args.device_scale_factor || 1;
+                            const mobile = args.mobile ?? false;
+                            await sendCdpCommand(session, 'Emulation.setDeviceMetricsOverride', {
+                                width, height, deviceScaleFactor: dpr, mobile,
+                            });
+                            return { content: [{ type: 'text', text: `Device emulation: ${width}x${height} @${dpr}x${mobile ? ' (mobile)' : ''}` }] };
+                        }
+                        case 'set_user_agent': {
+                            const ua = args.user_agent;
+                            if (!ua)
+                                return { content: [{ type: 'text', text: 'Error: set_user_agent requires user_agent' }] };
+                            await sendCdpCommand(session, 'Emulation.setUserAgentOverride', { userAgent: ua });
+                            return { content: [{ type: 'text', text: `User agent set.` }] };
+                        }
+                        case 'set_geolocation': {
+                            const lat = args.latitude;
+                            const lng = args.longitude;
+                            if (lat === undefined || lng === undefined)
+                                return { content: [{ type: 'text', text: 'Error: set_geolocation requires latitude and longitude' }] };
+                            await sendCdpCommand(session, 'Emulation.setGeolocationOverride', {
+                                latitude: lat, longitude: lng, accuracy: args.accuracy || 1,
+                            });
+                            return { content: [{ type: 'text', text: `Geolocation: ${lat}, ${lng}` }] };
+                        }
+                        case 'set_timezone': {
+                            const tz = args.timezone_id;
+                            if (!tz)
+                                return { content: [{ type: 'text', text: 'Error: set_timezone requires timezone_id' }] };
+                            await sendCdpCommand(session, 'Emulation.setTimezoneOverride', { timezoneId: tz });
+                            return { content: [{ type: 'text', text: `Timezone: ${tz}` }] };
+                        }
+                        case 'set_locale': {
+                            const loc = args.locale;
+                            if (!loc)
+                                return { content: [{ type: 'text', text: 'Error: set_locale requires locale' }] };
+                            await sendCdpCommand(session, 'Emulation.setLocaleOverride', { locale: loc });
+                            return { content: [{ type: 'text', text: `Locale: ${loc}` }] };
+                        }
+                        case 'set_network_conditions': {
+                            const presets = {
+                                'offline': { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+                                'slow-3g': { offline: false, latency: 2000, downloadThroughput: 50 * 1024, uploadThroughput: 50 * 1024 },
+                                'fast-3g': { offline: false, latency: 562, downloadThroughput: 180 * 1024, uploadThroughput: 84 * 1024 },
+                                '4g': { offline: false, latency: 170, downloadThroughput: 1.5 * 1024 * 1024, uploadThroughput: 750 * 1024 },
+                                'wifi': { offline: false, latency: 28, downloadThroughput: 30 * 1024 * 1024, uploadThroughput: 15 * 1024 * 1024 },
                             };
-                        await sendCdpCommand(session, 'Network.emulateNetworkConditions', params);
-                        return { content: [{ type: 'text', text: `Network: ${preset || 'custom'} (latency=${params.latency}ms, down=${params.downloadThroughput > 0 ? (params.downloadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'}, up=${params.uploadThroughput > 0 ? (params.uploadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'})` }] };
-                    }
-                    case 'set_media': {
-                        const features = (args.features || '').split(',').filter(f => f.includes(':')).map(f => {
-                            const [n, v] = f.trim().split(':');
-                            return { name: n.trim(), value: v.trim() };
-                        });
-                        await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features });
-                        return { content: [{ type: 'text', text: `Media features: ${features.map(f => `${f.name}:${f.value}`).join(', ') || '(cleared)'}` }] };
-                    }
-                    case 'clear_all': {
-                        await sendCdpCommand(session, 'Emulation.clearDeviceMetricsOverride');
-                        await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features: [] });
-                        try {
-                            await sendCdpCommand(session, 'Emulation.clearGeolocationOverride');
+                            const preset = args.preset;
+                            const params = preset && presets[preset]
+                                ? presets[preset]
+                                : {
+                                    offline: false,
+                                    latency: args.latency || 0,
+                                    downloadThroughput: args.download || -1,
+                                    uploadThroughput: args.upload || -1,
+                                };
+                            await sendCdpCommand(session, 'Network.emulateNetworkConditions', params);
+                            return { content: [{ type: 'text', text: `Network: ${preset || 'custom'} (latency=${params.latency}ms, down=${params.downloadThroughput > 0 ? (params.downloadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'}, up=${params.uploadThroughput > 0 ? (params.uploadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'})` }] };
                         }
-                        catch { /* ok */ }
-                        try {
-                            await sendCdpCommand(session, 'Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+                        case 'set_media': {
+                            const features = (args.features || '').split(',').filter(f => f.includes(':')).map(f => {
+                                const [n, v] = f.trim().split(':');
+                                return { name: n.trim(), value: v.trim() };
+                            });
+                            await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features });
+                            return { content: [{ type: 'text', text: `Media features: ${features.map(f => `${f.name}:${f.value}`).join(', ') || '(cleared)'}` }] };
                         }
-                        catch { /* ok */ }
-                        return { content: [{ type: 'text', text: 'All emulations cleared.' }] };
+                        case 'clear_all': {
+                            await sendCdpCommand(session, 'Emulation.clearDeviceMetricsOverride');
+                            await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features: [] });
+                            try {
+                                await sendCdpCommand(session, 'Emulation.clearGeolocationOverride');
+                            }
+                            catch { /* ok */ }
+                            try {
+                                await sendCdpCommand(session, 'Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+                            }
+                            catch { /* ok */ }
+                            return { content: [{ type: 'text', text: 'All emulations cleared.' }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown emulation action: ${action}` }] };
                     }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown emulation action: ${action}` }] };
                 }
-            }
-            case 'page_content': {
-                const action = args.action;
-                const selector = args.selector || 'body';
-                const maxLength = args.max_length || 50000;
-                switch (action) {
-                    case 'get_html': {
-                        const includeStyles = args.include_styles ?? false;
-                        const code = includeStyles
-                            ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || '(element not found)'`
-                            : `(() => {
+                case 'page_content': {
+                    const action = args.action;
+                    const selector = args.selector || 'body';
+                    const maxLength = args.max_length || 50000;
+                    switch (action) {
+                        case 'get_html': {
+                            const includeStyles = args.include_styles ?? false;
+                            const code = includeStyles
+                                ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || '(element not found)'`
+                                : `(() => {
                   const el = document.querySelector(${JSON.stringify(selector)});
                   if (!el) return '(element not found)';
                   const clone = el.cloneNode(true);
@@ -2103,20 +2117,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                   clone.querySelectorAll('script,noscript').forEach(e => e.remove());
                   return clone.outerHTML;
                 })()`;
-                        let html = await evaluateJs(session, code);
-                        if (html.length > maxLength)
-                            html = html.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
-                        return { content: [{ type: 'text', text: html }] };
-                    }
-                    case 'get_text': {
-                        const code = `document.querySelector(${JSON.stringify(selector)})?.innerText || '(element not found)'`;
-                        let text = await evaluateJs(session, code);
-                        if (text.length > maxLength)
-                            text = text.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
-                        return { content: [{ type: 'text', text }] };
-                    }
-                    case 'get_metadata': {
-                        const code = `JSON.stringify({
+                            let html = await evaluateJs(session, code);
+                            if (html.length > maxLength)
+                                html = html.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
+                            return { content: [{ type: 'text', text: html }] };
+                        }
+                        case 'get_text': {
+                            const code = `document.querySelector(${JSON.stringify(selector)})?.innerText || '(element not found)'`;
+                            let text = await evaluateJs(session, code);
+                            if (text.length > maxLength)
+                                text = text.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
+                            return { content: [{ type: 'text', text }] };
+                        }
+                        case 'get_metadata': {
+                            const code = `JSON.stringify({
               title: document.title,
               url: location.href,
               description: document.querySelector('meta[name="description"]')?.content || null,
@@ -2133,18 +2147,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               images: document.querySelectorAll('img').length,
               links: document.querySelectorAll('a[href]').length,
             })`;
-                        const raw = await evaluateJs(session, code);
-                        const meta = typeof raw === 'string' ? JSON.parse(raw) : {};
-                        const lines = Object.entries(meta)
-                            .filter(([, v]) => v !== null && v !== undefined)
-                            .map(([k, v]) => `  ${k}: ${v}`);
-                        return { content: [{ type: 'text', text: `Page Metadata:\n${lines.join('\n')}` }] };
-                    }
-                    case 'search_dom': {
-                        const search = args.search;
-                        if (!search)
-                            return { content: [{ type: 'text', text: 'Error: search_dom requires search string' }] };
-                        const code = `(() => {
+                            const raw = await evaluateJs(session, code);
+                            const meta = typeof raw === 'string' ? JSON.parse(raw) : {};
+                            const lines = Object.entries(meta)
+                                .filter(([, v]) => v !== null && v !== undefined)
+                                .map(([k, v]) => `  ${k}: ${v}`);
+                            return { content: [{ type: 'text', text: `Page Metadata:\n${lines.join('\n')}` }] };
+                        }
+                        case 'search_dom': {
+                            const search = args.search;
+                            if (!search)
+                                return { content: [{ type: 'text', text: 'Error: search_dom requires search string' }] };
+                            const code = `(() => {
               const results = [];
               const walker = document.createTreeWalker(document.querySelector(${JSON.stringify(selector)}) || document.body, NodeFilter.SHOW_ELEMENT);
               const needle = ${JSON.stringify(search.toLowerCase())};
@@ -2165,25 +2179,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               }
               return JSON.stringify(results);
             })()`;
-                        const raw = await evaluateJs(session, code);
-                        const results = typeof raw === 'string' ? JSON.parse(raw) : [];
-                        if (results.length === 0)
-                            return { content: [{ type: 'text', text: `No elements found matching "${search}".` }] };
-                        return { content: [{ type: 'text', text: `DOM search for "${search}" (${results.length} results):\n${results.map(r => `  ${r}`).join('\n')}` }] };
+                            const raw = await evaluateJs(session, code);
+                            const results = typeof raw === 'string' ? JSON.parse(raw) : [];
+                            if (results.length === 0)
+                                return { content: [{ type: 'text', text: `No elements found matching "${search}".` }] };
+                            return { content: [{ type: 'text', text: `DOM search for "${search}" (${results.length} results):\n${results.map(r => `  ${r}`).join('\n')}` }] };
+                        }
+                        default:
+                            return { content: [{ type: 'text', text: `Unknown page_content action: ${action}` }] };
                     }
-                    default:
-                        return { content: [{ type: 'text', text: `Unknown page_content action: ${action}` }] };
                 }
+                default:
+                    return {
+                        content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+                    };
             }
-            default:
-                return {
-                    content: [{ type: 'text', text: `Unknown tool: ${name}` }],
-                };
         }
+        catch (e) {
+            error(`Error executing tool ${name}:`, e);
+            cdpSession = null;
+            return {
+                content: [{ type: 'text', text: `Error: ${String(e)}` }],
+                isError: true,
+            };
+        }
+    }; // end handleToolCall
+    try {
+        return await withTimeout(handleToolCall(), MCP_REQUEST_TIMEOUT, name);
     }
     catch (e) {
-        error(`Error executing tool ${name}:`, e);
-        cdpSession = null;
+        error(`Tool ${name} global timeout:`, e);
         return {
             content: [{ type: 'text', text: `Error: ${String(e)}` }],
             isError: true,

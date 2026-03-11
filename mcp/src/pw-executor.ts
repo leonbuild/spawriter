@@ -73,11 +73,15 @@ export class PlaywrightExecutor {
   private page: Page | null = null;
   private userState: Record<string, unknown> = {};
   private isConnected = false;
+  private activeAbortController: AbortController | null = null;
 
   async ensureConnection(): Promise<{ page: Page; context: BrowserContext }> {
     if (this.isConnected && this.browser && this.page && !this.page.isClosed()) {
       try {
-        await this.page.evaluate('1');
+        await Promise.race([
+          this.page.evaluate('1'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Health check timeout')), 5000)),
+        ]);
         return { page: this.page, context: this.context! };
       } catch {
         log('Playwright connection stale, reconnecting...');
@@ -91,7 +95,11 @@ export class PlaywrightExecutor {
     const cdpUrl = getCdpUrl(port, clientId);
 
     log('Connecting Playwright over CDP:', cdpUrl);
-    const browser = await chromium.connectOverCDP(cdpUrl);
+
+    const browser = await Promise.race([
+      chromium.connectOverCDP(cdpUrl),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('CDP connection timeout (15s)')), 15000)),
+    ]);
 
     browser.on('disconnected', () => {
       log('Playwright browser disconnected');
@@ -101,8 +109,8 @@ export class PlaywrightExecutor {
     const contexts = browser.contexts();
     const context = contexts.length > 0 ? contexts[0] : await browser.newContext();
 
-    context.setDefaultTimeout(60000);
-    context.setDefaultNavigationTimeout(10000);
+    context.setDefaultTimeout(30000);
+    context.setDefaultNavigationTimeout(15000);
 
     const pages = context.pages().filter(p => !p.isClosed());
     const page = pages.length > 0 ? pages[0] : await context.newPage();
@@ -115,11 +123,28 @@ export class PlaywrightExecutor {
     return { page, context };
   }
 
+  cancelActiveExecution(): void {
+    if (this.activeAbortController) {
+      this.activeAbortController.abort();
+      this.activeAbortController = null;
+    }
+  }
+
   async execute(code: string, timeout = 30000): Promise<ExecuteResult> {
     const consoleLogs: Array<{ method: string; args: unknown[] }> = [];
 
+    this.cancelActiveExecution();
+    const abortController = new AbortController();
+    this.activeAbortController = abortController;
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
     try {
       const { page, context } = await this.ensureConnection();
+
+      const prevDefaultTimeout = 30000;
+      page.setDefaultTimeout(Math.min(timeout, prevDefaultTimeout));
+      page.setDefaultNavigationTimeout(Math.min(timeout, 15000));
 
       const customConsole = {
         log: (...args: unknown[]) => consoleLogs.push({ method: 'log', args }),
@@ -146,10 +171,18 @@ export class PlaywrightExecutor {
 
       const result = await Promise.race([
         vm.runInContext(wrappedCode, vmContext, { timeout, displayErrors: true }),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new CodeExecutionTimeoutError(timeout)), timeout)
-        ),
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new CodeExecutionTimeoutError(timeout)), timeout);
+        }),
+        new Promise((_, reject) => {
+          abortController.signal.addEventListener('abort', () => reject(new CodeExecutionTimeoutError(timeout)));
+        }),
       ]);
+
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+
+      page.setDefaultTimeout(prevDefaultTimeout);
+      page.setDefaultNavigationTimeout(15000);
 
       let responseText = PlaywrightExecutor.formatConsoleLogs(consoleLogs);
 
@@ -175,6 +208,8 @@ export class PlaywrightExecutor {
 
       return { text: finalText, isError: false };
     } catch (err: unknown) {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+
       const e = err as Error;
       const isTimeoutError = e instanceof CodeExecutionTimeoutError
         || e.name === 'TimeoutError'
@@ -182,9 +217,20 @@ export class PlaywrightExecutor {
 
       error('Error in playwright execute:', e.stack || e.message);
 
+      if (isTimeoutError) {
+        try {
+          if (this.page && !this.page.isClosed()) {
+            await Promise.race([
+              this.page.evaluate('1'),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('post-timeout check')), 3000)),
+            ]).catch(() => {});
+          }
+        } catch { /* ignore */ }
+      }
+
       const logsText = PlaywrightExecutor.formatConsoleLogs(consoleLogs, 'Console output (before error)');
       const resetHint = isTimeoutError
-        ? ''
+        ? '\n\n[HINT: Execution timed out. The operation may still be running in the browser. Use reset if the browser is in a bad state.]'
         : '\n\n[HINT: If this is a Playwright connection error, call reset to reconnect.]';
       const errorText = isTimeoutError ? e.message : (e.stack || e.message);
 
@@ -192,6 +238,10 @@ export class PlaywrightExecutor {
         text: `${logsText}\nError executing code: ${errorText}${resetHint}`,
         isError: true,
       };
+    } finally {
+      if (this.activeAbortController === abortController) {
+        this.activeAbortController = null;
+      }
     }
   }
 

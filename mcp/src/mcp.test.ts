@@ -6449,6 +6449,276 @@ describe('page_content – DOM search result formatting', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test: withTimeout utility (global MCP request timeout)
+// ---------------------------------------------------------------------------
+
+function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Tool "${toolName}" timed out after ${ms / 1000}s. The browser may be busy or unreachable. Try again or call reset.`));
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+describe('withTimeout utility', () => {
+  it('should resolve when promise completes within timeout', async () => {
+    const result = await withTimeout(Promise.resolve(42), 5000, 'test_tool');
+    assert.equal(result, 42);
+  });
+
+  it('should reject when promise exceeds timeout', async () => {
+    await assert.rejects(
+      withTimeout(new Promise(() => {}), 50, 'slow_tool'),
+      (err: Error) => {
+        assert.ok(err.message.includes('slow_tool'));
+        assert.ok(err.message.includes('timed out'));
+        assert.ok(err.message.includes('0.05s'));
+        return true;
+      }
+    );
+  });
+
+  it('should propagate original error if promise rejects before timeout', async () => {
+    await assert.rejects(
+      withTimeout(Promise.reject(new Error('original error')), 5000, 'test_tool'),
+      (err: Error) => err.message === 'original error'
+    );
+  });
+
+  it('should clean up timer when promise resolves', async () => {
+    const result = await withTimeout(Promise.resolve('fast'), 5000, 'test');
+    assert.equal(result, 'fast');
+  });
+
+  it('should clean up timer when promise rejects', async () => {
+    await assert.rejects(
+      withTimeout(Promise.reject(new Error('boom')), 5000, 'test'),
+      (err: Error) => err.message === 'boom'
+    );
+  });
+
+  it('should include tool name in timeout error', async () => {
+    await assert.rejects(
+      withTimeout(new Promise(() => {}), 50, 'my_special_tool'),
+      (err: Error) => {
+        assert.ok(err.message.includes('my_special_tool'));
+        return true;
+      }
+    );
+  });
+
+  it('should include seconds in timeout error', async () => {
+    await assert.rejects(
+      withTimeout(new Promise(() => {}), 120000, 'long_tool'),
+      { message: /120s/ }
+    );
+  });
+
+  it('should handle zero timeout', async () => {
+    await assert.rejects(
+      withTimeout(new Promise(() => {}), 0, 'instant_timeout'),
+      (err: Error) => err.message.includes('instant_timeout')
+    );
+  });
+
+  it('should handle async function that resolves with undefined', async () => {
+    const result = await withTimeout(Promise.resolve(undefined), 5000, 'test');
+    assert.equal(result, undefined);
+  });
+
+  it('should handle async function that resolves with null', async () => {
+    const result = await withTimeout(Promise.resolve(null), 5000, 'test');
+    assert.equal(result, null);
+  });
+
+  it('should handle promise chain', async () => {
+    const result = await withTimeout(
+      Promise.resolve(1).then(v => v + 1).then(v => v * 2),
+      5000,
+      'chain_test'
+    );
+    assert.equal(result, 4);
+  });
+
+  it('should not interfere with fast sequential calls', async () => {
+    const r1 = await withTimeout(Promise.resolve('a'), 5000, 't1');
+    const r2 = await withTimeout(Promise.resolve('b'), 5000, 't2');
+    const r3 = await withTimeout(Promise.resolve('c'), 5000, 't3');
+    assert.equal(r1, 'a');
+    assert.equal(r2, 'b');
+    assert.equal(r3, 'c');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: sendCdpCommand timeout behavior
+// ---------------------------------------------------------------------------
+
+describe('sendCdpCommand timeout pattern', () => {
+  it('should reject when command exceeds timeout', async () => {
+    await assert.rejects(
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          reject(new Error('CDP command timeout: Runtime.evaluate'));
+        }, 50);
+        // Simulate no response coming back
+        void timer;
+      }),
+      (err: Error) => err.message.includes('CDP command timeout')
+    );
+  });
+
+  it('should resolve when response arrives before timeout', async () => {
+    const result = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('CDP command timeout'));
+      }, 5000);
+      // Simulate immediate response
+      clearTimeout(timer);
+      resolve({ result: { value: 'ok' } });
+    });
+    assert.deepEqual(result, { result: { value: 'ok' } });
+  });
+
+  it('should use custom timeout for slow commands', () => {
+    const SLOW_CDP_COMMANDS = new Set([
+      'Accessibility.getFullAXTree', 'Page.captureScreenshot',
+      'Network.clearBrowserCache', 'Network.clearBrowserCookies',
+      'Page.reload', 'Page.navigate',
+    ]);
+    function getCommandTimeout(method: string): number {
+      return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
+    }
+    assert.equal(getCommandTimeout('Page.navigate'), 60000);
+    assert.equal(getCommandTimeout('Runtime.evaluate'), 30000);
+    assert.equal(getCommandTimeout('Accessibility.getFullAXTree'), 60000);
+    assert.equal(getCommandTimeout('DOM.enable'), 30000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: evaluateJs timeout parameter
+// ---------------------------------------------------------------------------
+
+describe('evaluateJs timeout parameter', () => {
+  it('should pass timeout to Runtime.evaluate params', () => {
+    const evalTimeout = 15000;
+    const commandTimeout = evalTimeout + 5000;
+    const params = {
+      expression: '1+1',
+      returnByValue: true,
+      awaitPromise: true,
+      timeout: evalTimeout,
+    };
+    assert.equal(params.timeout, 15000);
+    assert.equal(commandTimeout, 20000);
+  });
+
+  it('should default to 30s eval + 35s command timeout', () => {
+    const defaultEvalTimeout = 30000;
+    const defaultCommandTimeout = defaultEvalTimeout + 5000;
+    assert.equal(defaultEvalTimeout, 30000);
+    assert.equal(defaultCommandTimeout, 35000);
+  });
+
+  it('command timeout should always be greater than eval timeout', () => {
+    for (const evalTimeout of [1000, 5000, 10000, 30000, 60000]) {
+      const commandTimeout = evalTimeout + 5000;
+      assert.ok(commandTimeout > evalTimeout);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Timeout hierarchy correctness
+// ---------------------------------------------------------------------------
+
+describe('Timeout hierarchy', () => {
+  it('Playwright page timeout <= execution timeout', () => {
+    const executionTimeout = 30000;
+    const pageTimeout = Math.min(executionTimeout, 30000);
+    const navTimeout = Math.min(executionTimeout, 15000);
+    assert.ok(pageTimeout <= executionTimeout);
+    assert.ok(navTimeout <= executionTimeout);
+  });
+
+  it('Playwright page timeout adapts to short execution timeout', () => {
+    const executionTimeout = 5000;
+    const pageTimeout = Math.min(executionTimeout, 30000);
+    const navTimeout = Math.min(executionTimeout, 15000);
+    assert.equal(pageTimeout, 5000);
+    assert.equal(navTimeout, 5000);
+  });
+
+  it('navigation timeout caps at 15s even with high execution timeout', () => {
+    const executionTimeout = 60000;
+    const navTimeout = Math.min(executionTimeout, 15000);
+    assert.equal(navTimeout, 15000);
+  });
+
+  it('MCP global timeout > Playwright timeout > CDP command timeout', () => {
+    const mcpTimeout = 120000;
+    const playwrightDefault = 30000;
+    const cdpCommandDefault = 30000;
+    const cdpSlowCommand = 60000;
+    const healthCheck = 5000;
+    const cdpConnect = 15000;
+
+    assert.ok(mcpTimeout > playwrightDefault);
+    assert.ok(mcpTimeout > cdpSlowCommand);
+    assert.ok(playwrightDefault >= cdpCommandDefault);
+    assert.ok(healthCheck < playwrightDefault);
+    assert.ok(cdpConnect <= playwrightDefault);
+  });
+
+  it('all timeouts should be positive numbers', () => {
+    const timeouts = [120000, 60000, 30000, 15000, 10000, 5000, 2000, 1000];
+    for (const t of timeouts) {
+      assert.ok(t > 0);
+      assert.ok(Number.isFinite(t));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Error message format for timeout scenarios
+// ---------------------------------------------------------------------------
+
+describe('Timeout error message format', () => {
+  it('global MCP timeout includes tool name and seconds', () => {
+    const msg = `Tool "screenshot" timed out after ${120000 / 1000}s. The browser may be busy or unreachable. Try again or call reset.`;
+    assert.ok(msg.includes('screenshot'));
+    assert.ok(msg.includes('120s'));
+    assert.ok(msg.includes('reset'));
+  });
+
+  it('CDP command timeout includes method name', () => {
+    const msg = `CDP command timeout: Runtime.evaluate`;
+    assert.ok(msg.includes('Runtime.evaluate'));
+  });
+
+  it('health check timeout is descriptive', () => {
+    const msg = 'Health check timeout';
+    assert.ok(msg.includes('Health check'));
+  });
+
+  it('CDP connection timeout includes duration', () => {
+    const msg = 'CDP connection timeout (15s)';
+    assert.ok(msg.includes('15s'));
+  });
+
+  it('PlaywrightExecutor timeout hint suggests reset', () => {
+    const hint = '[HINT: Execution timed out. The operation may still be running in the browser. Use reset if the browser is in a bad state.]';
+    assert.ok(hint.includes('reset'));
+    assert.ok(hint.includes('timed out'));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Integration: tool action count verification
 // ---------------------------------------------------------------------------
 

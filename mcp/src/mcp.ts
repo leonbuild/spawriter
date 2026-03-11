@@ -551,12 +551,13 @@ function getCommandTimeout(method: string): number {
   return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
 }
 
-async function evaluateJs(session: CdpSession, expression: string): Promise<unknown> {
+async function evaluateJs(session: CdpSession, expression: string, evalTimeout = 30000): Promise<unknown> {
   const result = await sendCdpCommand(session, 'Runtime.evaluate', {
     expression,
     returnByValue: true,
     awaitPromise: true,
-  }) as { result?: { value?: unknown; type?: string; description?: string }; exceptionDetails?: { text?: string } };
+    timeout: evalTimeout,
+  }, evalTimeout + 5000) as { result?: { value?: unknown; type?: string; description?: string }; exceptionDetails?: { text?: string } };
 
   if (result.exceptionDetails) {
     throw new Error(`JS error: ${result.exceptionDetails.text}`);
@@ -1144,8 +1145,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
+const MCP_REQUEST_TIMEOUT = 120000; // 2 minutes hard cap for any tool call
+
+function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Tool "${toolName}" timed out after ${ms / 1000}s. The browser may be busy or unreachable. Try again or call reset.`));
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
+
+  const handleToolCall = async () => {
 
   if (name === 'reset') {
     if (cdpSession) {
@@ -2288,6 +2305,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (e) {
     error(`Error executing tool ${name}:`, e);
     cdpSession = null;
+    return {
+      content: [{ type: 'text', text: `Error: ${String(e)}` }],
+      isError: true,
+    };
+  }
+
+  }; // end handleToolCall
+
+  try {
+    return await withTimeout(handleToolCall(), MCP_REQUEST_TIMEOUT, name);
+  } catch (e) {
+    error(`Tool ${name} global timeout:`, e);
     return {
       content: [{ type: 'text', text: `Error: ${String(e)}` }],
       isError: true,

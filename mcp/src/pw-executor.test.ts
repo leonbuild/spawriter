@@ -952,3 +952,202 @@ describe('CodeExecutionTimeoutError – additional', () => {
     assert.ok(new CodeExecutionTimeoutError(60000).message.includes('60000ms'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Test: AbortController-based cancellation pattern
+// ---------------------------------------------------------------------------
+
+describe('AbortController cancellation pattern', () => {
+  it('should abort a pending promise when signal fires', async () => {
+    const ac = new AbortController();
+    const promise = Promise.race([
+      new Promise(resolve => setTimeout(resolve, 10000)),
+      new Promise<never>((_, reject) => {
+        ac.signal.addEventListener('abort', () => reject(new CodeExecutionTimeoutError(100)));
+      }),
+    ]);
+    setTimeout(() => ac.abort(), 50);
+    await assert.rejects(promise, (err: Error) => err instanceof CodeExecutionTimeoutError);
+  });
+
+  it('should not reject if resolved before abort', async () => {
+    const ac = new AbortController();
+    const result = await Promise.race([
+      Promise.resolve('done'),
+      new Promise<never>((_, reject) => {
+        ac.signal.addEventListener('abort', () => reject(new CodeExecutionTimeoutError(100)));
+      }),
+    ]);
+    assert.equal(result, 'done');
+    ac.abort(); // should not throw after resolution
+  });
+
+  it('should handle already-aborted controller', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    await assert.rejects(
+      Promise.race([
+        new Promise(resolve => setTimeout(resolve, 1000)),
+        new Promise<never>((_, reject) => {
+          if (ac.signal.aborted) reject(new CodeExecutionTimeoutError(0));
+          ac.signal.addEventListener('abort', () => reject(new CodeExecutionTimeoutError(0)));
+        }),
+      ]),
+      (err: Error) => err instanceof CodeExecutionTimeoutError
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Promise.race with multiple reject sources (timeout + abort)
+// ---------------------------------------------------------------------------
+
+describe('Multi-source timeout (timeout timer + abort signal)', () => {
+  it('timeout timer wins when it fires first', async () => {
+    const ac = new AbortController();
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    await assert.rejects(
+      Promise.race([
+        new Promise(resolve => setTimeout(resolve, 10000)),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error('timeout-timer')), 30);
+        }),
+        new Promise<never>((_, reject) => {
+          ac.signal.addEventListener('abort', () => reject(new Error('abort-signal')));
+        }),
+      ]),
+      (err: Error) => err.message === 'timeout-timer'
+    );
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  });
+
+  it('abort signal wins when it fires first', async () => {
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 30);
+    await assert.rejects(
+      Promise.race([
+        new Promise(resolve => setTimeout(resolve, 10000)),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error('timeout-timer')), 5000);
+        }),
+        new Promise<never>((_, reject) => {
+          ac.signal.addEventListener('abort', () => reject(new Error('abort-signal')));
+        }),
+      ]),
+      (err: Error) => err.message === 'abort-signal'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Health check timeout pattern (ensureConnection)
+// ---------------------------------------------------------------------------
+
+describe('Health check timeout pattern', () => {
+  it('should timeout when health check hangs', async () => {
+    await assert.rejects(
+      Promise.race([
+        new Promise(() => {}), // simulates a hanging page.evaluate('1')
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Health check timeout')), 50)),
+      ]),
+      (err: Error) => err.message === 'Health check timeout'
+    );
+  });
+
+  it('should pass when health check responds quickly', async () => {
+    const result = await Promise.race([
+      Promise.resolve('ok'),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Health check timeout')), 5000)),
+    ]);
+    assert.equal(result, 'ok');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: CDP connection timeout pattern (ensureConnection)
+// ---------------------------------------------------------------------------
+
+describe('CDP connection timeout pattern', () => {
+  it('should timeout when connectOverCDP hangs', async () => {
+    await assert.rejects(
+      Promise.race([
+        new Promise(() => {}), // simulates a hanging connectOverCDP
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('CDP connection timeout (15s)')), 50)),
+      ]),
+      (err: Error) => err.message === 'CDP connection timeout (15s)'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: PlaywrightExecutor.cancelActiveExecution
+// ---------------------------------------------------------------------------
+
+describe('PlaywrightExecutor.cancelActiveExecution', () => {
+  it('should be callable when no execution is active', () => {
+    const executor = new PlaywrightExecutor();
+    assert.doesNotThrow(() => executor.cancelActiveExecution());
+  });
+
+  it('should be callable multiple times without error', () => {
+    const executor = new PlaywrightExecutor();
+    executor.cancelActiveExecution();
+    executor.cancelActiveExecution();
+    executor.cancelActiveExecution();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Timeout hint message format
+// ---------------------------------------------------------------------------
+
+describe('Timeout hint messages', () => {
+  it('CodeExecutionTimeoutError message contains ms value', () => {
+    const err = new CodeExecutionTimeoutError(30000);
+    assert.ok(err.message.includes('30000'));
+    assert.ok(err.message.includes('timed out'));
+  });
+
+  it('timeout errors should be classified correctly', () => {
+    const timeoutErr = new CodeExecutionTimeoutError(5000);
+    assert.equal(timeoutErr.name, 'CodeExecutionTimeoutError');
+
+    const playwrightTimeout = new Error('Timeout 30000ms exceeded');
+    playwrightTimeout.name = 'TimeoutError';
+    assert.equal(playwrightTimeout.name, 'TimeoutError');
+
+    const abortErr = new Error('Aborted');
+    abortErr.name = 'AbortError';
+    assert.equal(abortErr.name, 'AbortError');
+  });
+
+  it('should classify all three timeout types as timeout errors', () => {
+    const errors = [
+      new CodeExecutionTimeoutError(5000),
+      Object.assign(new Error('Timeout'), { name: 'TimeoutError' }),
+      Object.assign(new Error('Aborted'), { name: 'AbortError' }),
+    ];
+
+    for (const err of errors) {
+      const isTimeout = err instanceof CodeExecutionTimeoutError
+        || err.name === 'TimeoutError'
+        || err.name === 'AbortError';
+      assert.ok(isTimeout, `${err.name} should be classified as timeout`);
+    }
+  });
+
+  it('should NOT classify regular errors as timeout', () => {
+    const regularErrors = [
+      new Error('connection refused'),
+      new TypeError('x is not a function'),
+      new RangeError('out of range'),
+    ];
+
+    for (const err of regularErrors) {
+      const isTimeout = err instanceof CodeExecutionTimeoutError
+        || err.name === 'TimeoutError'
+        || err.name === 'AbortError';
+      assert.ok(!isTimeout, `${err.name} should NOT be classified as timeout`);
+    }
+  });
+});

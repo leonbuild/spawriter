@@ -19,10 +19,12 @@ export declare class PlaywrightExecutor {
     private page;
     private userState;
     private isConnected;
+    private activeAbortController;
     ensureConnection(): Promise<{
         page: Page;
         context: BrowserContext;
     }>;
+    cancelActiveExecution(): void;
     execute(code: string, timeout?: number): Promise<ExecuteResult>;
     reset(): Promise<void>;
     getStatus(): {
