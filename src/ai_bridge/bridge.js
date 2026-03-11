@@ -378,6 +378,16 @@ import browser from "webextension-polyfill";
     }
 
     try {
+      const DOMAINS_TO_RECYCLE = ["Runtime.enable", "Page.enable"];
+      if (DOMAINS_TO_RECYCLE.includes(method)) {
+        const disableMethod = method.replace(".enable", ".disable");
+        try {
+          await chrome.debugger.sendCommand({ tabId: targetTabId }, disableMethod);
+        } catch (_) {
+          /* ignore disable errors */
+        }
+      }
+
       const result = await chrome.debugger.sendCommand(
         { tabId: targetTabId },
         method,
@@ -484,8 +494,18 @@ import browser from "webextension-polyfill";
     ]);
 
     const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
+    let mainFrameId = sessionId;
+    try {
+      const frameTree = await chrome.debugger.sendCommand(
+        { tabId },
+        "Page.getFrameTree"
+      );
+      mainFrameId = frameTree?.frameTree?.frame?.id || sessionId;
+    } catch (e) {
+      warn(`attachTab: failed to get frame tree for tab ${tabId}:`, e?.message);
+    }
     const targetInfo = {
-      targetId: sessionId,
+      targetId: mainFrameId,
       type: "page",
       tabId,
       title: tab?.title || "",

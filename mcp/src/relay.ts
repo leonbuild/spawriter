@@ -117,7 +117,7 @@ app.get('/json/list', (c) => {
   const targets = Array.from(attachedTargets.values()).map((target) => {
     const targetInfo = target.targetInfo ?? {};
     return {
-      id: targetInfo.targetId ?? target.sessionId,
+      id: target.sessionId,
       tabId: target.tabId,
       type: targetInfo.type ?? 'page',
       title: targetInfo.title ?? '',

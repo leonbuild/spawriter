@@ -77,15 +77,7 @@ export class PlaywrightExecutor {
 
   async ensureConnection(): Promise<{ page: Page; context: BrowserContext }> {
     if (this.isConnected && this.browser && this.page && !this.page.isClosed()) {
-      try {
-        await Promise.race([
-          this.page.evaluate('1'),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Health check timeout')), 5000)),
-        ]);
-        return { page: this.page, context: this.context! };
-      } catch {
-        log('Playwright connection stale, reconnecting...');
-      }
+      return { page: this.page, context: this.context! };
     }
 
     await this.closeQuietly();
@@ -115,6 +107,12 @@ export class PlaywrightExecutor {
     const pages = context.pages().filter(p => !p.isClosed());
     const page = pages.length > 0 ? pages[0] : await context.newPage();
 
+    try {
+      await page.waitForLoadState('domcontentloaded', { timeout: 5000 });
+    } catch {
+      // Best-effort stabilization: the page may already be in a valid state.
+    }
+
     this.browser = browser;
     this.context = context;
     this.page = page;
@@ -130,7 +128,7 @@ export class PlaywrightExecutor {
     }
   }
 
-  async execute(code: string, timeout = 30000): Promise<ExecuteResult> {
+  async execute(code: string, timeout = 30000, retryOnContextError = true): Promise<ExecuteResult> {
     const consoleLogs: Array<{ method: string; args: unknown[] }> = [];
 
     this.cancelActiveExecution();
@@ -154,6 +152,17 @@ export class PlaywrightExecutor {
         debug: (...args: unknown[]) => consoleLogs.push({ method: 'debug', args }),
       };
 
+      // Warm up execution context. Some CDP flows emit a transient
+      // "Execution context was destroyed" right after connect/navigation.
+      try {
+        await Promise.race([
+          page.evaluate('1'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Warmup timeout')), 3000)),
+        ]);
+      } catch {
+        // Best-effort warmup only; user code execution below has full error handling.
+      }
+
       const vmContextObj: Record<string, unknown> = {
         page,
         context,
@@ -172,13 +181,14 @@ export class PlaywrightExecutor {
       const result = await Promise.race([
         vm.runInContext(wrappedCode, vmContext, { timeout, displayErrors: true }),
         new Promise((_, reject) => {
-          timeoutHandle = setTimeout(() => reject(new CodeExecutionTimeoutError(timeout)), timeout);
+          timeoutHandle = setTimeout(() => {
+            reject(new CodeExecutionTimeoutError(timeout));
+          }, timeout);
         }),
         new Promise((_, reject) => {
           abortController.signal.addEventListener('abort', () => reject(new CodeExecutionTimeoutError(timeout)));
         }),
       ]);
-
       if (timeoutHandle) clearTimeout(timeoutHandle);
 
       page.setDefaultTimeout(prevDefaultTimeout);
@@ -214,6 +224,15 @@ export class PlaywrightExecutor {
       const isTimeoutError = e instanceof CodeExecutionTimeoutError
         || e.name === 'TimeoutError'
         || e.name === 'AbortError';
+      const isRecoverableContextError =
+        /Execution context was destroyed/i.test(e.message)
+        || /Cannot find context with specified id/i.test(e.message);
+
+      if (retryOnContextError && isRecoverableContextError) {
+        log('Playwright execution context stale, retrying once...');
+        await new Promise(resolve => setTimeout(resolve, 150));
+        return this.execute(code, timeout, false);
+      }
 
       error('Error in playwright execute:', e.stack || e.message);
 

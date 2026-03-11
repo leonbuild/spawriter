@@ -25,7 +25,7 @@ export declare class PlaywrightExecutor {
         context: BrowserContext;
     }>;
     cancelActiveExecution(): void;
-    execute(code: string, timeout?: number): Promise<ExecuteResult>;
+    execute(code: string, timeout?: number, retryOnContextError?: boolean): Promise<ExecuteResult>;
     reset(): Promise<void>;
     getStatus(): {
         connected: boolean;
