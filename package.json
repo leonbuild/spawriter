@@ -21,7 +21,7 @@
     "start:hot": "powershell -ExecutionPolicy Bypass -File scripts/start-hot.ps1",
     "self-sign": "npm run webpack-build && npm run lint && web-ext sign",
     "version:bump": "node scripts/bump-version.js",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "npx tsx --test mcp/src/mcp.test.ts mcp/src/pw-executor.test.ts",
     "webpack-build": "node --openssl-legacy-provider ./node_modules/webpack/bin/webpack.js --mode=production",
     "deploy": "npm run deploy:firefox && npm run deploy:chrome",
     "deploy:firefox": "npm run webpack-build && npm run lint && shipit firefox .",

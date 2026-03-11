@@ -12,6 +12,7 @@ import {
   sleep,
   VERSION,
 } from './utils.js';
+import { PlaywrightExecutor, ExecutorManager } from './pw-executor.js';
 
 let relayServerProcess: ReturnType<typeof import('child_process').spawn> | null = null;
 
@@ -24,6 +25,258 @@ interface CdpSession {
 
 let cdpSession: CdpSession | null = null;
 let sessionPromise: Promise<CdpSession> | null = null;
+
+const pwExecutor = new PlaywrightExecutor();
+const executorManager = new ExecutorManager();
+
+// ---------------------------------------------------------------------------
+// Console log capture (CDP Runtime.consoleAPICalled / Runtime.exceptionThrown)
+// ---------------------------------------------------------------------------
+
+interface ConsoleLogEntry {
+  level: string;
+  text: string;
+  timestamp: number;
+  url?: string;
+  lineNumber?: number;
+}
+
+const MAX_CONSOLE_LOGS = 1000;
+const consoleLogs: ConsoleLogEntry[] = [];
+
+function addConsoleLog(entry: ConsoleLogEntry) {
+  consoleLogs.push(entry);
+  if (consoleLogs.length > MAX_CONSOLE_LOGS) {
+    consoleLogs.splice(0, consoleLogs.length - MAX_CONSOLE_LOGS);
+  }
+}
+
+function clearConsoleLogs() {
+  consoleLogs.length = 0;
+}
+
+function getConsoleLogs(options: { count?: number; level?: string; search?: string } = {}): ConsoleLogEntry[] {
+  const count = Math.min(Math.max(options.count || 50, 1), MAX_CONSOLE_LOGS);
+  const level = options.level || 'all';
+  const search = (options.search || '').toLowerCase();
+
+  let filtered = consoleLogs;
+  if (level !== 'all') filtered = filtered.filter(log => log.level === level);
+  if (search) filtered = filtered.filter(log => log.text.toLowerCase().includes(search));
+  return filtered.slice(-count);
+}
+
+function formatConsoleLogs(logs: ConsoleLogEntry[], totalCount: number): string {
+  if (logs.length === 0) return `No console logs captured (${totalCount} total in buffer)`;
+  const lines = logs.map(log => {
+    const time = new Date(log.timestamp).toISOString().slice(11, 23);
+    const loc = log.url ? ` (${log.url}${log.lineNumber !== undefined ? ':' + log.lineNumber : ''})` : '';
+    return `[${time}] [${log.level.toUpperCase().padEnd(5)}] ${log.text}${loc}`;
+  });
+  return `Console logs (${logs.length}/${totalCount} total):\n${lines.join('\n')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Network request monitoring (CDP Network.*)
+// ---------------------------------------------------------------------------
+
+interface NetworkEntry {
+  requestId: string;
+  url: string;
+  method: string;
+  status?: number;
+  statusText?: string;
+  mimeType?: string;
+  startTime: number;
+  endTime?: number;
+  error?: string;
+  size?: number;
+  requestHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+  postData?: string;
+  hasPostData?: boolean;
+  resourceType?: string;
+}
+
+const MAX_NETWORK_ENTRIES = 500;
+const networkLog: Map<string, NetworkEntry> = new Map();
+
+// ---------------------------------------------------------------------------
+// Network interception state (Fetch domain)
+// ---------------------------------------------------------------------------
+
+interface InterceptRule {
+  id: string;
+  urlPattern: string;
+  resourceType?: string;
+  mockStatus?: number;
+  mockHeaders?: Record<string, string>;
+  mockBody?: string;
+  block?: boolean;
+}
+
+let interceptEnabled = false;
+const interceptRules: Map<string, InterceptRule> = new Map();
+let interceptNextId = 1;
+
+function clearInterceptState() {
+  interceptEnabled = false;
+  interceptRules.clear();
+  interceptNextId = 1;
+}
+
+async function handleFetchPaused(session: CdpSession, params: Record<string, unknown>) {
+  const reqId = params.requestId as string;
+  const requestUrl = ((params.request as Record<string, unknown>)?.url as string) || '';
+  const reqResourceType = (params.resourceType as string) || '';
+
+  for (const rule of interceptRules.values()) {
+    const urlMatch = !rule.urlPattern || requestUrl.includes(rule.urlPattern) ||
+      new RegExp(rule.urlPattern.replace(/\*/g, '.*')).test(requestUrl);
+    const typeMatch = !rule.resourceType || reqResourceType.toLowerCase() === rule.resourceType.toLowerCase();
+    if (!urlMatch || !typeMatch) continue;
+
+    if (rule.block) {
+      await sendCdpCommand(session, 'Fetch.failRequest', { requestId: reqId, errorReason: 'BlockedByClient' });
+      return;
+    }
+    if (rule.mockStatus !== undefined) {
+      const responseHeaders = Object.entries(rule.mockHeaders || { 'Content-Type': 'application/json' })
+        .map(([n, v]) => ({ name: n, value: v }));
+      const body = rule.mockBody ? Buffer.from(rule.mockBody).toString('base64') : '';
+      await sendCdpCommand(session, 'Fetch.fulfillRequest', {
+        requestId: reqId,
+        responseCode: rule.mockStatus,
+        responseHeaders,
+        body,
+      });
+      return;
+    }
+  }
+  await sendCdpCommand(session, 'Fetch.continueRequest', { requestId: reqId });
+}
+
+function clearNetworkLog() {
+  networkLog.clear();
+}
+
+function getNetworkEntries(options: { count?: number; urlFilter?: string; statusFilter?: string } = {}): NetworkEntry[] {
+  const count = Math.min(Math.max(options.count || 50, 1), MAX_NETWORK_ENTRIES);
+  const urlFilter = (options.urlFilter || '').toLowerCase();
+  const statusFilter = options.statusFilter || 'all';
+
+  let entries = Array.from(networkLog.values());
+  if (urlFilter) entries = entries.filter(e => e.url.toLowerCase().includes(urlFilter));
+  if (statusFilter !== 'all') {
+    entries = entries.filter(e => {
+      if (statusFilter === 'ok') return e.status !== undefined && e.status >= 200 && e.status < 400;
+      if (statusFilter === 'error') return !!e.error || (e.status !== undefined && e.status >= 400);
+      if (statusFilter === '4xx') return e.status !== undefined && e.status >= 400 && e.status < 500;
+      if (statusFilter === '5xx') return e.status !== undefined && e.status >= 500;
+      return true;
+    });
+  }
+  return entries.slice(-count);
+}
+
+function formatNetworkEntries(entries: NetworkEntry[], totalCount: number): string {
+  if (entries.length === 0) return `No network entries captured (${totalCount} total in buffer)`;
+  const lines = entries.map(e => {
+    const st = e.error ? `ERR:${e.error}` : (e.status !== undefined ? `${e.status}` : '...');
+    const dur = e.endTime && e.startTime ? `${e.endTime - e.startTime}ms` : '...';
+    const sz = e.size ? ` ${(e.size / 1024).toFixed(1)}KB` : '';
+    return `[${e.requestId}] ${e.method.padEnd(6)} ${st.padEnd(15)} ${dur.padStart(7)}${sz}  ${e.url}`;
+  });
+  return `Network (${entries.length}/${totalCount} total):\n${lines.join('\n')}\n\nUse network_detail { requestId: "..." } to inspect headers and body.`;
+}
+
+// ---------------------------------------------------------------------------
+// CDP event dispatch
+// ---------------------------------------------------------------------------
+
+function handleCdpEvent(method: string, params: Record<string, unknown>) {
+  switch (method) {
+    case 'Runtime.consoleAPICalled': {
+      const type = (params.type as string) || 'log';
+      const args = (params.args as Array<{ type: string; value?: unknown; description?: string }>) || [];
+      const text = args.map(arg => {
+        if (arg.value !== undefined) return String(arg.value);
+        if (arg.description) return arg.description;
+        return `[${arg.type}]`;
+      }).join(' ');
+      const stackTrace = params.stackTrace as { callFrames?: Array<{ url?: string; lineNumber?: number }> } | undefined;
+      const topFrame = stackTrace?.callFrames?.[0];
+      addConsoleLog({
+        level: type, text, timestamp: Date.now(),
+        url: topFrame?.url, lineNumber: topFrame?.lineNumber,
+      });
+      break;
+    }
+    case 'Runtime.exceptionThrown': {
+      const details = params.exceptionDetails as { text?: string; exception?: { description?: string }; url?: string; lineNumber?: number } | undefined;
+      addConsoleLog({
+        level: 'error',
+        text: details?.exception?.description || details?.text || 'Unknown exception',
+        timestamp: Date.now(), url: details?.url, lineNumber: details?.lineNumber,
+      });
+      break;
+    }
+    case 'Network.requestWillBeSent': {
+      const requestId = params.requestId as string;
+      const request = params.request as {
+        url: string; method: string; headers?: Record<string, string>;
+        postData?: string; hasPostData?: boolean;
+      };
+      if (requestId && request) {
+        networkLog.set(requestId, {
+          requestId, url: request.url, method: request.method, startTime: Date.now(),
+          requestHeaders: request.headers,
+          postData: request.postData,
+          hasPostData: request.hasPostData,
+          resourceType: params.type as string | undefined,
+        });
+        if (networkLog.size > MAX_NETWORK_ENTRIES) {
+          const firstKey = networkLog.keys().next().value;
+          if (firstKey) networkLog.delete(firstKey);
+        }
+      }
+      break;
+    }
+    case 'Network.responseReceived': {
+      const entry = networkLog.get(params.requestId as string);
+      if (entry) {
+        const r = params.response as {
+          status?: number; statusText?: string; mimeType?: string;
+          headers?: Record<string, string>;
+        } | undefined;
+        if (r) {
+          entry.status = r.status;
+          entry.statusText = r.statusText;
+          entry.mimeType = r.mimeType;
+          entry.responseHeaders = r.headers;
+        }
+        entry.endTime = Date.now();
+      }
+      break;
+    }
+    case 'Network.loadingFinished': {
+      const entry = networkLog.get(params.requestId as string);
+      if (entry) {
+        entry.endTime = entry.endTime || Date.now();
+        if (typeof params.encodedDataLength === 'number') entry.size = params.encodedDataLength;
+      }
+      break;
+    }
+    case 'Network.loadingFailed': {
+      const entry = networkLog.get(params.requestId as string);
+      if (entry) {
+        entry.error = (params.errorText as string) || 'Failed';
+        entry.endTime = Date.now();
+      }
+      break;
+    }
+  }
+}
 
 async function ensureRelayServer(): Promise<void> {
   try {
@@ -153,7 +406,7 @@ function connectCdp(sessionId: string): Promise<CdpSession> {
 
       ws.on('message', (data: Buffer) => {
         try {
-          const msg = JSON.parse(data.toString()) as { id?: number; result?: unknown; error?: { message: string } };
+          const msg = JSON.parse(data.toString()) as { id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { message: string } };
           if (msg.id !== undefined) {
             const pending = session.pendingRequests.get(msg.id);
             if (pending) {
@@ -164,6 +417,15 @@ function connectCdp(sessionId: string): Promise<CdpSession> {
               } else {
                 pending.resolve(msg.result);
               }
+            }
+            return;
+          }
+
+          if (msg.method && msg.params) {
+            handleCdpEvent(msg.method, msg.params);
+            handleDebuggerEvent(msg.method, msg.params);
+            if (msg.method === 'Fetch.requestPaused' && interceptEnabled) {
+              handleFetchPaused(session, msg.params).catch(() => {});
             }
           }
         } catch {
@@ -261,6 +523,18 @@ async function doEnsureSession(): Promise<CdpSession> {
   log('Connecting to CDP relay, target:', targets[0].url);
   cdpSession = await connectCdp(sessionId);
   log('CDP session established');
+
+  try {
+    await sendCdpCommand(cdpSession, 'Network.enable', {
+      maxTotalBufferSize: 10 * 1024 * 1024,
+      maxResourceBufferSize: 5 * 1024 * 1024,
+      maxPostDataSize: 65536,
+    });
+    await sendCdpCommand(cdpSession, 'Runtime.enable');
+  } catch {
+    log('Domain enable after connect failed (may already be enabled by relay)');
+  }
+
   return cdpSession;
 }
 
@@ -350,6 +624,165 @@ function formatAXTreeAsText(nodes: AXNode[]): string {
   return lines.join('\n') || '(empty accessibility tree)';
 }
 
+// ---------------------------------------------------------------------------
+// Accessibility snapshot diff & search
+// ---------------------------------------------------------------------------
+
+let lastSnapshot: string | null = null;
+
+// ---------------------------------------------------------------------------
+// Debugger state
+// ---------------------------------------------------------------------------
+
+let debuggerEnabled = false;
+const breakpoints = new Map<string, { id: string; file: string; line: number }>();
+let debuggerPaused = false;
+let currentCallFrameId: string | null = null;
+const knownScripts = new Map<string, { scriptId: string; url: string }>();
+
+function handleDebuggerEvent(method: string, params: Record<string, unknown>) {
+  switch (method) {
+    case 'Debugger.paused': {
+      debuggerPaused = true;
+      const callFrames = params.callFrames as Array<{ callFrameId: string }> | undefined;
+      currentCallFrameId = callFrames?.[0]?.callFrameId ?? null;
+      break;
+    }
+    case 'Debugger.resumed':
+      debuggerPaused = false;
+      currentCallFrameId = null;
+      break;
+    case 'Debugger.scriptParsed': {
+      const url = params.url as string | undefined;
+      const scriptId = params.scriptId as string | undefined;
+      if (url && scriptId && !url.startsWith('chrome') && !url.startsWith('devtools')) {
+        knownScripts.set(scriptId, { scriptId, url });
+      }
+      break;
+    }
+  }
+}
+
+function computeSnapshotDiff(oldSnap: string, newSnap: string): string {
+  const oldLines = oldSnap.split('\n');
+  const newLines = newSnap.split('\n');
+  const oldSet = new Set(oldLines);
+  const newSet = new Set(newLines);
+
+  const added = newLines.filter(l => !oldSet.has(l));
+  const removed = oldLines.filter(l => !newSet.has(l));
+
+  if (added.length === 0 && removed.length === 0) {
+    return 'No changes since last snapshot.';
+  }
+
+  const parts: string[] = [];
+  if (removed.length > 0) {
+    parts.push(`Removed (${removed.length}):\n${removed.map(l => `- ${l}`).join('\n')}`);
+  }
+  if (added.length > 0) {
+    parts.push(`Added (${added.length}):\n${added.map(l => `+ ${l}`).join('\n')}`);
+  }
+  return parts.join('\n\n');
+}
+
+function searchSnapshot(snapshot: string, query: string): string {
+  const lines = snapshot.split('\n');
+  const lowerQuery = query.toLowerCase();
+  const matchIndices: number[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].toLowerCase().includes(lowerQuery)) {
+      matchIndices.push(i);
+      if (matchIndices.length >= 20) break;
+    }
+  }
+
+  if (matchIndices.length === 0) return 'No matches found';
+
+  const CONTEXT_LINES = 3;
+  const included = new Set<number>();
+  for (const idx of matchIndices) {
+    for (let i = Math.max(0, idx - CONTEXT_LINES); i <= Math.min(lines.length - 1, idx + CONTEXT_LINES); i++) {
+      included.add(i);
+    }
+  }
+
+  const sorted = [...included].sort((a, b) => a - b);
+  const result: string[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && sorted[i - 1] !== sorted[i] - 1) result.push('---');
+    const line = lines[sorted[i]];
+    const isMatch = line.toLowerCase().includes(lowerQuery);
+    result.push(isMatch ? `>>> ${line}` : `    ${line}`);
+  }
+
+  return `Search results for "${query}" (${matchIndices.length} matches):\n${result.join('\n')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Labeled screenshot: inject numbered overlays on interactive elements
+// ---------------------------------------------------------------------------
+
+const INTERACTIVE_ROLES = new Set([
+  'button', 'link', 'textbox', 'searchbox', 'combobox', 'listbox',
+  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option',
+  'checkbox', 'radio', 'switch', 'slider', 'spinbutton',
+  'tab', 'treeitem', 'row',
+]);
+
+interface LabeledElement {
+  index: number;
+  role: string;
+  name: string;
+  backendDOMNodeId: number;
+}
+
+function getInteractiveElements(nodes: AXNode[]): LabeledElement[] {
+  const elements: LabeledElement[] = [];
+  let idx = 1;
+  for (const node of nodes) {
+    if (node.ignored) continue;
+    const role = node.role?.value;
+    if (!role || !INTERACTIVE_ROLES.has(role)) continue;
+    if (!node.backendDOMNodeId) continue;
+    elements.push({
+      index: idx++,
+      role,
+      name: node.name?.value ?? '',
+      backendDOMNodeId: node.backendDOMNodeId,
+    });
+  }
+  return elements;
+}
+
+function buildLabelInjectionScript(labels: Array<{ index: number; x: number; y: number; width: number; height: number }>): string {
+  return `(function() {
+    var container = document.createElement('div');
+    container.id = '__spawriter_labels__';
+    container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
+    ${labels.map(l => `
+    (function(){
+      var d=document.createElement('div');
+      d.textContent='${l.index}';
+      d.style.cssText='position:absolute;left:${l.x}px;top:${l.y}px;width:${Math.max(l.width, 14)}px;height:${Math.max(l.height, 14)}px;border:2px solid #e11d48;border-radius:3px;font-size:10px;font-weight:bold;color:#fff;background:rgba(225,29,72,0.85);display:flex;align-items:center;justify-content:center;line-height:1;pointer-events:none;';
+      container.appendChild(d);
+    })();`).join('')}
+    document.body.appendChild(container);
+  })()`;
+}
+
+const REMOVE_LABELS_SCRIPT = `(function() {
+  var el = document.getElementById('__spawriter_labels__');
+  if (el) el.remove();
+})()`;
+
+function formatLabelLegend(elements: LabeledElement[]): string {
+  if (elements.length === 0) return 'No interactive elements found.';
+  const lines = elements.map(e => `[${e.index}] ${e.role}${e.name ? ` "${e.name}"` : ''}`);
+  return `Interactive elements (${elements.length}):\n${lines.join('\n')}`;
+}
+
 const server = new Server(
   {
     name: 'spawriter',
@@ -365,13 +798,24 @@ const server = new Server(
 const tools = [
   {
     name: 'screenshot',
-    description: 'Take a screenshot of the current page',
-    inputSchema: { type: 'object' as const, properties: {} },
+    description: 'Take a screenshot of the current page. With labels=true, overlays numbered labels on interactive elements and returns their accessibility info.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        labels: { type: 'boolean', description: 'Overlay numbered labels on interactive elements (buttons, links, inputs, etc.)' },
+      },
+    },
   },
   {
     name: 'accessibility_snapshot',
-    description: 'Get accessibility snapshot of the page',
-    inputSchema: { type: 'object' as const, properties: {} },
+    description: 'Get accessibility snapshot of the page. Supports search to find specific elements and diff to see changes since last call.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        search: { type: 'string', description: 'Search for elements matching this text (case-insensitive). Returns matching lines with context.' },
+        diff: { type: 'boolean', description: 'Show diff against the previous snapshot (default: true when no search)' },
+      },
+    },
   },
   {
     name: 'execute',
@@ -391,8 +835,67 @@ const tools = [
     },
   },
   {
+    name: 'console_logs',
+    description: 'Get captured browser console logs (log, warn, error, info, debug). Logs are captured in real-time from Runtime.consoleAPICalled and Runtime.exceptionThrown CDP events.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        count: { type: 'number', description: 'Number of recent logs to return (default: 50, max: 1000)' },
+        level: { type: 'string', enum: ['log', 'info', 'warn', 'error', 'debug', 'all'], description: 'Filter by log level (default: all)' },
+        search: { type: 'string', description: 'Filter logs containing this text' },
+        clear: { type: 'boolean', description: 'Clear log buffer after returning results' },
+      },
+    },
+  },
+  {
+    name: 'network_log',
+    description: 'Get captured network requests. Shows URL, method, status, timing, size, and errors. Captured from Network CDP events in real-time.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        count: { type: 'number', description: 'Number of recent entries to return (default: 50, max: 500)' },
+        url_filter: { type: 'string', description: 'Filter by URL substring' },
+        status_filter: { type: 'string', enum: ['all', 'ok', 'error', '4xx', '5xx'], description: 'Filter by response status category (default: all)' },
+        clear: { type: 'boolean', description: 'Clear network buffer after returning results' },
+      },
+    },
+  },
+  {
+    name: 'network_detail',
+    description: `Get full details of a network request including headers and body content.
+Use network_log first to find the requestId, then use this tool to inspect details.
+Can retrieve: request headers, request body (POST data), response headers, response body.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        requestId: { type: 'string', description: 'Request ID from network_log output (required)' },
+        include: {
+          type: 'string',
+          description: 'Comma-separated list of sections to include: request_headers, request_body, response_headers, response_body, all (default: all)',
+        },
+        max_body_size: { type: 'number', description: 'Max response body size in chars to return (default: 10000). Use 0 for headers only.' },
+      },
+      required: ['requestId'],
+    },
+  },
+  {
+    name: 'playwright_execute',
+    description: `Execute code in a Node.js VM sandbox with full Playwright API access.
+Available variables: page (Playwright Page), context (BrowserContext), state (persistent object across calls).
+Use for: complex interactions, form filling, multi-step flows, Playwright locators, multi-page scenarios.
+For simple/fast JS in page context, use the 'execute' tool instead.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        code: { type: 'string', description: 'JavaScript code to execute. Has access to page, context, state, and standard globals.' },
+        timeout: { type: 'number', description: 'Execution timeout in ms (default: 30000)' },
+      },
+      required: ['code'],
+    },
+  },
+  {
     name: 'reset',
-    description: 'Reset the CDP connection',
+    description: 'Reset the CDP connection, Playwright executor, and clear all captured console logs and network entries',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -442,6 +945,199 @@ const tools = [
       required: ['action', 'appName'],
     },
   },
+  {
+    name: 'debugger',
+    description: `Control the JavaScript debugger via CDP. Set breakpoints, step through code, inspect variables.
+Actions: enable, set_breakpoint, remove_breakpoint, list_breakpoints, resume, step_over, step_into, step_out, inspect_variables, evaluate, list_scripts, pause_on_exceptions.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['enable', 'set_breakpoint', 'remove_breakpoint', 'list_breakpoints', 'resume', 'step_over', 'step_into', 'step_out', 'inspect_variables', 'evaluate', 'list_scripts', 'pause_on_exceptions'],
+          description: 'Debugger action to perform',
+        },
+        file: { type: 'string', description: 'Script URL for set_breakpoint (use list_scripts to find URLs)' },
+        line: { type: 'number', description: '1-based line number for set_breakpoint' },
+        condition: { type: 'string', description: 'Conditional expression for set_breakpoint (only pause when true)' },
+        breakpointId: { type: 'string', description: 'Breakpoint ID for remove_breakpoint' },
+        expression: { type: 'string', description: 'JS expression for evaluate (accesses local scope when paused)' },
+        search: { type: 'string', description: 'URL substring filter for list_scripts' },
+        state: { type: 'string', enum: ['none', 'uncaught', 'all'], description: 'Exception pause mode for pause_on_exceptions' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'css_inspect',
+    description: 'Get computed CSS styles for an element identified by a CSS selector. Returns key visual properties.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        selector: { type: 'string', description: 'CSS selector to identify the element (e.g. "#header", ".btn-primary")' },
+        properties: { type: 'string', description: 'Comma-separated list of specific CSS properties to inspect (default: common visual properties)' },
+      },
+      required: ['selector'],
+    },
+  },
+  {
+    name: 'session_manager',
+    description: `Manage Playwright executor sessions. Each session has its own browser connection and persistent state.\nActions: list, create, switch, remove, remove_all.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list', 'create', 'switch', 'remove', 'remove_all'],
+          description: 'Session management action',
+        },
+        sessionId: { type: 'string', description: 'Session identifier for create/switch/remove (e.g. "feature-xyz", "debug-session")' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'storage',
+    description: `Manage browser storage: cookies, localStorage, sessionStorage, cache.
+Actions: get_cookies, set_cookie, delete_cookie, get_local_storage, set_local_storage, remove_local_storage, get_session_storage, clear_storage, get_storage_usage.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['get_cookies', 'set_cookie', 'delete_cookie', 'get_local_storage', 'set_local_storage', 'remove_local_storage', 'get_session_storage', 'clear_storage', 'get_storage_usage'],
+          description: 'Storage action',
+        },
+        key: { type: 'string', description: 'Storage key for get/set/remove localStorage/sessionStorage' },
+        value: { type: 'string', description: 'Value for set operations' },
+        name: { type: 'string', description: 'Cookie name for set/delete' },
+        domain: { type: 'string', description: 'Cookie domain' },
+        url: { type: 'string', description: 'URL for cookie operations' },
+        path: { type: 'string', description: 'Cookie path' },
+        secure: { type: 'boolean', description: 'Cookie secure flag' },
+        httpOnly: { type: 'boolean', description: 'Cookie httpOnly flag' },
+        sameSite: { type: 'string', enum: ['Strict', 'Lax', 'None'], description: 'Cookie sameSite attribute' },
+        expires: { type: 'number', description: 'Cookie expiry (Unix timestamp)' },
+        origin: { type: 'string', description: 'Origin for clear/usage operations' },
+        storage_types: { type: 'string', description: 'Comma-separated types to clear: cookies,local_storage,session_storage,cache_storage,indexeddb,service_workers' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'performance',
+    description: `Monitor page performance: runtime metrics, Web Vitals (LCP/CLS/INP/TTFB), memory usage, resource timing.
+Actions: get_metrics, get_web_vitals, get_memory, get_resource_timing.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['get_metrics', 'get_web_vitals', 'get_memory', 'get_resource_timing'],
+          description: 'Performance action',
+        },
+        count: { type: 'number', description: 'Number of resource entries to return (default: 20, for get_resource_timing)' },
+        type_filter: { type: 'string', description: 'Filter resource entries by type (e.g. script, css, img, fetch, xmlhttprequest)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'editor',
+    description: `View and edit page JavaScript and CSS sources in real-time. Supports hot-reload.
+Actions: list_sources, get_source, edit_source, search_source, list_stylesheets, get_stylesheet, edit_stylesheet.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['list_sources', 'get_source', 'edit_source', 'search_source', 'list_stylesheets', 'get_stylesheet', 'edit_stylesheet'],
+          description: 'Editor action',
+        },
+        scriptId: { type: 'string', description: 'Script ID from list_sources' },
+        styleSheetId: { type: 'string', description: 'Stylesheet ID from list_stylesheets' },
+        search: { type: 'string', description: 'Search string for filtering/searching' },
+        content: { type: 'string', description: 'New content for edit operations' },
+        line_start: { type: 'number', description: 'Start line for partial source view (1-based)' },
+        line_end: { type: 'number', description: 'End line for partial source view (1-based)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'network_intercept',
+    description: `Intercept and modify network requests. Mock API responses, block requests, modify headers.
+Actions: enable, disable, list_rules, add_rule, remove_rule.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['enable', 'disable', 'list_rules', 'add_rule', 'remove_rule'],
+          description: 'Intercept action',
+        },
+        rule_id: { type: 'string', description: 'Rule ID for remove_rule' },
+        url_pattern: { type: 'string', description: 'URL pattern to match (glob: * for any)' },
+        resource_type: { type: 'string', description: 'Resource type filter (XHR, Fetch, Document, Script, Stylesheet, Image, Font, Other)' },
+        mock_status: { type: 'number', description: 'HTTP status code for mock response' },
+        mock_headers: { type: 'string', description: 'JSON string of response headers for mock' },
+        mock_body: { type: 'string', description: 'Response body for mock' },
+        block: { type: 'boolean', description: 'Block matching requests (respond with 404)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'emulation',
+    description: `Emulate devices, network conditions, geolocation, timezone, color scheme, and media features.
+Actions: set_device, set_user_agent, set_geolocation, set_timezone, set_locale, set_network_conditions, set_media, clear_all.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['set_device', 'set_user_agent', 'set_geolocation', 'set_timezone', 'set_locale', 'set_network_conditions', 'set_media', 'clear_all'],
+          description: 'Emulation action',
+        },
+        width: { type: 'number', description: 'Viewport width (for set_device)' },
+        height: { type: 'number', description: 'Viewport height (for set_device)' },
+        device_scale_factor: { type: 'number', description: 'Device pixel ratio (for set_device, default: 1)' },
+        mobile: { type: 'boolean', description: 'Mobile mode (for set_device)' },
+        user_agent: { type: 'string', description: 'User agent string (for set_user_agent)' },
+        latitude: { type: 'number', description: 'Latitude (for set_geolocation)' },
+        longitude: { type: 'number', description: 'Longitude (for set_geolocation)' },
+        accuracy: { type: 'number', description: 'Accuracy in meters (for set_geolocation, default: 1)' },
+        timezone_id: { type: 'string', description: 'IANA timezone (for set_timezone, e.g. America/New_York)' },
+        locale: { type: 'string', description: 'Locale string (for set_locale, e.g. en-US)' },
+        preset: { type: 'string', enum: ['offline', 'slow-3g', 'fast-3g', '4g', 'wifi'], description: 'Network condition preset' },
+        download: { type: 'number', description: 'Download throughput bytes/sec (custom network)' },
+        upload: { type: 'number', description: 'Upload throughput bytes/sec (custom network)' },
+        latency: { type: 'number', description: 'Latency in ms (custom network)' },
+        features: { type: 'string', description: 'Comma-separated media features (e.g. prefers-color-scheme:dark,prefers-reduced-motion:reduce)' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'page_content',
+    description: `Get structured page content: clean HTML, text, metadata, or search the DOM.
+Actions: get_html, get_text, get_metadata, search_dom.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['get_html', 'get_text', 'get_metadata', 'search_dom'],
+          description: 'Content action',
+        },
+        selector: { type: 'string', description: 'CSS selector to scope content (default: body)' },
+        search: { type: 'string', description: 'Search string for search_dom' },
+        max_length: { type: 'number', description: 'Max output length in chars (default: 50000)' },
+        include_styles: { type: 'boolean', description: 'Include inline styles in HTML output (default: false)' },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -456,7 +1152,130 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       cdpSession.ws.close();
       cdpSession = null;
     }
-    return { content: [{ type: 'text', text: 'Connection reset' }] };
+    clearConsoleLogs();
+    clearNetworkLog();
+    clearInterceptState();
+    lastSnapshot = null;
+    await pwExecutor.reset();
+    debuggerEnabled = false;
+    breakpoints.clear();
+    debuggerPaused = false;
+    currentCallFrameId = null;
+    knownScripts.clear();
+    await executorManager.resetAll();
+    return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, and sessions cleared.' }] };
+  }
+
+  if (name === 'playwright_execute') {
+    try {
+      await ensureRelayServer();
+      const code = args.code as string;
+      const timeout = (args.timeout as number) || 30000;
+      const result = await pwExecutor.execute(code, timeout);
+      return {
+        content: [{ type: 'text', text: result.text }],
+        isError: result.isError || undefined,
+      };
+    } catch (e) {
+      error('Error in playwright_execute:', e);
+      return {
+        content: [{ type: 'text', text: `Error: ${String(e)}` }],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === 'console_logs') {
+    const logs = getConsoleLogs({
+      count: args.count as number | undefined,
+      level: args.level as string | undefined,
+      search: args.search as string | undefined,
+    });
+    const text = formatConsoleLogs(logs, consoleLogs.length);
+    if (args.clear) clearConsoleLogs();
+    return { content: [{ type: 'text', text }] };
+  }
+
+  if (name === 'network_log') {
+    const entries = getNetworkEntries({
+      count: args.count as number | undefined,
+      urlFilter: args.url_filter as string | undefined,
+      statusFilter: args.status_filter as string | undefined,
+    });
+    const text = formatNetworkEntries(entries, networkLog.size);
+    if (args.clear) clearNetworkLog();
+    return { content: [{ type: 'text', text }] };
+  }
+
+  if (name === 'network_detail') {
+    const requestId = args.requestId as string;
+    const entry = networkLog.get(requestId);
+    if (!entry) return { content: [{ type: 'text', text: `Request "${requestId}" not found. Use network_log to list available requests.` }] };
+
+    const includeStr = ((args.include as string) || 'all').toLowerCase();
+    const sections = includeStr === 'all'
+      ? ['request_headers', 'request_body', 'response_headers', 'response_body']
+      : includeStr.split(',').map(s => s.trim());
+    const maxBodySize = (args.max_body_size as number) ?? 10000;
+
+    const parts: string[] = [];
+    const dur = entry.endTime && entry.startTime ? `${entry.endTime - entry.startTime}ms` : 'pending';
+    parts.push(`Request: ${entry.method} ${entry.url}`);
+    parts.push(`Status: ${entry.status ?? '(pending)'} ${entry.statusText || ''}`);
+    parts.push(`Type: ${entry.resourceType || 'unknown'} | MIME: ${entry.mimeType || 'unknown'} | Duration: ${dur} | Size: ${entry.size ? `${(entry.size / 1024).toFixed(1)}KB` : 'unknown'}`);
+    if (entry.error) parts.push(`Error: ${entry.error}`);
+
+    if (sections.includes('request_headers') && entry.requestHeaders) {
+      const hdrs = Object.entries(entry.requestHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+      parts.push(`\nRequest Headers:\n${hdrs}`);
+    }
+
+    if (sections.includes('request_body')) {
+      if (entry.postData) {
+        let bodyText = entry.postData;
+        if (bodyText.length > maxBodySize && maxBodySize > 0) bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
+        parts.push(`\nRequest Body:\n${bodyText}`);
+      } else if (entry.hasPostData) {
+        try {
+          const session = await ensureSession();
+          const result = await sendCdpCommand(session, 'Network.getRequestPostData', { requestId }) as { postData?: string; base64Encoded?: boolean };
+          if (result?.postData) {
+            let bodyText = result.base64Encoded ? Buffer.from(result.postData, 'base64').toString('utf-8') : result.postData;
+            if (bodyText.length > maxBodySize && maxBodySize > 0) bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
+            parts.push(`\nRequest Body:\n${bodyText}`);
+          } else {
+            parts.push('\nRequest Body: (not available)');
+          }
+        } catch {
+          parts.push('\nRequest Body: (not available - request may have been evicted from buffer)');
+        }
+      } else {
+        parts.push('\nRequest Body: (none - GET or no body)');
+      }
+    }
+
+    if (sections.includes('response_headers') && entry.responseHeaders) {
+      const hdrs = Object.entries(entry.responseHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
+      parts.push(`\nResponse Headers:\n${hdrs}`);
+    }
+
+    if (sections.includes('response_body') && maxBodySize > 0) {
+      try {
+        const session = await ensureSession();
+        const result = await sendCdpCommand(session, 'Network.getResponseBody', { requestId }) as { body?: string; base64Encoded?: boolean };
+        if (result?.body !== undefined) {
+          let bodyText = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf-8') : result.body;
+          if (bodyText.length > maxBodySize) bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
+          parts.push(`\nResponse Body:\n${bodyText}`);
+        } else {
+          parts.push('\nResponse Body: (empty)');
+        }
+      } catch {
+        parts.push('\nResponse Body: (not available - may have been evicted from browser buffer. Try requesting sooner after the network call.)');
+      }
+    }
+
+    return { content: [{ type: 'text', text: parts.join('\n') }] };
   }
 
   try {
@@ -464,19 +1283,78 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     switch (name) {
       case 'screenshot': {
-        const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot')) as { data: string };
+        const withLabels = args.labels as boolean | undefined;
+
+        if (!withLabels) {
+          const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot')) as { data: string };
+          return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
+        }
+
+        await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
+        await sendCdpCommand(session, 'DOM.enable', undefined, getCommandTimeout('DOM.enable'));
+        const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
+        const interactive = getInteractiveElements(axResult.nodes ?? []);
+
+        const labelPositions: Array<{ index: number; x: number; y: number; width: number; height: number }> = [];
+        for (const el of interactive) {
+          try {
+            const boxModel = await sendCdpCommand(session, 'DOM.getBoxModel', { backendNodeId: el.backendDOMNodeId }) as {
+              model?: { content: number[]; border: number[] };
+            };
+            if (boxModel?.model) {
+              const b = boxModel.model.border;
+              const x = Math.min(b[0], b[2], b[4], b[6]);
+              const y = Math.min(b[1], b[3], b[5], b[7]);
+              const maxX = Math.max(b[0], b[2], b[4], b[6]);
+              const maxY = Math.max(b[1], b[3], b[5], b[7]);
+              labelPositions.push({ index: el.index, x, y, width: maxX - x, height: maxY - y });
+            }
+          } catch {
+            // Element might not be visible
+          }
+        }
+
+        if (labelPositions.length > 0) {
+          await evaluateJs(session, buildLabelInjectionScript(labelPositions));
+        }
+
+        const screenshotResult = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot')) as { data: string };
+
+        if (labelPositions.length > 0) {
+          await evaluateJs(session, REMOVE_LABELS_SCRIPT).catch(() => {});
+        }
+
+        const legend = formatLabelLegend(interactive);
         return {
-          content: [{ type: 'image', data: result.data, mimeType: 'image/png' }],
+          content: [
+            { type: 'image', data: screenshotResult.data, mimeType: 'image/png' },
+            { type: 'text', text: legend },
+          ],
         };
       }
 
       case 'accessibility_snapshot': {
         await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
-        const snapshot = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
-        const text = formatAXTreeAsText(snapshot.nodes ?? []);
-        return {
-          content: [{ type: 'text', text }],
-        };
+        const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
+        const fullText = formatAXTreeAsText(axResult.nodes ?? []);
+
+        const searchQuery = args.search as string | undefined;
+        const showDiff = args.diff as boolean | undefined;
+
+        if (searchQuery) {
+          lastSnapshot = fullText;
+          return { content: [{ type: 'text', text: searchSnapshot(fullText, searchQuery) }] };
+        }
+
+        const shouldDiff = showDiff !== false && lastSnapshot !== null;
+        if (shouldDiff && lastSnapshot) {
+          const diffText = computeSnapshotDiff(lastSnapshot, fullText);
+          lastSnapshot = fullText;
+          return { content: [{ type: 'text', text: diffText }] };
+        }
+
+        lastSnapshot = fullText;
+        return { content: [{ type: 'text', text: fullText }] };
       }
 
       case 'execute': {
@@ -661,6 +1539,745 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
         };
+      }
+
+      case 'debugger': {
+        const action = args.action as string;
+
+        switch (action) {
+          case 'enable': {
+            await sendCdpCommand(session, 'Debugger.enable');
+            await sendCdpCommand(session, 'Runtime.enable');
+            debuggerEnabled = true;
+            return { content: [{ type: 'text', text: 'Debugger enabled. Scripts will be parsed and breakpoints can be set.' }] };
+          }
+          case 'set_breakpoint': {
+            const file = args.file as string;
+            const line = args.line as number;
+            const condition = args.condition as string | undefined;
+            if (!file || !line) return { content: [{ type: 'text', text: 'Error: set_breakpoint requires file and line' }] };
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); await sendCdpCommand(session, 'Runtime.enable'); debuggerEnabled = true; }
+            const result = await sendCdpCommand(session, 'Debugger.setBreakpointByUrl', {
+              lineNumber: line - 1,
+              urlRegex: file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+              columnNumber: 0,
+              ...(condition ? { condition } : {}),
+            }) as { breakpointId: string };
+            breakpoints.set(result.breakpointId, { id: result.breakpointId, file, line });
+            return { content: [{ type: 'text', text: `Breakpoint set: ${result.breakpointId} at ${file}:${line}${condition ? ` (condition: ${condition})` : ''}` }] };
+          }
+          case 'remove_breakpoint': {
+            const bpId = args.breakpointId as string;
+            if (!bpId) return { content: [{ type: 'text', text: 'Error: remove_breakpoint requires breakpointId' }] };
+            await sendCdpCommand(session, 'Debugger.removeBreakpoint', { breakpointId: bpId });
+            breakpoints.delete(bpId);
+            return { content: [{ type: 'text', text: `Breakpoint removed: ${bpId}` }] };
+          }
+          case 'list_breakpoints': {
+            const bps = Array.from(breakpoints.values());
+            if (bps.length === 0) return { content: [{ type: 'text', text: 'No active breakpoints.' }] };
+            const lines = bps.map(bp => `${bp.id}: ${bp.file}:${bp.line}`);
+            return { content: [{ type: 'text', text: `Active breakpoints (${bps.length}):\n${lines.join('\n')}` }] };
+          }
+          case 'resume': {
+            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+            await sendCdpCommand(session, 'Debugger.resume');
+            return { content: [{ type: 'text', text: 'Resumed execution.' }] };
+          }
+          case 'step_over': {
+            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+            await sendCdpCommand(session, 'Debugger.stepOver');
+            return { content: [{ type: 'text', text: 'Stepped over.' }] };
+          }
+          case 'step_into': {
+            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+            await sendCdpCommand(session, 'Debugger.stepInto');
+            return { content: [{ type: 'text', text: 'Stepped into.' }] };
+          }
+          case 'step_out': {
+            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
+            await sendCdpCommand(session, 'Debugger.stepOut');
+            return { content: [{ type: 'text', text: 'Stepped out.' }] };
+          }
+          case 'inspect_variables': {
+            if (!debuggerPaused || !currentCallFrameId) return { content: [{ type: 'text', text: 'Debugger is not paused at a breakpoint.' }] };
+            const evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
+              callFrameId: currentCallFrameId,
+              expression: '(function(){ var __r = {}; try { var __s = arguments.callee.caller; } catch(e) {} return JSON.stringify(__r); })()',
+              returnByValue: true,
+            }) as { result?: { value?: string } };
+            return { content: [{ type: 'text', text: evalResult?.result?.value ?? 'Unable to inspect variables (try using evaluate action instead)' }] };
+          }
+          case 'evaluate': {
+            const expression = args.expression as string;
+            if (!expression) return { content: [{ type: 'text', text: 'Error: evaluate requires expression' }] };
+            let evalResult;
+            if (debuggerPaused && currentCallFrameId) {
+              evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
+                callFrameId: currentCallFrameId,
+                expression,
+                returnByValue: true,
+                generatePreview: true,
+              }) as { result?: { value?: unknown; type?: string; description?: string } };
+            } else {
+              evalResult = await sendCdpCommand(session, 'Runtime.evaluate', {
+                expression,
+                returnByValue: true,
+                awaitPromise: true,
+              }) as { result?: { value?: unknown; type?: string; description?: string } };
+            }
+            const val = evalResult?.result?.value;
+            const text = val !== undefined ? (typeof val === 'string' ? val : JSON.stringify(val, null, 2)) : (evalResult?.result?.description || 'undefined');
+            return { content: [{ type: 'text', text }] };
+          }
+          case 'list_scripts': {
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); await sendCdpCommand(session, 'Runtime.enable'); debuggerEnabled = true; await new Promise(r => setTimeout(r, 200)); }
+            const searchStr = (args.search as string || '').toLowerCase();
+            let scripts = Array.from(knownScripts.values());
+            if (searchStr) scripts = scripts.filter(s => s.url.toLowerCase().includes(searchStr));
+            scripts = scripts.slice(0, 30);
+            if (scripts.length === 0) return { content: [{ type: 'text', text: 'No scripts found.' }] };
+            const scriptLines = scripts.map(s => `${s.scriptId}: ${s.url}`);
+            return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${scriptLines.join('\n')}` }] };
+          }
+          case 'pause_on_exceptions': {
+            const state = (args.state as string) || 'none';
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; }
+            await sendCdpCommand(session, 'Debugger.setPauseOnExceptions', { state });
+            return { content: [{ type: 'text', text: `Pause on exceptions: ${state}` }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown debugger action: ${action}` }] };
+        }
+      }
+
+      case 'css_inspect': {
+        const selector = args.selector as string;
+        const requestedProps = (args.properties as string || '').split(',').map(p => p.trim()).filter(Boolean);
+
+        const defaultProps = [
+          'display', 'position', 'width', 'height', 'margin', 'padding',
+          'color', 'background-color', 'font-size', 'font-weight', 'font-family',
+          'border', 'border-radius', 'opacity', 'visibility', 'overflow',
+          'flex-direction', 'justify-content', 'align-items', 'gap',
+          'z-index', 'box-shadow', 'text-align',
+        ];
+        const propsToGet = requestedProps.length > 0 ? requestedProps : defaultProps;
+
+        const code = `(function() {
+          var el = document.querySelector(${JSON.stringify(selector)});
+          if (!el) return JSON.stringify({ error: 'Element not found: ' + ${JSON.stringify(selector)} });
+          var cs = getComputedStyle(el);
+          var result = {};
+          ${JSON.stringify(propsToGet)}.forEach(function(p) { result[p] = cs.getPropertyValue(p); });
+          result.__tagName = el.tagName.toLowerCase();
+          result.__className = el.className || '';
+          result.__id = el.id || '';
+          var rect = el.getBoundingClientRect();
+          result.__bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
+          return JSON.stringify(result);
+        })()`;
+
+        const value = await evaluateJs(session, code);
+        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+        if (parsed?.error) return { content: [{ type: 'text', text: parsed.error }] };
+
+        const tag = parsed.__tagName;
+        const id = parsed.__id ? `#${parsed.__id}` : '';
+        const cls = parsed.__className ? `.${parsed.__className.split(' ').join('.')}` : '';
+        const bounds = parsed.__bounds;
+        const header = `Element: <${tag}${id}${cls}> (${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y})`;
+
+        delete parsed.__tagName; delete parsed.__className; delete parsed.__id; delete parsed.__bounds;
+        const propLines = Object.entries(parsed)
+          .filter(([, v]) => v !== '' && v !== 'none' && v !== 'normal' && v !== 'auto' && v !== 'visible' && v !== '0px')
+          .map(([k, v]) => `  ${k}: ${v}`);
+
+        return { content: [{ type: 'text', text: `${header}\n\nComputed styles:\n${propLines.join('\n') || '  (no non-default styles)'}` }] };
+      }
+
+      case 'session_manager': {
+        const action = args.action as string;
+        const sessionId = args.sessionId as string | undefined;
+
+        switch (action) {
+          case 'list': {
+            const sessions = executorManager.listSessions();
+            if (sessions.length === 0) return { content: [{ type: 'text', text: 'No active sessions.' }] };
+            const lines = sessions.map(s =>
+              `${s.id}: connected=${s.connected}, stateKeys=[${s.stateKeys.join(', ')}]`
+            );
+            return { content: [{ type: 'text', text: `Sessions (${sessions.length}):\n${lines.join('\n')}` }] };
+          }
+          case 'create': {
+            if (!sessionId) return { content: [{ type: 'text', text: 'Error: create requires sessionId' }] };
+            const existing = executorManager.get(sessionId);
+            if (existing) return { content: [{ type: 'text', text: `Session "${sessionId}" already exists.` }] };
+            executorManager.getOrCreate(sessionId);
+            return { content: [{ type: 'text', text: `Session "${sessionId}" created.` }] };
+          }
+          case 'switch': {
+            if (!sessionId) return { content: [{ type: 'text', text: 'Error: switch requires sessionId' }] };
+            const executor = executorManager.get(sessionId);
+            if (!executor) return { content: [{ type: 'text', text: `Session "${sessionId}" not found. Use "create" first.` }] };
+            return { content: [{ type: 'text', text: `Switched to session "${sessionId}". Use playwright_execute with this session context.` }] };
+          }
+          case 'remove': {
+            if (!sessionId) return { content: [{ type: 'text', text: 'Error: remove requires sessionId' }] };
+            const removed = await executorManager.remove(sessionId);
+            return { content: [{ type: 'text', text: removed ? `Session "${sessionId}" removed.` : `Session "${sessionId}" not found.` }] };
+          }
+          case 'remove_all': {
+            const count = executorManager.size;
+            await executorManager.resetAll();
+            return { content: [{ type: 'text', text: `All ${count} sessions removed.` }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown session action: ${action}. Use: list, create, switch, remove, remove_all` }] };
+        }
+      }
+
+      case 'storage': {
+        const action = args.action as string;
+        switch (action) {
+          case 'get_cookies': {
+            const result = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<Record<string, unknown>> };
+            const cookies = result?.cookies || [];
+            if (cookies.length === 0) return { content: [{ type: 'text', text: 'No cookies found.' }] };
+            const lines = cookies.map(c =>
+              `${c.name}=${String(c.value).slice(0, 80)}${String(c.value).length > 80 ? '...' : ''} (domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'})`
+            );
+            return { content: [{ type: 'text', text: `Cookies (${cookies.length}):\n${lines.join('\n')}` }] };
+          }
+          case 'set_cookie': {
+            const cookieName = args.name as string;
+            const cookieValue = args.value as string;
+            if (!cookieName || cookieValue === undefined) return { content: [{ type: 'text', text: 'Error: set_cookie requires name and value' }] };
+            const cookieParams: Record<string, unknown> = { name: cookieName, value: cookieValue };
+            if (args.domain) cookieParams.domain = args.domain;
+            if (args.url) cookieParams.url = args.url;
+            if (args.path) cookieParams.path = args.path;
+            if (args.secure !== undefined) cookieParams.secure = args.secure;
+            if (args.httpOnly !== undefined) cookieParams.httpOnly = args.httpOnly;
+            if (args.sameSite) cookieParams.sameSite = args.sameSite;
+            if (args.expires) cookieParams.expires = args.expires;
+            if (!cookieParams.url && !cookieParams.domain) {
+              const pageUrl = await evaluateJs(session, 'window.location.href');
+              cookieParams.url = pageUrl;
+            }
+            const result = await sendCdpCommand(session, 'Network.setCookie', cookieParams) as { success: boolean };
+            return { content: [{ type: 'text', text: result?.success ? `Cookie "${cookieName}" set.` : `Failed to set cookie "${cookieName}".` }] };
+          }
+          case 'delete_cookie': {
+            const cookieName = args.name as string;
+            if (!cookieName) return { content: [{ type: 'text', text: 'Error: delete_cookie requires name' }] };
+            const delParams: Record<string, unknown> = { name: cookieName };
+            if (args.domain) delParams.domain = args.domain;
+            if (args.url) delParams.url = args.url;
+            if (args.path) delParams.path = args.path;
+            if (!delParams.url && !delParams.domain) {
+              const pageUrl = await evaluateJs(session, 'window.location.href');
+              delParams.url = pageUrl;
+            }
+            await sendCdpCommand(session, 'Network.deleteCookies', delParams);
+            return { content: [{ type: 'text', text: `Cookie "${cookieName}" deleted.` }] };
+          }
+          case 'get_local_storage':
+          case 'get_session_storage': {
+            const isLocal = action === 'get_local_storage';
+            const storageType = isLocal ? 'localStorage' : 'sessionStorage';
+            const key = args.key as string | undefined;
+            if (key) {
+              const val = await evaluateJs(session, `${storageType}.getItem(${JSON.stringify(key)})`);
+              return { content: [{ type: 'text', text: val !== null ? `${storageType}[${key}] = ${String(val)}` : `${storageType}[${key}] = (not set)` }] };
+            }
+            const result = await evaluateJs(session, `JSON.stringify(Object.fromEntries(Object.entries(${storageType})))`);
+            const parsed = typeof result === 'string' ? JSON.parse(result) : {};
+            const entries = Object.entries(parsed);
+            if (entries.length === 0) return { content: [{ type: 'text', text: `${storageType} is empty.` }] };
+            const lines = entries.map(([k, v]) => {
+              const vs = String(v);
+              return `  ${k}: ${vs.slice(0, 200)}${vs.length > 200 ? '...' : ''}`;
+            });
+            return { content: [{ type: 'text', text: `${storageType} (${entries.length} entries):\n${lines.join('\n')}` }] };
+          }
+          case 'set_local_storage': {
+            const key = args.key as string;
+            const val = args.value as string;
+            if (!key || val === undefined) return { content: [{ type: 'text', text: 'Error: set_local_storage requires key and value' }] };
+            await evaluateJs(session, `localStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(val)})`);
+            return { content: [{ type: 'text', text: `localStorage[${key}] set.` }] };
+          }
+          case 'remove_local_storage': {
+            const key = args.key as string;
+            if (!key) return { content: [{ type: 'text', text: 'Error: remove_local_storage requires key' }] };
+            await evaluateJs(session, `localStorage.removeItem(${JSON.stringify(key)})`);
+            return { content: [{ type: 'text', text: `localStorage[${key}] removed.` }] };
+          }
+          case 'clear_storage': {
+            const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
+            const types = (args.storage_types as string) || 'all';
+            await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: types });
+            return { content: [{ type: 'text', text: `Storage cleared for ${origin} (types: ${types}).` }] };
+          }
+          case 'get_storage_usage': {
+            const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
+            const result = await sendCdpCommand(session, 'Storage.getUsageAndQuota', { origin }) as {
+              usage: number; quota: number; overrideActive: boolean;
+              usageBreakdown: Array<{ storageType: string; usage: number }>;
+            };
+            const total = `Usage: ${(result.usage / 1024).toFixed(1)}KB / ${(result.quota / (1024 * 1024)).toFixed(1)}MB (${((result.usage / result.quota) * 100).toFixed(1)}%)`;
+            const breakdown = (result.usageBreakdown || [])
+              .filter(b => b.usage > 0)
+              .map(b => `  ${b.storageType}: ${(b.usage / 1024).toFixed(1)}KB`)
+              .join('\n');
+            return { content: [{ type: 'text', text: `${total}${breakdown ? '\n\nBreakdown:\n' + breakdown : ''}` }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown storage action: ${action}` }] };
+        }
+      }
+
+      case 'performance': {
+        const action = args.action as string;
+        switch (action) {
+          case 'get_metrics': {
+            await sendCdpCommand(session, 'Performance.enable');
+            const result = await sendCdpCommand(session, 'Performance.getMetrics') as { metrics: Array<{ name: string; value: number }> };
+            await sendCdpCommand(session, 'Performance.disable');
+            const metrics = result?.metrics || [];
+            if (metrics.length === 0) return { content: [{ type: 'text', text: 'No metrics available.' }] };
+            const keyMetrics = ['Timestamp', 'Documents', 'Frames', 'JSEventListeners', 'Nodes', 'LayoutCount',
+              'RecalcStyleCount', 'LayoutDuration', 'RecalcStyleDuration', 'ScriptDuration', 'TaskDuration',
+              'JSHeapUsedSize', 'JSHeapTotalSize'];
+            const lines = metrics
+              .filter(m => keyMetrics.includes(m.name))
+              .map(m => {
+                if (m.name.includes('HeapUsedSize') || m.name.includes('HeapTotalSize'))
+                  return `  ${m.name}: ${(m.value / (1024 * 1024)).toFixed(2)}MB`;
+                if (m.name.includes('Duration'))
+                  return `  ${m.name}: ${(m.value * 1000).toFixed(1)}ms`;
+                return `  ${m.name}: ${m.value}`;
+              });
+            return { content: [{ type: 'text', text: `Performance Metrics:\n${lines.join('\n')}` }] };
+          }
+          case 'get_web_vitals': {
+            const code = `JSON.stringify({
+              lcp: window.__spawriter_lcp || null,
+              cls: window.__spawriter_cls || null,
+              inp: window.__spawriter_inp || null,
+              fcp: performance.getEntriesByName('first-contentful-paint')[0]?.startTime || null,
+              ttfb: performance.getEntriesByType('navigation')[0]?.responseStart || null,
+              domInteractive: performance.getEntriesByType('navigation')[0]?.domInteractive || null,
+              domComplete: performance.getEntriesByType('navigation')[0]?.domComplete || null,
+              loadTime: performance.getEntriesByType('navigation')[0]?.loadEventEnd || null,
+            })`;
+            const raw = await evaluateJs(session, code);
+            const vitals = typeof raw === 'string' ? JSON.parse(raw) : {};
+            const fmt = (val: number | null, unit: string, good: number, poor: number) => {
+              if (val === null || val === undefined) return '(not measured)';
+              const s = unit === 'ms' ? `${val.toFixed(0)}ms` : val.toFixed(3);
+              const grade = val <= good ? '✅ Good' : val <= poor ? '⚠️ Needs Improvement' : '❌ Poor';
+              return `${s} ${grade}`;
+            };
+            const lines = [
+              `  LCP: ${fmt(vitals.lcp, 'ms', 2500, 4000)}`,
+              `  CLS: ${fmt(vitals.cls, '', 0.1, 0.25)}`,
+              `  INP: ${fmt(vitals.inp, 'ms', 200, 500)}`,
+              `  FCP: ${vitals.fcp ? `${vitals.fcp.toFixed(0)}ms` : '(not available)'}`,
+              `  TTFB: ${vitals.ttfb ? `${vitals.ttfb.toFixed(0)}ms` : '(not available)'}`,
+              `  DOM Interactive: ${vitals.domInteractive ? `${vitals.domInteractive.toFixed(0)}ms` : '(n/a)'}`,
+              `  DOM Complete: ${vitals.domComplete ? `${vitals.domComplete.toFixed(0)}ms` : '(n/a)'}`,
+              `  Load: ${vitals.loadTime ? `${vitals.loadTime.toFixed(0)}ms` : '(n/a)'}`,
+            ];
+            const observerCode = `
+              if (!window.__spawriter_lcp_obs) {
+                window.__spawriter_lcp = 0; window.__spawriter_cls = 0; window.__spawriter_inp = Infinity;
+                new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_lcp = e.startTime; }).observe({type:'largest-contentful-paint',buffered:true});
+                new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_cls += e.value; }).observe({type:'layout-shift',buffered:true});
+                new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_inp = Math.min(window.__spawriter_inp, e.duration); }).observe({type:'event',buffered:true,durationThreshold:16});
+                window.__spawriter_lcp_obs = true;
+              }
+              'observers_active'`;
+            await evaluateJs(session, observerCode);
+            return { content: [{ type: 'text', text: `Web Vitals:\n${lines.join('\n')}\n\n(Note: LCP/CLS/INP require observers — run this tool again for updated values after page interaction.)` }] };
+          }
+          case 'get_memory': {
+            await sendCdpCommand(session, 'Performance.enable');
+            const result = await sendCdpCommand(session, 'Performance.getMetrics') as { metrics: Array<{ name: string; value: number }> };
+            await sendCdpCommand(session, 'Performance.disable');
+            const m = Object.fromEntries((result?.metrics || []).map(x => [x.name, x.value]));
+            const heapUsed = m['JSHeapUsedSize'] || 0;
+            const heapTotal = m['JSHeapTotalSize'] || 0;
+            const nodes = m['Nodes'] || 0;
+            const listeners = m['JSEventListeners'] || 0;
+            const docs = m['Documents'] || 0;
+            const frames = m['Frames'] || 0;
+            return { content: [{ type: 'text', text: `Memory:\n  JS Heap: ${(heapUsed / (1024 * 1024)).toFixed(2)}MB / ${(heapTotal / (1024 * 1024)).toFixed(2)}MB (${heapTotal > 0 ? ((heapUsed / heapTotal) * 100).toFixed(1) : 0}%)\n  DOM Nodes: ${nodes}\n  Event Listeners: ${listeners}\n  Documents: ${docs}\n  Frames: ${frames}` }] };
+          }
+          case 'get_resource_timing': {
+            const count = (args.count as number) || 20;
+            const typeFilter = (args.type_filter as string) || '';
+            const code = `JSON.stringify(performance.getEntriesByType('resource').map(e => ({
+              name: e.name, type: e.initiatorType, duration: e.duration,
+              transferSize: e.transferSize, decodedBodySize: e.decodedBodySize,
+              startTime: e.startTime
+            })))`;
+            const raw = await evaluateJs(session, code);
+            let resources: Array<{ name: string; type: string; duration: number; transferSize: number; decodedBodySize: number; startTime: number }> =
+              typeof raw === 'string' ? JSON.parse(raw) : [];
+            if (typeFilter) resources = resources.filter(r => r.type.toLowerCase().includes(typeFilter.toLowerCase()));
+            resources.sort((a, b) => b.duration - a.duration);
+            resources = resources.slice(0, count);
+            if (resources.length === 0) return { content: [{ type: 'text', text: 'No resource timing entries found.' }] };
+            const lines = resources.map(r => {
+              const url = r.name.length > 80 ? '...' + r.name.slice(-77) : r.name;
+              return `  ${r.duration.toFixed(0).padStart(6)}ms  ${(r.transferSize / 1024).toFixed(1).padStart(7)}KB  ${r.type.padEnd(12)}  ${url}`;
+            });
+            return { content: [{ type: 'text', text: `Resource Timing (top ${resources.length} by duration):\n  ${' '.padEnd(6)}ms  ${' '.padEnd(7)}KB  ${'type'.padEnd(12)}  URL\n${lines.join('\n')}` }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown performance action: ${action}` }] };
+        }
+      }
+
+      case 'editor': {
+        const action = args.action as string;
+        switch (action) {
+          case 'list_sources': {
+            const search = (args.search as string || '').toLowerCase();
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); await sendCdpCommand(session, 'Runtime.enable'); debuggerEnabled = true; await new Promise(r => setTimeout(r, 200)); }
+            let scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
+            if (search) scripts = scripts.filter(s => s.url.toLowerCase().includes(search));
+            scripts = scripts.slice(0, 50);
+            if (scripts.length === 0) return { content: [{ type: 'text', text: 'No scripts found.' }] };
+            const lines = scripts.map(s => `  [${s.scriptId}] ${s.url}`);
+            return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${lines.join('\n')}` }] };
+          }
+          case 'get_source': {
+            const scriptId = args.scriptId as string;
+            if (!scriptId) return { content: [{ type: 'text', text: 'Error: get_source requires scriptId' }] };
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; }
+            const result = await sendCdpCommand(session, 'Debugger.getScriptSource', { scriptId }) as { scriptSource: string };
+            let source = result?.scriptSource || '(empty)';
+            const lineStart = args.line_start as number | undefined;
+            const lineEnd = args.line_end as number | undefined;
+            if (lineStart || lineEnd) {
+              const srcLines = source.split('\n');
+              const start = Math.max(1, lineStart || 1) - 1;
+              const end = Math.min(srcLines.length, lineEnd || srcLines.length);
+              source = srcLines.slice(start, end).map((l, i) => `${(start + i + 1).toString().padStart(5)}| ${l}`).join('\n');
+            } else if (source.length > 50000) {
+              source = source.slice(0, 50000) + `\n[Truncated to 50000 chars. Use line_start/line_end for specific ranges.]`;
+            }
+            return { content: [{ type: 'text', text: source }] };
+          }
+          case 'edit_source': {
+            const scriptId = args.scriptId as string;
+            const content = args.content as string;
+            if (!scriptId || !content) return { content: [{ type: 'text', text: 'Error: edit_source requires scriptId and content' }] };
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; }
+            try {
+              await sendCdpCommand(session, 'Debugger.setScriptSource', { scriptId, scriptSource: content });
+              return { content: [{ type: 'text', text: `Script ${scriptId} updated (hot-reload applied).` }] };
+            } catch (e) {
+              const code = `
+                try {
+                  const s = document.createElement('script');
+                  s.textContent = ${JSON.stringify(content)};
+                  document.head.appendChild(s);
+                  'Script injected via DOM.'
+                } catch(e) { 'Fallback failed: ' + e.message }`;
+              const fb = await evaluateJs(session, code);
+              return { content: [{ type: 'text', text: `setScriptSource failed (${String(e)}). Fallback: ${fb}` }] };
+            }
+          }
+          case 'search_source': {
+            const search = args.search as string;
+            if (!search) return { content: [{ type: 'text', text: 'Error: search_source requires search string' }] };
+            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; await new Promise(r => setTimeout(r, 200)); }
+            const scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
+            const matches: string[] = [];
+            for (const s of scripts.slice(0, 30)) {
+              try {
+                const result = await sendCdpCommand(session, 'Debugger.searchInContent', { scriptId: s.scriptId, query: search }) as { result: Array<{ lineNumber: number; lineContent: string }> };
+                if (result?.result?.length) {
+                  matches.push(`${s.url} (${result.result.length} matches):`);
+                  for (const m of result.result.slice(0, 5)) {
+                    matches.push(`  L${m.lineNumber + 1}: ${m.lineContent.trim().slice(0, 120)}`);
+                  }
+                  if (result.result.length > 5) matches.push(`  ... and ${result.result.length - 5} more`);
+                }
+              } catch { /* skip scripts that can't be searched */ }
+            }
+            return { content: [{ type: 'text', text: matches.length > 0 ? `Search results for "${search}":\n${matches.join('\n')}` : `No results for "${search}" in loaded scripts.` }] };
+          }
+          case 'list_stylesheets': {
+            await sendCdpCommand(session, 'CSS.enable');
+            await sendCdpCommand(session, 'DOM.enable');
+            const result = await sendCdpCommand(session, 'CSS.getStyleSheets' in {} ? 'CSS.getStyleSheets' : 'Runtime.evaluate', {
+              expression: `JSON.stringify(Array.from(document.styleSheets).map((s, i) => ({ id: i, href: s.href || '(inline)', disabled: s.disabled, rules: s.cssRules?.length || 0 })))`,
+              returnByValue: true,
+            }) as { result?: { value: unknown } };
+            const sheets = typeof (result?.result as Record<string, unknown>)?.value === 'string'
+              ? JSON.parse((result?.result as Record<string, unknown>).value as string)
+              : [];
+            if (sheets.length === 0) return { content: [{ type: 'text', text: 'No stylesheets found.' }] };
+            const lines = sheets.map((s: { id: number; href: string; disabled: boolean; rules: number }) =>
+              `  [${s.id}] ${s.href} (${s.rules} rules${s.disabled ? ', disabled' : ''})`
+            );
+            return { content: [{ type: 'text', text: `Stylesheets (${sheets.length}):\n${lines.join('\n')}` }] };
+          }
+          case 'get_stylesheet': {
+            const idx = args.styleSheetId as string;
+            if (idx === undefined) return { content: [{ type: 'text', text: 'Error: get_stylesheet requires styleSheetId' }] };
+            const code = `(() => {
+              const s = document.styleSheets[${parseInt(idx, 10)}];
+              if (!s) return 'Stylesheet not found.';
+              try { return Array.from(s.cssRules).map(r => r.cssText).join('\\n'); }
+              catch(e) { return 'Cannot read rules (CORS): ' + e.message; }
+            })()`;
+            let cssText = await evaluateJs(session, code) as string;
+            if (cssText.length > 50000) cssText = cssText.slice(0, 50000) + '\n[Truncated]';
+            return { content: [{ type: 'text', text: cssText }] };
+          }
+          case 'edit_stylesheet': {
+            const idx = args.styleSheetId as string;
+            const content = args.content as string;
+            if (idx === undefined || !content) return { content: [{ type: 'text', text: 'Error: edit_stylesheet requires styleSheetId and content' }] };
+            const code = `(() => {
+              const s = document.styleSheets[${parseInt(idx, 10)}];
+              if (!s) return 'Stylesheet not found.';
+              while (s.cssRules.length > 0) s.deleteRule(0);
+              const rules = ${JSON.stringify(content)}.split('}').filter(r => r.trim());
+              rules.forEach(r => { try { s.insertRule(r.trim() + '}', s.cssRules.length); } catch(e) {} });
+              return 'Stylesheet updated (' + s.cssRules.length + ' rules applied).';
+            })()`;
+            const result = await evaluateJs(session, code);
+            return { content: [{ type: 'text', text: String(result) }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown editor action: ${action}` }] };
+        }
+      }
+
+      case 'network_intercept': {
+        const action = args.action as string;
+        switch (action) {
+          case 'enable': {
+            const patterns = [{ urlPattern: args.url_pattern as string || '*', requestStage: 'Request' }];
+            await sendCdpCommand(session, 'Fetch.enable', { patterns });
+            interceptEnabled = true;
+            return { content: [{ type: 'text', text: `Network interception enabled. ${interceptRules.size} rules active.` }] };
+          }
+          case 'disable': {
+            await sendCdpCommand(session, 'Fetch.disable');
+            interceptEnabled = false;
+            return { content: [{ type: 'text', text: 'Network interception disabled.' }] };
+          }
+          case 'list_rules': {
+            const rules = Array.from(interceptRules.values());
+            if (rules.length === 0) return { content: [{ type: 'text', text: `No intercept rules. Interception is ${interceptEnabled ? 'enabled' : 'disabled'}.` }] };
+            const lines = rules.map(r => {
+              const parts = [`[${r.id}] pattern="${r.urlPattern}"`];
+              if (r.resourceType) parts.push(`type=${r.resourceType}`);
+              if (r.block) parts.push('→ BLOCK');
+              else if (r.mockStatus !== undefined) parts.push(`→ mock ${r.mockStatus}`);
+              return parts.join(' ');
+            });
+            return { content: [{ type: 'text', text: `Intercept rules (${rules.length}, ${interceptEnabled ? 'enabled' : 'disabled'}):\n${lines.join('\n')}` }] };
+          }
+          case 'add_rule': {
+            const urlPattern = args.url_pattern as string;
+            if (!urlPattern) return { content: [{ type: 'text', text: 'Error: add_rule requires url_pattern' }] };
+            const ruleId = `rule_${interceptNextId++}`;
+            const rule: InterceptRule = { id: ruleId, urlPattern, resourceType: args.resource_type as string | undefined };
+            if (args.block) {
+              rule.block = true;
+            } else if (args.mock_status !== undefined) {
+              rule.mockStatus = args.mock_status as number;
+              if (args.mock_headers) rule.mockHeaders = JSON.parse(args.mock_headers as string);
+              if (args.mock_body !== undefined) rule.mockBody = args.mock_body as string;
+            }
+            interceptRules.set(ruleId, rule);
+            return { content: [{ type: 'text', text: `Rule added: ${ruleId} (pattern="${urlPattern}"${rule.block ? ', block' : ''}${rule.mockStatus !== undefined ? `, mock ${rule.mockStatus}` : ''})` }] };
+          }
+          case 'remove_rule': {
+            const ruleId = args.rule_id as string;
+            if (!ruleId) return { content: [{ type: 'text', text: 'Error: remove_rule requires rule_id' }] };
+            const removed = interceptRules.delete(ruleId);
+            return { content: [{ type: 'text', text: removed ? `Rule ${ruleId} removed.` : `Rule ${ruleId} not found.` }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown intercept action: ${action}` }] };
+        }
+      }
+
+      case 'emulation': {
+        const action = args.action as string;
+        switch (action) {
+          case 'set_device': {
+            const width = args.width as number || 375;
+            const height = args.height as number || 812;
+            const dpr = args.device_scale_factor as number || 1;
+            const mobile = args.mobile as boolean ?? false;
+            await sendCdpCommand(session, 'Emulation.setDeviceMetricsOverride', {
+              width, height, deviceScaleFactor: dpr, mobile,
+            });
+            return { content: [{ type: 'text', text: `Device emulation: ${width}x${height} @${dpr}x${mobile ? ' (mobile)' : ''}` }] };
+          }
+          case 'set_user_agent': {
+            const ua = args.user_agent as string;
+            if (!ua) return { content: [{ type: 'text', text: 'Error: set_user_agent requires user_agent' }] };
+            await sendCdpCommand(session, 'Emulation.setUserAgentOverride', { userAgent: ua });
+            return { content: [{ type: 'text', text: `User agent set.` }] };
+          }
+          case 'set_geolocation': {
+            const lat = args.latitude as number;
+            const lng = args.longitude as number;
+            if (lat === undefined || lng === undefined) return { content: [{ type: 'text', text: 'Error: set_geolocation requires latitude and longitude' }] };
+            await sendCdpCommand(session, 'Emulation.setGeolocationOverride', {
+              latitude: lat, longitude: lng, accuracy: (args.accuracy as number) || 1,
+            });
+            return { content: [{ type: 'text', text: `Geolocation: ${lat}, ${lng}` }] };
+          }
+          case 'set_timezone': {
+            const tz = args.timezone_id as string;
+            if (!tz) return { content: [{ type: 'text', text: 'Error: set_timezone requires timezone_id' }] };
+            await sendCdpCommand(session, 'Emulation.setTimezoneOverride', { timezoneId: tz });
+            return { content: [{ type: 'text', text: `Timezone: ${tz}` }] };
+          }
+          case 'set_locale': {
+            const loc = args.locale as string;
+            if (!loc) return { content: [{ type: 'text', text: 'Error: set_locale requires locale' }] };
+            await sendCdpCommand(session, 'Emulation.setLocaleOverride', { locale: loc });
+            return { content: [{ type: 'text', text: `Locale: ${loc}` }] };
+          }
+          case 'set_network_conditions': {
+            const presets: Record<string, { offline: boolean; latency: number; downloadThroughput: number; uploadThroughput: number }> = {
+              'offline': { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+              'slow-3g': { offline: false, latency: 2000, downloadThroughput: 50 * 1024, uploadThroughput: 50 * 1024 },
+              'fast-3g': { offline: false, latency: 562, downloadThroughput: 180 * 1024, uploadThroughput: 84 * 1024 },
+              '4g': { offline: false, latency: 170, downloadThroughput: 1.5 * 1024 * 1024, uploadThroughput: 750 * 1024 },
+              'wifi': { offline: false, latency: 28, downloadThroughput: 30 * 1024 * 1024, uploadThroughput: 15 * 1024 * 1024 },
+            };
+            const preset = args.preset as string;
+            const params = preset && presets[preset]
+              ? presets[preset]
+              : {
+                  offline: false,
+                  latency: (args.latency as number) || 0,
+                  downloadThroughput: (args.download as number) || -1,
+                  uploadThroughput: (args.upload as number) || -1,
+                };
+            await sendCdpCommand(session, 'Network.emulateNetworkConditions', params);
+            return { content: [{ type: 'text', text: `Network: ${preset || 'custom'} (latency=${params.latency}ms, down=${params.downloadThroughput > 0 ? (params.downloadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'}, up=${params.uploadThroughput > 0 ? (params.uploadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'})` }] };
+          }
+          case 'set_media': {
+            const features = (args.features as string || '').split(',').filter(f => f.includes(':')).map(f => {
+              const [n, v] = f.trim().split(':');
+              return { name: n.trim(), value: v.trim() };
+            });
+            await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features });
+            return { content: [{ type: 'text', text: `Media features: ${features.map(f => `${f.name}:${f.value}`).join(', ') || '(cleared)'}` }] };
+          }
+          case 'clear_all': {
+            await sendCdpCommand(session, 'Emulation.clearDeviceMetricsOverride');
+            await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features: [] });
+            try { await sendCdpCommand(session, 'Emulation.clearGeolocationOverride'); } catch { /* ok */ }
+            try { await sendCdpCommand(session, 'Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }); } catch { /* ok */ }
+            return { content: [{ type: 'text', text: 'All emulations cleared.' }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown emulation action: ${action}` }] };
+        }
+      }
+
+      case 'page_content': {
+        const action = args.action as string;
+        const selector = (args.selector as string) || 'body';
+        const maxLength = (args.max_length as number) || 50000;
+
+        switch (action) {
+          case 'get_html': {
+            const includeStyles = args.include_styles as boolean ?? false;
+            const code = includeStyles
+              ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || '(element not found)'`
+              : `(() => {
+                  const el = document.querySelector(${JSON.stringify(selector)});
+                  if (!el) return '(element not found)';
+                  const clone = el.cloneNode(true);
+                  clone.querySelectorAll('[style]').forEach(e => e.removeAttribute('style'));
+                  clone.querySelectorAll('script,noscript').forEach(e => e.remove());
+                  return clone.outerHTML;
+                })()`;
+            let html = await evaluateJs(session, code) as string;
+            if (html.length > maxLength) html = html.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
+            return { content: [{ type: 'text', text: html }] };
+          }
+          case 'get_text': {
+            const code = `document.querySelector(${JSON.stringify(selector)})?.innerText || '(element not found)'`;
+            let text = await evaluateJs(session, code) as string;
+            if (text.length > maxLength) text = text.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
+            return { content: [{ type: 'text', text }] };
+          }
+          case 'get_metadata': {
+            const code = `JSON.stringify({
+              title: document.title,
+              url: location.href,
+              description: document.querySelector('meta[name="description"]')?.content || null,
+              charset: document.characterSet,
+              lang: document.documentElement.lang || null,
+              viewport: document.querySelector('meta[name="viewport"]')?.content || null,
+              ogTitle: document.querySelector('meta[property="og:title"]')?.content || null,
+              ogDescription: document.querySelector('meta[property="og:description"]')?.content || null,
+              ogImage: document.querySelector('meta[property="og:image"]')?.content || null,
+              canonical: document.querySelector('link[rel="canonical"]')?.href || null,
+              favicon: document.querySelector('link[rel="icon"]')?.href || document.querySelector('link[rel="shortcut icon"]')?.href || null,
+              scripts: document.querySelectorAll('script[src]').length,
+              stylesheets: document.querySelectorAll('link[rel="stylesheet"]').length,
+              images: document.querySelectorAll('img').length,
+              links: document.querySelectorAll('a[href]').length,
+            })`;
+            const raw = await evaluateJs(session, code);
+            const meta = typeof raw === 'string' ? JSON.parse(raw) : {};
+            const lines = Object.entries(meta)
+              .filter(([, v]) => v !== null && v !== undefined)
+              .map(([k, v]) => `  ${k}: ${v}`);
+            return { content: [{ type: 'text', text: `Page Metadata:\n${lines.join('\n')}` }] };
+          }
+          case 'search_dom': {
+            const search = args.search as string;
+            if (!search) return { content: [{ type: 'text', text: 'Error: search_dom requires search string' }] };
+            const code = `(() => {
+              const results = [];
+              const walker = document.createTreeWalker(document.querySelector(${JSON.stringify(selector)}) || document.body, NodeFilter.SHOW_ELEMENT);
+              const needle = ${JSON.stringify(search.toLowerCase())};
+              while (walker.nextNode()) {
+                const el = walker.currentNode;
+                const tag = el.tagName.toLowerCase();
+                const id = el.id ? '#' + el.id : '';
+                const cls = el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\\s+/).join('.') : '';
+                const text = (el.textContent || '').slice(0, 200).trim();
+                const attrs = Array.from(el.attributes).map(a => a.name + '="' + a.value + '"').join(' ');
+                const match = tag.includes(needle) || id.toLowerCase().includes(needle) ||
+                  cls.toLowerCase().includes(needle) || text.toLowerCase().includes(needle) ||
+                  attrs.toLowerCase().includes(needle);
+                if (match) {
+                  results.push('<' + tag + id + cls + '> ' + text.slice(0, 100));
+                  if (results.length >= 50) break;
+                }
+              }
+              return JSON.stringify(results);
+            })()`;
+            const raw = await evaluateJs(session, code);
+            const results: string[] = typeof raw === 'string' ? JSON.parse(raw) : [];
+            if (results.length === 0) return { content: [{ type: 'text', text: `No elements found matching "${search}".` }] };
+            return { content: [{ type: 'text', text: `DOM search for "${search}" (${results.length} results):\n${results.map(r => `  ${r}`).join('\n')}` }] };
+          }
+          default:
+            return { content: [{ type: 'text', text: `Unknown page_content action: ${action}` }] };
+        }
       }
 
       default:

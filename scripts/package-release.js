@@ -162,12 +162,12 @@ function main() {
     path.join(releaseDir, "README.md")
   );
   copyFileIfExists(
-    path.join(rootDir, "doc", "CHROME_INSTALL_TEST_GUIDE.md"),
-    path.join(releaseDir, "doc", "CHROME_INSTALL_TEST_GUIDE.md")
+    path.join(rootDir, "docs", "CHROME_INSTALL_TEST_GUIDE.md"),
+    path.join(releaseDir, "docs", "CHROME_INSTALL_TEST_GUIDE.md")
   );
   copyFileIfExists(
-    path.join(rootDir, "doc", "MCP_DEV_GUIDE.md"),
-    path.join(releaseDir, "doc", "MCP_DEV_GUIDE.md")
+    path.join(rootDir, "docs", "MCP_DEV_GUIDE.md"),
+    path.join(releaseDir, "docs", "MCP_DEV_GUIDE.md")
   );
 
   writeStartHereFile(releaseDir);

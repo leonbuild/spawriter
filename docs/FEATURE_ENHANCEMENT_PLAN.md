@@ -128,10 +128,10 @@ playwriter 没有自己实现 Playwright API。它 fork 了微软官方 `playwri
 | **P1** | Playwright execute | 高 | 高 |
 | **P1** | 带标签截图 | 高 | 高 |
 | **P1** | State 持久化 | 高 | 高 |
-| **P2** | 断点调试器 | 中 | 中 |
+| **P2** | 断点调试器 ✅ | 中 | 中 |
+| **P2** | CSS 检查 ✅ | 中 | 中 |
+| **P2** | Session 管理 ✅ | 中 | 中 |
 | **P2** | 代码编辑器 | 中 | 中 |
-| **P2** | CSS 检查 | 中 | 中 |
-| **P2** | Session 管理 | 中 | 中 |
 | **P3** | 视频录制 / CLI / Demo 视频 / Ghost cursor | 低 | 低 |
 
 ---
@@ -140,20 +140,24 @@ playwriter 没有自己实现 Playwright API。它 fork 了微软官方 `playwri
 
 ```
 spawriter v2.0（合并后）
-├── MCP Tools
+├── MCP Tools (23 个)
 │   ├── execute                    ← 保留（页面上下文 JS，快速轻量）
 │   ├── playwright_execute         ← 新增（Playwright VM 沙箱，复杂交互）
 │   ├── screenshot                 ← 增强（支持 labels 参数）
 │   ├── accessibility_snapshot     ← 增强（支持 diff/search）
 │   ├── console_logs               ← 新增（纯 CDP）
 │   ├── network_log                ← 新增（纯 CDP）
+│   ├── network_detail             ← 新增（请求/响应 headers + body 详情）
+│   ├── debugger                   ← 新增（断点/单步/变量检查，12 种操作）
+│   ├── css_inspect                ← 新增（CSS 属性检查）
+│   ├── session_manager            ← 新增（多会话管理，5 种操作）
 │   ├── navigate                   ← 保留
 │   ├── dashboard_state            ← 保留（spawriter 独有）
 │   ├── override_app               ← 保留（spawriter 独有）
 │   ├── app_action                 ← 保留（spawriter 独有）
 │   ├── clear_cache_and_reload     ← 保留
 │   ├── ensure_fresh_render        ← 保留
-│   └── reset                      ← 保留（增强：清理日志/网络/Playwright）
+│   └── reset                      ← 保留（增强：清理日志/网络/Playwright/调试器/会话）
 └── Extension
     ├── single-spa DevTools panel  ← 保留（spawriter 独有）
     └── import-map-overrides UI    ← 保留（spawriter 独有）
@@ -163,7 +167,7 @@ spawriter v2.0（合并后）
 
 ## 5. 分阶段实施
 
-### Phase 1：纯 CDP 增强（~1 周）
+### Phase 1：纯 CDP 增强 ✅ 已完成
 
 > 不需要 Playwright，改动最小，价值最高。
 
@@ -416,7 +420,7 @@ if (name === 'reset') {
 
 ---
 
-### Phase 2：Playwright 集成（~1-2 周）
+### Phase 2：Playwright 集成 ✅ 已完成
 
 #### 5.2.1 新建 `mcp/src/pw-executor.ts`
 
@@ -497,15 +501,23 @@ Use for: complex interactions, form filling, multi-page, Playwright locators.`,
 
 ---
 
-### Phase 3：按需高级功能
+### Phase 3：按需高级功能（部分完成）
 
-| 功能 | 来源 | 估时 |
-|------|------|------|
-| 断点调试器 | 移植 playwriter `debugger.ts` | 1 天 |
-| 代码编辑器 | 移植 playwriter `editor.ts` | 1 天 |
-| 视频录制 | 扩展添加 `chrome.tabCapture` + RecordingRelay | 2 天 |
-| Session 管理 | 添加 `ExecutorManager` | 1 天 |
-| CLI 工具 | relay 添加 `POST /cli/execute` | 0.5 天 |
+| 功能 | 来源 | 估时 | 状态 |
+|------|------|------|------|
+| 断点调试器 | 移植 playwriter `debugger.ts` | 1 天 | ✅ 已完成 |
+| CSS 检查 | CDP `Runtime.evaluate` + `getComputedStyle` | 0.5 天 | ✅ 已完成 |
+| Session 管理 | 添加 `ExecutorManager` | 1 天 | ✅ 已完成 |
+| 代码编辑器 | 移植 playwriter `editor.ts` | 1 天 | 待定 |
+| 视频录制 | 扩展添加 `chrome.tabCapture` + RecordingRelay | 2 天 | 待定 |
+| CLI 工具 | relay 添加 `POST /cli/execute` | 0.5 天 | 待定 |
+
+**Phase 3 已完成功能：**
+
+- `debugger` 工具：12 种操作（enable, set_breakpoint, remove_breakpoint, list_breakpoints, resume, step_over, step_into, step_out, inspect_variables, evaluate, list_scripts, pause_on_exceptions）
+- `css_inspect` 工具：CSS 选择器 + getComputedStyle，支持指定属性或返回常用视觉属性
+- `session_manager` 工具：5 种操作（list, create, switch, remove, remove_all），带自动淘汰机制（默认最多 5 会话）
+- `ExecutorManager` 类：多会话 Playwright 执行器管理，独立浏览器连接和状态
 
 ---
 
@@ -558,4 +570,5 @@ Phase 1/2 完成后更新 `cursor-rules/spawriter.mdc`：
 | `playwright_execute` | Run code with Playwright API (page, context, state) | `code`, `timeout?` |
 | `console_logs` | Browser console logs | `count?`, `level?`, `search?`, `clear?` |
 | `network_log` | Network requests | `count?`, `url_filter?`, `status_filter?`, `clear?` |
+| `network_detail` | 请求/响应 headers + body 详情 | `requestId`, `include?`, `max_body_size?` |
 ```

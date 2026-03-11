@@ -8,45 +8,58 @@ alwaysApply: false
 
 You have access to **spawriter** MCP tools that control the user's real Chrome tab via CDP (Chrome DevTools Protocol). This is NOT a headless browser — all actions affect the user's visible browser.
 
-## Prerequisites
-
-Before using any MCP tool:
-
-1. The **spawriter browser extension** must be installed and connected (green badge on toolbar).
-2. The MCP server `spawriter` must be registered and running in Cursor.
-3. At least one Chrome tab must be attached for CDP communication.
-
-If tools return errors or are unavailable, ask the user to verify the extension connection (green badge) and MCP server status.
-
-## MCP Configuration
-
-Add to `.cursor/mcp.json` or `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "spawriter": {
-      "command": "node",
-      "args": ["<path-to-spawriter>/mcp/dist/cli.js", "serve"]
-    }
-  }
-}
-```
-
-Relay port: `19989`.
-
----
-
-## Available Tools (10)
+## Available Tools (23)
 
 ### Inspection & State
 
 | Tool | Description | Key Args |
 |------|-------------|----------|
-| `dashboard_state` | Get single-spa app list, statuses, active import-map-overrides, and per-app override URLs | `appName?` (optional filter) |
-| `screenshot` | Capture the current visible page as an image | — |
-| `accessibility_snapshot` | Get condensed accessibility tree (text format) | — |
-| `execute` | Run arbitrary JavaScript in the page context and return result | `code` (string) |
+| `dashboard_state` | Get single-spa app list, statuses, active import-map-overrides | `appName?` |
+| `screenshot` | Capture page screenshot, optionally with numbered labels on interactive elements | `labels?` (boolean) |
+| `accessibility_snapshot` | Get condensed accessibility tree with search and diff support | `search?`, `diff?` |
+| `execute` | Run JS in page context (fast, lightweight, direct CDP) | `code` |
+| `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API (page, context, state) | `code`, `timeout?` |
+| `console_logs` | Get captured browser console logs with filtering | `count?`, `level?`, `search?`, `clear?` |
+| `network_log` | Get captured network requests with filtering | `count?`, `url_filter?`, `status_filter?`, `clear?` |
+| `network_detail` | Get full details of a specific request: headers, request/response body | `requestId`, `include?`, `max_body_size?` |
+
+### Debugging & CSS
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `debugger` | Control JavaScript debugger: breakpoints, stepping, variable inspection | `action` (12 actions), `file?`, `line?`, `condition?`, `expression?`, etc. |
+| `css_inspect` | Get computed CSS styles for an element by selector | `selector`, `properties?` (comma-separated) |
+| `editor` | View and edit page JS/CSS sources in real-time (hot-reload) | `action` (7 actions), `scriptId?`, `styleSheetId?`, `search?`, `content?`, `line_start?`, `line_end?` |
+
+### Storage & State
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `storage` | Manage cookies, localStorage, sessionStorage, cache | `action` (9 actions), `key?`, `value?`, `name?`, `domain?`, `origin?`, `storage_types?` |
+
+### Performance
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `performance` | Runtime metrics, Web Vitals, memory, resource timing | `action` (4 actions), `count?`, `type_filter?` |
+
+### Network
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `network_intercept` | Intercept/mock/block network requests (Fetch domain) | `action` (5 actions), `url_pattern?`, `mock_status?`, `mock_body?`, `block?` |
+
+### Emulation
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `emulation` | Device, network, geolocation, timezone, media feature emulation | `action` (8 actions), `width?`, `height?`, `preset?`, `features?`, etc. |
+
+### Page Content
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `page_content` | Get clean HTML, text, metadata, or search the DOM | `action` (4 actions), `selector?`, `search?`, `max_length?` |
 
 ### Navigation & Refresh
 
@@ -68,11 +81,12 @@ Relay port: `19989`.
 |------|-------------|----------|
 | `app_action` | Control single-spa app lifecycle | `action`: `mount` / `unmount` / `unload`; `appName` |
 
-### Connection
+### Session & Connection
 
 | Tool | Description | Key Args |
 |------|-------------|----------|
-| `reset` | Reset CDP connection (use when session is unstable) | — |
+| `session_manager` | Manage multiple Playwright executor sessions | `action`: `list` / `create` / `switch` / `remove` / `remove_all`; `sessionId?` |
+| `reset` | Reset CDP + Playwright connections, clear all logs/network/debugger/sessions | — |
 
 ---
 
@@ -81,8 +95,12 @@ Relay port: `19989`.
 ### 1. Understand current state first
 
 ```
-dashboard_state  →  see all apps, their statuses, active overrides
-screenshot       →  confirm the visible UI
+dashboard_state           →  see all apps, their statuses, active overrides
+screenshot                →  confirm the visible UI
+screenshot { labels: true } → labeled screenshot showing interactive elements
+accessibility_snapshot    →  get page structure as text
+console_logs              →  check for errors
+network_log               →  verify API calls
 ```
 
 ### 2. Set up overrides for local development
@@ -100,7 +118,135 @@ dashboard_state  →  confirm overrideUrl shows your localhost URL
 screenshot       →  confirm the UI reflects your local code
 ```
 
-### 4. Make code changes, then verify
+### 4. Complex interactions with Playwright
+
+```
+playwright_execute { code: "await page.click('button[type=submit]')" }
+playwright_execute { code: "state.formData = await page.inputValue('#email')" }
+playwright_execute { code: "await page.fill('#name', 'Test User')" }
+```
+
+Use `playwright_execute` for: Playwright locators, form filling, multi-step flows, assertions.
+Use `execute` for: quick JS evaluation in page context, reading DOM values, calling page APIs.
+
+### 5. Debug with console and network logs
+
+```
+console_logs { level: "error" }          →  filter errors only
+console_logs { search: "API" }           →  find API-related logs
+network_log { status_filter: "error" }   →  find failed requests
+network_log { url_filter: "api.example" } →  filter by URL
+network_detail { requestId: "R1.2" }     →  get full headers + request/response body
+network_detail { requestId: "R1.2", include: "response_body", max_body_size: 5000 }
+```
+
+### 6. Track page changes with snapshot diff
+
+```
+accessibility_snapshot                    →  first call caches baseline
+accessibility_snapshot                    →  second call shows diff
+accessibility_snapshot { search: "button" } →  search for specific elements
+accessibility_snapshot { diff: false }    →  force full snapshot (no diff)
+```
+
+### 7. Debug JavaScript with breakpoints
+
+```
+debugger { action: "enable" }
+debugger { action: "list_scripts", search: "app.js" }
+debugger { action: "set_breakpoint", file: "app.js", line: 42 }
+debugger { action: "set_breakpoint", file: "utils.js", line: 10, condition: "x > 5" }
+debugger { action: "resume" }
+debugger { action: "step_over" }
+debugger { action: "evaluate", expression: "localVar" }
+debugger { action: "inspect_variables" }
+debugger { action: "pause_on_exceptions", state: "uncaught" }
+```
+
+### 8. Inspect CSS styles
+
+```
+css_inspect { selector: "#header" }
+css_inspect { selector: ".btn-primary", properties: "color,background-color,font-size" }
+```
+
+### 9. Manage multiple Playwright sessions
+
+```
+session_manager { action: "create", sessionId: "feature-test" }
+session_manager { action: "list" }
+session_manager { action: "switch", sessionId: "feature-test" }
+session_manager { action: "remove", sessionId: "feature-test" }
+session_manager { action: "remove_all" }
+```
+
+### 10. Manage browser storage
+
+```
+storage { action: "get_cookies" }                               →  list all cookies
+storage { action: "set_cookie", name: "debug", value: "1" }   →  set a cookie
+storage { action: "get_local_storage" }                        →  list all localStorage
+storage { action: "get_local_storage", key: "theme" }          →  get specific key
+storage { action: "set_local_storage", key: "theme", value: "dark" }
+storage { action: "clear_storage", storage_types: "local_storage" }
+storage { action: "get_storage_usage" }                        →  check quota/usage
+```
+
+### 11. Monitor performance
+
+```
+performance { action: "get_metrics" }           →  runtime metrics (heap, nodes, timing)
+performance { action: "get_web_vitals" }        →  LCP, CLS, INP, FCP, TTFB with grading
+performance { action: "get_memory" }            →  JS heap, DOM nodes, listeners
+performance { action: "get_resource_timing" }   →  slowest resources by duration
+performance { action: "get_resource_timing", type_filter: "fetch", count: 10 }
+```
+
+### 12. Edit page sources live
+
+```
+editor { action: "list_sources", search: "app" }    →  find loaded scripts
+editor { action: "get_source", scriptId: "123", line_start: 1, line_end: 50 }
+editor { action: "edit_source", scriptId: "123", content: "..." }   →  hot-reload
+editor { action: "search_source", search: "TODO" }  →  search across all scripts
+editor { action: "list_stylesheets" }                →  find CSS sheets
+editor { action: "get_stylesheet", styleSheetId: "0" }
+editor { action: "edit_stylesheet", styleSheetId: "0", content: "body { color: red; }" }
+```
+
+### 13. Intercept network requests
+
+```
+network_intercept { action: "enable" }
+network_intercept { action: "add_rule", url_pattern: "/api/users", mock_status: 200, mock_body: "[{\"id\":1}]" }
+network_intercept { action: "add_rule", url_pattern: "/ads/", block: true }
+network_intercept { action: "list_rules" }
+network_intercept { action: "remove_rule", rule_id: "rule_1" }
+network_intercept { action: "disable" }
+```
+
+### 14. Emulate devices and conditions
+
+```
+emulation { action: "set_device", width: 375, height: 812, device_scale_factor: 3, mobile: true }
+emulation { action: "set_network_conditions", preset: "slow-3g" }
+emulation { action: "set_geolocation", latitude: 37.7749, longitude: -122.4194 }
+emulation { action: "set_timezone", timezone_id: "America/New_York" }
+emulation { action: "set_media", features: "prefers-color-scheme:dark" }
+emulation { action: "clear_all" }
+```
+
+### 15. Get page content
+
+```
+page_content { action: "get_html" }                    →  clean HTML (no scripts/styles)
+page_content { action: "get_html", selector: "#main" } →  scoped to element
+page_content { action: "get_text" }                    →  plain text content
+page_content { action: "get_metadata" }                →  title, meta, OG tags, counts
+page_content { action: "search_dom", search: "error" } →  find elements by text/attr
+```
+
+### 16. Make code changes, then verify
 
 ```
 ensure_fresh_render  →  reload with fresh cache after code changes
@@ -108,36 +254,12 @@ dashboard_state      →  re-confirm state
 screenshot           →  visual check
 ```
 
-### 5. Cleanup when done
+### 17. Cleanup when done
 
 ```
 override_app { action: "remove", appName: "@cnic/main" }
    — or —
 override_app { action: "reset_all" }    ← removes ALL overrides at once
-```
-
----
-
-## Journal Project App Registry
-
-This project uses a single-spa micro-frontend architecture with these registered apps:
-
-| App Name (single-spa) | Package Name | Dev Port | Entry | Route |
-|------------------------|-------------|----------|-------|-------|
-| `@cnic/main` | `@cnic/main` | 9100 | `http://localhost:9100/app.js` | `/j` (always active) |
-| `@journal/submit` | `@journal/submit` | 9110 | `http://localhost:9110/app.js` | `/j/:id/my/submit` |
-| `@journal/review` | `@journal/review` | 9120 | `http://localhost:9120/app.js` | `/j/:id/my/review` & `/j/:id/quick-review` |
-| `@journal/edit` | `@journal/edit` | 9130 | `http://localhost:9130/app.js` | `/j/:id/my/edit` |
-| `@journal/publish` | `@journal/publish` | 9140 | `http://localhost:9140/app.js` | `/j/:id/my/publish` |
-| `@journal/manage` | `@journal/manage` | 9150 | `http://localhost:9150/app.js` | `/j/:id/my/manage` |
-| `@cnic/root-config` | `@cnic/root-config` | 9000 | `http://localhost:9000/cnic-root-config.js` | (root) |
-
-**Note:** The root-config's local import map uses `@cnic/*` aliases for some apps (e.g., `@cnic/submit` maps to port 9110). When setting overrides, use the **single-spa app name** from the layout definition (`@journal/*` for child apps, `@cnic/main` for the main app).
-
-### Override example for developing @journal/edit locally:
-
-```
-override_app { action: "set", appName: "@journal/edit", url: "http://localhost:9130/app.js" }
 ```
 
 ---
@@ -178,9 +300,15 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 
 | Symptom | Fix |
 |---------|-----|
-| Tool timeout | Call `reset` to re-establish CDP session |
+| Tool timeout | Call `reset` to re-establish CDP + Playwright sessions |
 | Override not reflected | Use `ensure_fresh_render` or `clear_cache_and_reload { mode: "aggressive" }` |
 | Panel not syncing | Extension detects changes via 3s polling; wait a few seconds or refresh the panel |
 | App not mounting after override | Navigate to the app's route first (e.g., `/j/:journalId/my/edit`) then check status |
 | `importMapOverrides not available` | Page may not have loaded yet; wait and retry |
+| Debugger not paused | Call `debugger { action: "enable" }` first, then set breakpoints and trigger code execution |
+| CSS inspect "Element not found" | Verify selector with `execute { code: "document.querySelector('...')" }` first |
+| Session limit reached | Sessions auto-evict oldest when max (5) reached; use `session_manager { action: "remove" }` to free slots |
 | Stale cached bundle | `clear_cache_and_reload { mode: "aggressive" }` clears service workers too |
+| `playwright_execute` connection error | Call `reset` then retry; ensure relay server is running |
+| No console/network logs | Logs are captured after CDP connection is established; re-trigger the action |
+| Labeled screenshot shows no labels | Page may have no interactive elements; check `accessibility_snapshot` |
