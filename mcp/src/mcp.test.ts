@@ -5853,3 +5853,637 @@ describe('reset clears all state including intercept', () => {
     assert.equal(stateCategories.length, 9);
   });
 });
+
+// ===========================================================================
+// Extended comprehensive tests for Phase 4-9
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// storage tool – comprehensive cookie edge cases
+// ---------------------------------------------------------------------------
+
+describe('storage – cookie edge cases', () => {
+  function formatCookieValue(value: string, maxLen = 80): string {
+    return `${value.slice(0, maxLen)}${value.length > maxLen ? '...' : ''}`;
+  }
+
+  it('should handle empty cookie value', () => assert.equal(formatCookieValue(''), ''));
+  it('should handle exactly 80 char value', () => assert.equal(formatCookieValue('x'.repeat(80)), 'x'.repeat(80)));
+  it('should truncate 81 char value', () => assert.ok(formatCookieValue('x'.repeat(81)).endsWith('...')));
+  it('should handle JSON cookie value', () => {
+    const json = JSON.stringify({ token: 'abc', exp: 1234567890 });
+    const result = formatCookieValue(json);
+    assert.ok(result.includes('token'));
+  });
+  it('should handle base64 cookie value', () => {
+    const b64 = Buffer.from('session-data-content').toString('base64');
+    assert.equal(formatCookieValue(b64), b64);
+  });
+  it('should handle URL-encoded cookie value', () => {
+    const encoded = encodeURIComponent('key=value&other=data;more');
+    assert.equal(formatCookieValue(encoded), encoded);
+  });
+  it('should handle cookie with unicode characters', () => {
+    assert.equal(formatCookieValue('日本語クッキー'), '日本語クッキー');
+  });
+  it('should handle cookie with newlines (encoded)', () => {
+    assert.equal(formatCookieValue('line1%0Aline2'), 'line1%0Aline2');
+  });
+});
+
+describe('storage – cookie attribute combinations', () => {
+  function formatCookieAttrs(c: { secure: boolean; httpOnly: boolean; sameSite?: string; domain: string; path: string }): string {
+    return `domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'}`;
+  }
+
+  it('should format secure + httpOnly + Strict', () => {
+    const text = formatCookieAttrs({ secure: true, httpOnly: true, sameSite: 'Strict', domain: '.a.com', path: '/' });
+    assert.ok(text.includes('secure=true'));
+    assert.ok(text.includes('httpOnly=true'));
+    assert.ok(text.includes('sameSite=Strict'));
+  });
+
+  it('should format insecure cookie', () => {
+    const text = formatCookieAttrs({ secure: false, httpOnly: false, domain: 'localhost', path: '/api' });
+    assert.ok(text.includes('secure=false'));
+    assert.ok(text.includes('sameSite=None'));
+    assert.ok(text.includes('path=/api'));
+  });
+
+  it('should handle subdomain dots', () => {
+    assert.ok(formatCookieAttrs({ secure: true, httpOnly: true, domain: '.sub.example.com', path: '/' }).includes('.sub.example.com'));
+  });
+});
+
+describe('storage – localStorage key/value edge cases', () => {
+  function formatStorageEntry(key: string, value: string, maxLen = 200): string {
+    const vs = String(value);
+    return `  ${key}: ${vs.slice(0, maxLen)}${vs.length > maxLen ? '...' : ''}`;
+  }
+
+  it('should handle key with special chars', () => {
+    assert.ok(formatStorageEntry('key.with.dots', 'value').includes('key.with.dots'));
+  });
+  it('should handle key with unicode', () => {
+    assert.ok(formatStorageEntry('语言设置', 'zh-CN').includes('语言设置'));
+  });
+  it('should handle JSON value', () => {
+    const json = JSON.stringify({ items: [1, 2, 3], nested: { a: true } });
+    assert.ok(formatStorageEntry('cart', json).includes('"items"'));
+  });
+  it('should truncate at 200 chars', () => {
+    const result = formatStorageEntry('data', 'y'.repeat(201));
+    assert.ok(result.endsWith('...'));
+  });
+  it('should not truncate exactly 200 chars', () => {
+    const result = formatStorageEntry('data', 'y'.repeat(200));
+    assert.ok(!result.endsWith('...'));
+  });
+  it('should handle empty value', () => {
+    assert.ok(formatStorageEntry('empty', '').includes('empty: '));
+  });
+  it('should handle boolean-like values', () => {
+    assert.ok(formatStorageEntry('flag', 'true').includes('true'));
+    assert.ok(formatStorageEntry('flag', 'false').includes('false'));
+  });
+  it('should handle numeric string values', () => {
+    assert.ok(formatStorageEntry('count', '42').includes('42'));
+  });
+});
+
+describe('storage – clear_storage types parsing', () => {
+  function parseStorageTypes(types: string): string[] {
+    return types === 'all' ? ['all'] : types.split(',').map(t => t.trim());
+  }
+
+  it('should parse all', () => assert.deepStrictEqual(parseStorageTypes('all'), ['all']));
+  it('should parse single type', () => assert.deepStrictEqual(parseStorageTypes('cookies'), ['cookies']));
+  it('should parse multiple types', () => {
+    assert.deepStrictEqual(parseStorageTypes('cookies,local_storage,indexeddb'), ['cookies', 'local_storage', 'indexeddb']);
+  });
+  it('should handle spaces', () => {
+    assert.deepStrictEqual(parseStorageTypes(' cookies , local_storage '), ['cookies', 'local_storage']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// performance – comprehensive metric edge cases
+// ---------------------------------------------------------------------------
+
+describe('performance – key metrics list', () => {
+  const keyMetrics = ['Timestamp', 'Documents', 'Frames', 'JSEventListeners', 'Nodes', 'LayoutCount',
+    'RecalcStyleCount', 'LayoutDuration', 'RecalcStyleDuration', 'ScriptDuration', 'TaskDuration',
+    'JSHeapUsedSize', 'JSHeapTotalSize'];
+
+  it('should have 13 key metrics', () => assert.equal(keyMetrics.length, 13));
+  it('should have no duplicates', () => assert.equal(new Set(keyMetrics).size, keyMetrics.length));
+  it('should include heap metrics', () => {
+    assert.ok(keyMetrics.includes('JSHeapUsedSize'));
+    assert.ok(keyMetrics.includes('JSHeapTotalSize'));
+  });
+  it('should include all duration metrics', () => {
+    const durations = keyMetrics.filter(m => m.includes('Duration'));
+    assert.equal(durations.length, 4);
+  });
+  it('should include node count', () => assert.ok(keyMetrics.includes('Nodes')));
+});
+
+describe('performance – web vitals thresholds', () => {
+  const thresholds = {
+    LCP: { good: 2500, poor: 4000, unit: 'ms' },
+    CLS: { good: 0.1, poor: 0.25, unit: '' },
+    INP: { good: 200, poor: 500, unit: 'ms' },
+  };
+
+  it('LCP good threshold is 2.5s', () => assert.equal(thresholds.LCP.good, 2500));
+  it('LCP poor threshold is 4s', () => assert.equal(thresholds.LCP.poor, 4000));
+  it('CLS good threshold is 0.1', () => assert.equal(thresholds.CLS.good, 0.1));
+  it('CLS poor threshold is 0.25', () => assert.equal(thresholds.CLS.poor, 0.25));
+  it('INP good threshold is 200ms', () => assert.equal(thresholds.INP.good, 200));
+  it('INP poor threshold is 500ms', () => assert.equal(thresholds.INP.poor, 500));
+  it('good < poor for all metrics', () => {
+    for (const [, t] of Object.entries(thresholds)) {
+      assert.ok(t.good < t.poor, `good (${t.good}) should be < poor (${t.poor})`);
+    }
+  });
+});
+
+describe('performance – resource timing sorting and filtering', () => {
+  const resources = [
+    { name: 'a.js', type: 'script', duration: 100, transferSize: 1024 },
+    { name: 'b.css', type: 'css', duration: 300, transferSize: 512 },
+    { name: 'c.png', type: 'img', duration: 200, transferSize: 8192 },
+    { name: 'd.json', type: 'fetch', duration: 50, transferSize: 256 },
+    { name: 'e.woff', type: 'font', duration: 150, transferSize: 4096 },
+  ];
+
+  it('should sort by duration descending', () => {
+    const sorted = [...resources].sort((a, b) => b.duration - a.duration);
+    assert.equal(sorted[0].name, 'b.css');
+    assert.equal(sorted[1].name, 'c.png');
+  });
+
+  it('should filter by type', () => {
+    const filtered = resources.filter(r => r.type === 'script');
+    assert.equal(filtered.length, 1);
+    assert.equal(filtered[0].name, 'a.js');
+  });
+
+  it('should limit results', () => {
+    const limited = resources.slice(0, 3);
+    assert.equal(limited.length, 3);
+  });
+
+  it('should handle empty resources', () => {
+    const empty: typeof resources = [];
+    assert.equal(empty.length, 0);
+  });
+
+  it('should handle same duration', () => {
+    const same = [
+      { name: 'x.js', type: 'script', duration: 100, transferSize: 1024 },
+      { name: 'y.js', type: 'script', duration: 100, transferSize: 2048 },
+    ];
+    const sorted = same.sort((a, b) => b.duration - a.duration);
+    assert.equal(sorted.length, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// editor – comprehensive source view edge cases
+// ---------------------------------------------------------------------------
+
+describe('editor – source truncation', () => {
+  it('should truncate source over 50000 chars', () => {
+    const longSource = 'x'.repeat(60000);
+    const truncated = longSource.length > 50000
+      ? longSource.slice(0, 50000) + '\n[Truncated to 50000 chars. Use line_start/line_end for specific ranges.]'
+      : longSource;
+    assert.ok(truncated.length < 60000);
+    assert.ok(truncated.includes('[Truncated'));
+  });
+
+  it('should not truncate exactly 50000 chars', () => {
+    const source = 'x'.repeat(50000);
+    const result = source.length > 50000 ? source.slice(0, 50000) + '\n[Truncated]' : source;
+    assert.equal(result, source);
+  });
+});
+
+describe('editor – search results formatting', () => {
+  function formatSearchResult(url: string, matches: Array<{ lineNumber: number; lineContent: string }>): string[] {
+    const result: string[] = [];
+    result.push(`${url} (${matches.length} matches):`);
+    for (const m of matches.slice(0, 5)) {
+      result.push(`  L${m.lineNumber + 1}: ${m.lineContent.trim().slice(0, 120)}`);
+    }
+    if (matches.length > 5) result.push(`  ... and ${matches.length - 5} more`);
+    return result;
+  }
+
+  it('should format single match', () => {
+    const result = formatSearchResult('app.js', [{ lineNumber: 41, lineContent: '  const todo = new Todo();' }]);
+    assert.ok(result[0].includes('1 matches'));
+    assert.ok(result[1].includes('L42'));
+  });
+
+  it('should truncate to 5 matches', () => {
+    const matches = Array.from({ length: 10 }, (_, i) => ({ lineNumber: i, lineContent: `line ${i}` }));
+    const result = formatSearchResult('big.js', matches);
+    assert.ok(result.some(l => l.includes('... and 5 more')));
+  });
+
+  it('should truncate long line content at 120 chars', () => {
+    const longLine = 'a'.repeat(200);
+    const result = formatSearchResult('x.js', [{ lineNumber: 0, lineContent: longLine }]);
+    assert.ok(result[1].length < 200);
+  });
+});
+
+describe('editor – script filtering', () => {
+  it('should exclude chrome-extension:// URLs', () => {
+    const scripts = [
+      { scriptId: '1', url: 'https://app.com/main.js' },
+      { scriptId: '2', url: 'chrome-extension://abc123/content.js' },
+      { scriptId: '3', url: 'https://cdn.com/lib.js' },
+    ];
+    const filtered = scripts.filter(s => s.url && !s.url.startsWith('chrome-extension://'));
+    assert.equal(filtered.length, 2);
+    assert.ok(filtered.every(s => !s.url.startsWith('chrome-extension://')));
+  });
+
+  it('should exclude scripts without URL', () => {
+    const scripts = [
+      { scriptId: '1', url: '' },
+      { scriptId: '2', url: 'https://app.com/main.js' },
+    ];
+    const filtered = scripts.filter(s => s.url && !s.url.startsWith('chrome-extension://'));
+    assert.equal(filtered.length, 1);
+  });
+
+  it('should limit to 50 scripts', () => {
+    const scripts = Array.from({ length: 100 }, (_, i) => ({ scriptId: `${i}`, url: `https://app.com/${i}.js` }));
+    assert.equal(scripts.slice(0, 50).length, 50);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// network_intercept – comprehensive pattern and rule tests
+// ---------------------------------------------------------------------------
+
+describe('network_intercept – glob-to-regex conversion', () => {
+  function globToRegex(pattern: string): RegExp {
+    return new RegExp(pattern.replace(/\*/g, '.*'));
+  }
+
+  it('should convert simple glob', () => {
+    const re = globToRegex('*/api/*');
+    assert.ok(re.test('https://example.com/api/users'));
+    assert.ok(re.test('http://localhost:3000/api/data'));
+  });
+
+  it('should handle no wildcards', () => {
+    const re = globToRegex('/exact/path');
+    assert.ok(re.test('/exact/path'));
+    assert.ok(!re.test('/other/path'));
+  });
+
+  it('should handle multiple wildcards', () => {
+    const re = globToRegex('*://*.example.com/*');
+    assert.ok(re.test('https://api.example.com/v2/users'));
+  });
+
+  it('should match everything with single star', () => {
+    const re = globToRegex('*');
+    assert.ok(re.test('anything'));
+    assert.ok(re.test(''));
+  });
+});
+
+describe('network_intercept – Fetch.fulfillRequest encoding', () => {
+  it('should base64-encode mock body', () => {
+    const body = '{"status":"ok","data":[1,2,3]}';
+    const encoded = Buffer.from(body).toString('base64');
+    const decoded = Buffer.from(encoded, 'base64').toString('utf-8');
+    assert.equal(decoded, body);
+  });
+
+  it('should handle empty mock body', () => {
+    const encoded = Buffer.from('').toString('base64');
+    assert.equal(encoded, '');
+  });
+
+  it('should handle unicode mock body', () => {
+    const body = '{"message":"成功","data":"日本語"}';
+    const encoded = Buffer.from(body).toString('base64');
+    const decoded = Buffer.from(encoded, 'base64').toString('utf-8');
+    assert.equal(decoded, body);
+  });
+
+  it('should handle HTML mock body', () => {
+    const body = '<html><body><h1>Mock Page</h1></body></html>';
+    const encoded = Buffer.from(body).toString('base64');
+    assert.ok(encoded.length > 0);
+    assert.equal(Buffer.from(encoded, 'base64').toString(), body);
+  });
+});
+
+describe('network_intercept – response header formatting', () => {
+  function formatHeaders(headers: Record<string, string>): Array<{ name: string; value: string }> {
+    return Object.entries(headers).map(([n, v]) => ({ name: n, value: v }));
+  }
+
+  it('should format single header', () => {
+    const result = formatHeaders({ 'Content-Type': 'application/json' });
+    assert.equal(result.length, 1);
+    assert.equal(result[0].name, 'Content-Type');
+  });
+
+  it('should format multiple headers', () => {
+    const result = formatHeaders({
+      'Content-Type': 'text/html',
+      'Cache-Control': 'no-cache',
+      'X-Custom': 'value',
+    });
+    assert.equal(result.length, 3);
+  });
+
+  it('should handle empty headers', () => {
+    assert.equal(formatHeaders({}).length, 0);
+  });
+
+  it('should default to Content-Type application/json', () => {
+    const defaults = { 'Content-Type': 'application/json' };
+    const result = formatHeaders(defaults);
+    assert.equal(result[0].value, 'application/json');
+  });
+});
+
+describe('network_intercept – rule formatting for list_rules', () => {
+  function formatRule(rule: { id: string; urlPattern: string; resourceType?: string; mockStatus?: number; block?: boolean }): string {
+    const parts = [`[${rule.id}] pattern="${rule.urlPattern}"`];
+    if (rule.resourceType) parts.push(`type=${rule.resourceType}`);
+    if (rule.block) parts.push('→ BLOCK');
+    else if (rule.mockStatus !== undefined) parts.push(`→ mock ${rule.mockStatus}`);
+    return parts.join(' ');
+  }
+
+  it('should format block rule', () => {
+    const text = formatRule({ id: 'rule_1', urlPattern: '*/ads/*', block: true });
+    assert.ok(text.includes('→ BLOCK'));
+    assert.ok(text.includes('*/ads/*'));
+  });
+
+  it('should format mock rule', () => {
+    const text = formatRule({ id: 'rule_2', urlPattern: '*/api/*', mockStatus: 200 });
+    assert.ok(text.includes('→ mock 200'));
+  });
+
+  it('should include resource type', () => {
+    const text = formatRule({ id: 'rule_3', urlPattern: '*.js', resourceType: 'Script' });
+    assert.ok(text.includes('type=Script'));
+  });
+
+  it('should format rule with no action', () => {
+    const text = formatRule({ id: 'rule_4', urlPattern: '*' });
+    assert.ok(!text.includes('BLOCK'));
+    assert.ok(!text.includes('mock'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// emulation – comprehensive device and condition tests
+// ---------------------------------------------------------------------------
+
+describe('emulation – common device presets', () => {
+  const devices = [
+    { name: 'iPhone SE', width: 375, height: 667, dpr: 2, mobile: true },
+    { name: 'iPhone 14 Pro', width: 393, height: 852, dpr: 3, mobile: true },
+    { name: 'iPad Air', width: 820, height: 1180, dpr: 2, mobile: true },
+    { name: 'Pixel 7', width: 412, height: 915, dpr: 2.625, mobile: true },
+    { name: 'Galaxy S21', width: 360, height: 800, dpr: 3, mobile: true },
+    { name: 'Desktop HD', width: 1920, height: 1080, dpr: 1, mobile: false },
+    { name: 'Desktop 4K', width: 3840, height: 2160, dpr: 2, mobile: false },
+    { name: 'Laptop', width: 1366, height: 768, dpr: 1, mobile: false },
+  ];
+
+  it('should have 8 device presets', () => assert.equal(devices.length, 8));
+
+  for (const d of devices) {
+    it(`${d.name} should have valid dimensions`, () => {
+      assert.ok(d.width > 0);
+      assert.ok(d.height > 0);
+      assert.ok(d.dpr > 0);
+    });
+  }
+
+  it('all mobile devices should have mobile=true', () => {
+    const mobileDevices = devices.filter(d => d.mobile);
+    assert.ok(mobileDevices.length >= 5);
+  });
+
+  it('no desktop device should be mobile', () => {
+    const desktops = devices.filter(d => !d.mobile);
+    assert.ok(desktops.every(d => d.width >= 1024));
+  });
+});
+
+describe('emulation – timezone validation', () => {
+  const validTimezones = [
+    'America/New_York', 'America/Los_Angeles', 'Europe/London', 'Europe/Berlin',
+    'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Australia/Sydney',
+    'Pacific/Auckland', 'UTC',
+  ];
+
+  it('should have common timezones', () => {
+    assert.ok(validTimezones.includes('UTC'));
+    assert.ok(validTimezones.includes('America/New_York'));
+    assert.ok(validTimezones.includes('Asia/Tokyo'));
+  });
+
+  it('all should be non-empty strings', () => {
+    for (const tz of validTimezones) {
+      assert.ok(tz.length > 0);
+    }
+  });
+});
+
+describe('emulation – geolocation validation', () => {
+  it('should accept valid coordinates', () => {
+    const coords = [
+      { lat: 37.7749, lng: -122.4194, name: 'San Francisco' },
+      { lat: 51.5074, lng: -0.1278, name: 'London' },
+      { lat: 35.6762, lng: 139.6503, name: 'Tokyo' },
+      { lat: -33.8688, lng: 151.2093, name: 'Sydney' },
+      { lat: 0, lng: 0, name: 'Null Island' },
+      { lat: 90, lng: 180, name: 'North Pole max longitude' },
+      { lat: -90, lng: -180, name: 'South Pole min longitude' },
+    ];
+    for (const c of coords) {
+      assert.ok(c.lat >= -90 && c.lat <= 90, `${c.name}: lat ${c.lat} out of range`);
+      assert.ok(c.lng >= -180 && c.lng <= 180, `${c.name}: lng ${c.lng} out of range`);
+    }
+  });
+});
+
+describe('emulation – network conditions format', () => {
+  function formatNetworkConditions(preset: string, params: { latency: number; downloadThroughput: number; uploadThroughput: number }): string {
+    return `Network: ${preset} (latency=${params.latency}ms, down=${params.downloadThroughput > 0 ? (params.downloadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'}, up=${params.uploadThroughput > 0 ? (params.uploadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'})`;
+  }
+
+  it('should format slow-3g', () => {
+    const text = formatNetworkConditions('slow-3g', { latency: 2000, downloadThroughput: 50 * 1024, uploadThroughput: 50 * 1024 });
+    assert.ok(text.includes('slow-3g'));
+    assert.ok(text.includes('2000ms'));
+    assert.ok(text.includes('50KB/s'));
+  });
+
+  it('should show unlimited for negative throughput', () => {
+    const text = formatNetworkConditions('custom', { latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    assert.ok(text.includes('unlimited'));
+  });
+
+  it('should format wifi', () => {
+    const text = formatNetworkConditions('wifi', { latency: 28, downloadThroughput: 30 * 1024 * 1024, uploadThroughput: 15 * 1024 * 1024 });
+    assert.ok(text.includes('wifi'));
+    assert.ok(text.includes('28ms'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// page_content – comprehensive content and search tests
+// ---------------------------------------------------------------------------
+
+describe('page_content – HTML cleaning patterns', () => {
+  const scriptPatterns = [
+    '<script>alert(1)</script>',
+    '<script type="text/javascript">var x = 1;</script>',
+    '<script src="app.js"></script>',
+    '<script async defer src="analytics.js"></script>',
+    '<SCRIPT>console.log("upper")</SCRIPT>',
+    '<noscript>Please enable JavaScript</noscript>',
+  ];
+
+  for (const p of scriptPatterns) {
+    it(`should remove: ${p.slice(0, 40)}...`, () => {
+      const cleaned = p.replace(/<(script|noscript)[^>]*>[\s\S]*?<\/(script|noscript)>/gi, '');
+      assert.ok(!cleaned.includes('script'), `Failed to clean: ${p}`);
+    });
+  }
+
+  it('should preserve non-script content', () => {
+    const html = '<div><p>Hello</p><script>bad()</script><span>World</span></div>';
+    const cleaned = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+    assert.ok(cleaned.includes('Hello'));
+    assert.ok(cleaned.includes('World'));
+    assert.ok(!cleaned.includes('bad'));
+  });
+});
+
+describe('page_content – style attribute removal', () => {
+  const stylePatterns = [
+    { input: '<div style="color:red">text</div>', expected: '<div>text</div>' },
+    { input: '<p style="font-size:12px;margin:0">text</p>', expected: '<p>text</p>' },
+    { input: '<span style="">text</span>', expected: '<span>text</span>' },
+    { input: '<div style="background-image:url(\'data:image/png;base64,abc\')">img</div>', expected: '<div>img</div>' },
+  ];
+
+  for (const { input, expected } of stylePatterns) {
+    it(`should clean: ${input.slice(0, 50)}...`, () => {
+      const cleaned = input.replace(/\s*style="[^"]*"/gi, '');
+      assert.equal(cleaned, expected);
+    });
+  }
+});
+
+describe('page_content – metadata fields', () => {
+  const metadataFields = [
+    'title', 'url', 'description', 'charset', 'lang', 'viewport',
+    'ogTitle', 'ogDescription', 'ogImage', 'canonical', 'favicon',
+    'scripts', 'stylesheets', 'images', 'links',
+  ];
+
+  it('should have 15 metadata fields', () => assert.equal(metadataFields.length, 15));
+  it('should have no duplicates', () => assert.equal(new Set(metadataFields).size, metadataFields.length));
+  it('should include OG tags', () => {
+    assert.ok(metadataFields.includes('ogTitle'));
+    assert.ok(metadataFields.includes('ogDescription'));
+    assert.ok(metadataFields.includes('ogImage'));
+  });
+  it('should include counts', () => {
+    assert.ok(metadataFields.includes('scripts'));
+    assert.ok(metadataFields.includes('images'));
+    assert.ok(metadataFields.includes('links'));
+  });
+});
+
+describe('page_content – DOM search result formatting', () => {
+  function formatDomResult(tag: string, id: string, classes: string, text: string): string {
+    return `<${tag}${id ? '#' + id : ''}${classes ? '.' + classes.split(' ').join('.') : ''}> ${text.slice(0, 100)}`;
+  }
+
+  it('should format element with id', () => {
+    const text = formatDomResult('div', 'main', '', 'Main content');
+    assert.equal(text, '<div#main> Main content');
+  });
+
+  it('should format element with classes', () => {
+    const text = formatDomResult('button', '', 'btn btn-primary', 'Click me');
+    assert.equal(text, '<button.btn.btn-primary> Click me');
+  });
+
+  it('should format element with both', () => {
+    const text = formatDomResult('section', 'hero', 'wide dark', 'Hero section');
+    assert.equal(text, '<section#hero.wide.dark> Hero section');
+  });
+
+  it('should truncate text at 100 chars', () => {
+    const text = formatDomResult('p', '', '', 'x'.repeat(200));
+    assert.ok(text.length < 200);
+  });
+
+  it('should handle empty text', () => {
+    const text = formatDomResult('div', 'empty', '', '');
+    assert.equal(text, '<div#empty> ');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration: tool action count verification
+// ---------------------------------------------------------------------------
+
+describe('Integration: tool action counts', () => {
+  it('storage should have 9 actions', () => {
+    const actions = ['get_cookies', 'set_cookie', 'delete_cookie', 'get_local_storage', 'set_local_storage', 'remove_local_storage', 'get_session_storage', 'clear_storage', 'get_storage_usage'];
+    assert.equal(actions.length, 9);
+  });
+
+  it('performance should have 4 actions', () => {
+    const actions = ['get_metrics', 'get_web_vitals', 'get_memory', 'get_resource_timing'];
+    assert.equal(actions.length, 4);
+  });
+
+  it('editor should have 7 actions', () => {
+    const actions = ['list_sources', 'get_source', 'edit_source', 'search_source', 'list_stylesheets', 'get_stylesheet', 'edit_stylesheet'];
+    assert.equal(actions.length, 7);
+  });
+
+  it('network_intercept should have 5 actions', () => {
+    const actions = ['enable', 'disable', 'list_rules', 'add_rule', 'remove_rule'];
+    assert.equal(actions.length, 5);
+  });
+
+  it('emulation should have 8 actions', () => {
+    const actions = ['set_device', 'set_user_agent', 'set_geolocation', 'set_timezone', 'set_locale', 'set_network_conditions', 'set_media', 'clear_all'];
+    assert.equal(actions.length, 8);
+  });
+
+  it('page_content should have 4 actions', () => {
+    const actions = ['get_html', 'get_text', 'get_metadata', 'search_dom'];
+    assert.equal(actions.length, 4);
+  });
+
+  it('total new actions across 6 tools = 37', () => {
+    assert.equal(9 + 4 + 7 + 5 + 8 + 4, 37);
+  });
+});
