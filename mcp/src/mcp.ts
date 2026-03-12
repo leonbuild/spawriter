@@ -1508,8 +1508,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const value = await evaluateJs(session, code);
+        const resultText = typeof value === 'string' ? value : JSON.stringify(value);
+
+        // Auto-reload so the page reflects the new override state (matches DevTools panel behavior)
+        let reloaded = false;
+        try {
+          const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+          if (parsed && parsed.success) {
+            await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+            await sleep(2000);
+            reloaded = true;
+          }
+        } catch { /* parse failed – skip reload */ }
+
         return {
-          content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+          content: [{ type: 'text', text: reloaded ? resultText + ' (page reloaded)' : resultText }],
         };
       }
 
