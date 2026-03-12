@@ -106,7 +106,7 @@ node dist/cli.js serve
    - `screenshot`
    - `execute`（例如读取 `location.href`）
    - `ensure_fresh_render`
-   - `clear_cache_and_reload`（`light`/`aggressive`）
+   - `clear_cache_and_reload`（支持 `clear` 参数精细控制：`cache`, `cookies`, `local_storage`, `service_workers` 等，或旧版 `mode`: `light`/`aggressive`）
 
 预期结果：
 

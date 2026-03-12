@@ -69,7 +69,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 |------|-------------|----------|
 | `navigate` | Navigate the attached tab to a URL | `url` |
 | `ensure_fresh_render` | Reload page with fresh cache | — |
-| `clear_cache_and_reload` | Explicit cache reset + reload | `mode`: `"light"` or `"aggressive"` |
+| `clear_cache_and_reload` | Granular cache/storage reset + reload | `clear?` (comma-separated types), `origin?`, `reload?` (boolean), `mode?` (deprecated) |
 
 ### Import-Map Override Management
 
@@ -303,14 +303,14 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 | Symptom | Fix |
 |---------|-----|
 | Tool timeout | Call `reset` to re-establish CDP + Playwright sessions |
-| Override not reflected | Use `ensure_fresh_render` or `clear_cache_and_reload { mode: "aggressive" }` |
+| Override not reflected | Use `ensure_fresh_render` or `clear_cache_and_reload { clear: "cache,service_workers" }` |
 | Panel not syncing | Extension detects changes via 3s polling; wait a few seconds or refresh the panel |
 | App not mounting after override | Navigate to the app's route first (e.g., `/j/:journalId/my/edit`) then check status |
 | `importMapOverrides not available` | Page may not have loaded yet; wait and retry |
 | Debugger not paused | Call `debugger { action: "enable" }` first, then set breakpoints and trigger code execution |
 | CSS inspect "Element not found" | Verify selector with `execute { code: "document.querySelector('...')" }` first |
 | Session limit reached | Sessions auto-evict oldest when max (5) reached; use `session_manager { action: "remove" }` to free slots |
-| Stale cached bundle | `clear_cache_and_reload { mode: "aggressive" }` clears service workers too |
+| Stale cached bundle | `clear_cache_and_reload { clear: "cache,service_workers" }` clears cache + service workers without wiping cookies |
 | `playwright_execute` connection error | Call `reset` then retry; ensure relay server is running |
 | No console/network logs | Logs are captured after CDP connection is established; re-trigger the action |
 | Labeled screenshot shows no labels | Page may have no interactive elements; check `accessibility_snapshot` |

@@ -748,10 +748,23 @@ For simple/fast JS in page context, use the 'execute' tool instead.`,
     },
     {
         name: 'clear_cache_and_reload',
-        description: 'Clear browser cache and reload the page',
+        description: `Clear browser cache/storage and optionally reload the page.
+Supports granular control over what to clear via the "clear" parameter.
+Legacy "mode" parameter still works for backward compatibility.`,
         inputSchema: {
             type: 'object',
-            properties: { mode: { type: 'string', enum: ['light', 'aggressive'], description: 'Clear mode' } },
+            properties: {
+                clear: {
+                    type: 'string',
+                    description: 'Comma-separated types to clear: cache, cookies, local_storage, session_storage, cache_storage, indexeddb, service_workers, all. Default: "cache"',
+                },
+                origin: {
+                    type: 'string',
+                    description: 'Scope storage/cookie clearing to this origin (e.g. "https://cursor.com"). Default: current page origin. Does not affect "cache" (always global).',
+                },
+                reload: { type: 'boolean', description: 'Whether to reload the page after clearing. Default: true' },
+                mode: { type: 'string', enum: ['light', 'aggressive'], description: '(Deprecated) Legacy mode. "light" = reload only, "aggressive" = clear all globally + reload. Overridden by "clear" if both are provided.' },
+            },
         },
     },
     {
@@ -1245,15 +1258,69 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     };
                 }
                 case 'clear_cache_and_reload': {
-                    const mode = args.mode || 'light';
-                    if (mode === 'aggressive') {
-                        await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
-                        await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
+                    const legacyMode = args.mode;
+                    const clearArg = args.clear;
+                    const shouldReload = args.reload !== false;
+                    let clearTypes;
+                    if (clearArg) {
+                        const raw = clearArg.toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+                        clearTypes = new Set(raw.includes('all')
+                            ? ['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']
+                            : raw);
                     }
-                    await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
-                    await sleep(2000);
+                    else if (legacyMode === 'aggressive') {
+                        clearTypes = new Set(['cache', 'cookies']);
+                    }
+                    else {
+                        clearTypes = new Set();
+                    }
+                    const origin = args.origin || await evaluateJs(session, 'window.location.origin');
+                    const cleared = [];
+                    if (clearTypes.has('cache')) {
+                        await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
+                        cleared.push('cache (global)');
+                    }
+                    if (clearTypes.has('cookies')) {
+                        if (legacyMode === 'aggressive' && !clearArg) {
+                            await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
+                            cleared.push('cookies (global)');
+                        }
+                        else {
+                            const cookieResult = await sendCdpCommand(session, 'Network.getCookies');
+                            const originHost = new URL(origin).hostname;
+                            const matching = (cookieResult?.cookies || []).filter(c => {
+                                const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+                                return originHost === cd || originHost.endsWith('.' + cd);
+                            });
+                            for (const c of matching) {
+                                await sendCdpCommand(session, 'Network.deleteCookies', { name: c.name, domain: c.domain });
+                            }
+                            cleared.push(`cookies (${origin}, ${matching.length} removed)`);
+                        }
+                    }
+                    const storageTypeParts = [];
+                    if (clearTypes.has('local_storage'))
+                        storageTypeParts.push('local_storage');
+                    if (clearTypes.has('session_storage'))
+                        storageTypeParts.push('session_storage');
+                    if (clearTypes.has('cache_storage'))
+                        storageTypeParts.push('cache_storage');
+                    if (clearTypes.has('indexeddb'))
+                        storageTypeParts.push('indexeddb');
+                    if (clearTypes.has('service_workers'))
+                        storageTypeParts.push('service_workers');
+                    if (storageTypeParts.length > 0) {
+                        await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: storageTypeParts.join(',') });
+                        cleared.push(`${storageTypeParts.join(', ')} (${origin})`);
+                    }
+                    if (shouldReload) {
+                        await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+                        await sleep(2000);
+                        cleared.push('page reloaded');
+                    }
+                    const summary = cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'Page reloaded (no storage cleared)';
                     return {
-                        content: [{ type: 'text', text: `Cache cleared with mode: ${mode}` }],
+                        content: [{ type: 'text', text: summary }],
                     };
                 }
                 case 'ensure_fresh_render': {
@@ -1327,8 +1394,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                             return { content: [{ type: 'text', text: 'Error: unknown action "' + action + '". Use: set, remove, enable, disable, reset_all' }] };
                     }
                     const value = await evaluateJs(session, code);
+                    const resultText = typeof value === 'string' ? value : JSON.stringify(value);
+                    // Auto-reload so the page reflects the new override state (matches DevTools panel behavior)
+                    let reloaded = false;
+                    try {
+                        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
+                        if (parsed && parsed.success) {
+                            await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+                            await sleep(2000);
+                            reloaded = true;
+                        }
+                    }
+                    catch { /* parse failed – skip reload */ }
                     return {
-                        content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
+                        content: [{ type: 'text', text: reloaded ? resultText + ' (page reloaded)' : resultText }],
                     };
                 }
                 case 'app_action': {

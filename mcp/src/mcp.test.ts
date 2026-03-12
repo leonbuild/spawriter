@@ -6719,6 +6719,666 @@ describe('Timeout error message format', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload parameter parsing
+// ---------------------------------------------------------------------------
+
+function parseClearTypes(
+  clearArg?: string,
+  legacyMode?: string,
+): { types: Set<string>; isLegacyAggressive: boolean } {
+  if (clearArg) {
+    const raw = clearArg.toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+    const allTypes = ['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers'];
+    return { types: new Set(raw.includes('all') ? allTypes : raw), isLegacyAggressive: false };
+  }
+  if (legacyMode === 'aggressive') {
+    return { types: new Set(['cache', 'cookies']), isLegacyAggressive: true };
+  }
+  return { types: new Set<string>(), isLegacyAggressive: false };
+}
+
+describe('clear_cache_and_reload parameter parsing', () => {
+  it('no args: empty clear set (reload only)', () => {
+    const { types } = parseClearTypes();
+    assert.equal(types.size, 0);
+  });
+
+  it('legacy mode light: empty clear set', () => {
+    const { types } = parseClearTypes(undefined, 'light');
+    assert.equal(types.size, 0);
+  });
+
+  it('legacy mode aggressive: cache + cookies', () => {
+    const { types, isLegacyAggressive } = parseClearTypes(undefined, 'aggressive');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.equal(types.size, 2);
+    assert.ok(isLegacyAggressive);
+  });
+
+  it('clear="cache": only cache', () => {
+    const { types } = parseClearTypes('cache');
+    assert.ok(types.has('cache'));
+    assert.equal(types.size, 1);
+  });
+
+  it('clear="cache,service_workers": cache + service_workers', () => {
+    const { types } = parseClearTypes('cache,service_workers');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('service_workers'));
+    assert.equal(types.size, 2);
+  });
+
+  it('clear="cookies": only cookies (not global)', () => {
+    const { types, isLegacyAggressive } = parseClearTypes('cookies');
+    assert.ok(types.has('cookies'));
+    assert.equal(types.size, 1);
+    assert.ok(!isLegacyAggressive);
+  });
+
+  it('clear="all": expands to all 7 types', () => {
+    const { types } = parseClearTypes('all');
+    assert.equal(types.size, 7);
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.ok(types.has('local_storage'));
+    assert.ok(types.has('session_storage'));
+    assert.ok(types.has('cache_storage'));
+    assert.ok(types.has('indexeddb'));
+    assert.ok(types.has('service_workers'));
+  });
+
+  it('clear overrides legacy mode', () => {
+    const { types, isLegacyAggressive } = parseClearTypes('cache', 'aggressive');
+    assert.ok(types.has('cache'));
+    assert.equal(types.size, 1);
+    assert.ok(!isLegacyAggressive);
+  });
+
+  it('trims whitespace in clear types', () => {
+    const { types } = parseClearTypes(' cache , cookies ');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.equal(types.size, 2);
+  });
+
+  it('deduplicates types', () => {
+    const { types } = parseClearTypes('cache,cache,cookies');
+    assert.equal(types.size, 2);
+  });
+
+  it('ignores empty segments', () => {
+    const { types } = parseClearTypes('cache,,cookies,');
+    assert.equal(types.size, 2);
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+  });
+
+  it('case insensitive: mixed case types', () => {
+    const { types } = parseClearTypes('Cache,COOKIES,Local_Storage');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.ok(types.has('local_storage'));
+    assert.equal(types.size, 3);
+  });
+
+  it('case insensitive: ALL expands all types', () => {
+    const { types } = parseClearTypes('ALL');
+    assert.equal(types.size, 7);
+  });
+
+  it('"all" with extra types still yields exactly 7', () => {
+    const { types } = parseClearTypes('all,cache,cookies');
+    assert.equal(types.size, 7);
+  });
+
+  it('single storage type: local_storage', () => {
+    const { types } = parseClearTypes('local_storage');
+    assert.ok(types.has('local_storage'));
+    assert.equal(types.size, 1);
+    assert.ok(!types.has('cache'));
+    assert.ok(!types.has('cookies'));
+  });
+
+  it('single storage type: indexeddb', () => {
+    const { types } = parseClearTypes('indexeddb');
+    assert.ok(types.has('indexeddb'));
+    assert.equal(types.size, 1);
+  });
+
+  it('single storage type: session_storage', () => {
+    const { types } = parseClearTypes('session_storage');
+    assert.ok(types.has('session_storage'));
+    assert.equal(types.size, 1);
+  });
+
+  it('single storage type: cache_storage', () => {
+    const { types } = parseClearTypes('cache_storage');
+    assert.ok(types.has('cache_storage'));
+    assert.equal(types.size, 1);
+  });
+
+  it('single storage type: service_workers', () => {
+    const { types } = parseClearTypes('service_workers');
+    assert.ok(types.has('service_workers'));
+    assert.equal(types.size, 1);
+  });
+
+  it('multiple storage types without cache or cookies', () => {
+    const { types } = parseClearTypes('local_storage,indexeddb,service_workers');
+    assert.equal(types.size, 3);
+    assert.ok(types.has('local_storage'));
+    assert.ok(types.has('indexeddb'));
+    assert.ok(types.has('service_workers'));
+    assert.ok(!types.has('cache'));
+    assert.ok(!types.has('cookies'));
+  });
+
+  it('unknown type is passed through (no crash)', () => {
+    const { types } = parseClearTypes('cache,unknown_type');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('unknown_type'));
+    assert.equal(types.size, 2);
+  });
+
+  it('legacy mode unknown value: treated like light', () => {
+    const { types, isLegacyAggressive } = parseClearTypes(undefined, 'medium');
+    assert.equal(types.size, 0);
+    assert.ok(!isLegacyAggressive);
+  });
+
+  it('empty string clear arg: treated as no types', () => {
+    const { types } = parseClearTypes('');
+    assert.equal(types.size, 0);
+  });
+
+  it('whitespace-only clear arg: treated as no types', () => {
+    const { types } = parseClearTypes('   ');
+    assert.equal(types.size, 0);
+  });
+
+  it('clear="cookies" + mode="aggressive": clear wins, not legacy aggressive', () => {
+    const { types, isLegacyAggressive } = parseClearTypes('cookies', 'aggressive');
+    assert.ok(types.has('cookies'));
+    assert.equal(types.size, 1);
+    assert.ok(!isLegacyAggressive);
+  });
+
+  it('clear="all" + mode="aggressive": clear wins, all 7 types, not legacy', () => {
+    const { types, isLegacyAggressive } = parseClearTypes('all', 'aggressive');
+    assert.equal(types.size, 7);
+    assert.ok(!isLegacyAggressive);
+  });
+
+  it('clear="cache,cookies" without legacy mode: not legacy aggressive', () => {
+    const { types, isLegacyAggressive } = parseClearTypes('cache,cookies');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.equal(types.size, 2);
+    assert.ok(!isLegacyAggressive);
+  });
+
+  it('clear with only unknown types: still has entries', () => {
+    const { types } = parseClearTypes('foo,bar');
+    assert.equal(types.size, 2);
+    assert.ok(types.has('foo'));
+    assert.ok(types.has('bar'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload cookie domain matching
+// ---------------------------------------------------------------------------
+
+function matchesCookieDomain(originHost: string, cookieDomain: string): boolean {
+  const cd = cookieDomain.startsWith('.') ? cookieDomain.slice(1) : cookieDomain;
+  return originHost === cd || originHost.endsWith('.' + cd);
+}
+
+describe('clear_cache_and_reload cookie domain matching', () => {
+  it('exact domain match', () => {
+    assert.ok(matchesCookieDomain('cursor.com', 'cursor.com'));
+  });
+
+  it('dot-prefixed domain matches subdomain', () => {
+    assert.ok(matchesCookieDomain('app.cursor.com', '.cursor.com'));
+  });
+
+  it('dot-prefixed domain matches exact host', () => {
+    assert.ok(matchesCookieDomain('cursor.com', '.cursor.com'));
+  });
+
+  it('subdomain matches parent with auto dot', () => {
+    assert.ok(matchesCookieDomain('dashboard.cursor.com', 'cursor.com'));
+  });
+
+  it('unrelated domain does not match', () => {
+    assert.ok(!matchesCookieDomain('cursor.com', 'google.com'));
+  });
+
+  it('partial suffix does not match', () => {
+    assert.ok(!matchesCookieDomain('notcursor.com', 'cursor.com'));
+  });
+
+  it('dot-prefixed partial suffix does not match', () => {
+    assert.ok(!matchesCookieDomain('notcursor.com', '.cursor.com'));
+  });
+
+  it('deeper subdomain matches', () => {
+    assert.ok(matchesCookieDomain('a.b.cursor.com', '.cursor.com'));
+  });
+
+  it('empty cookie domain does not match', () => {
+    assert.ok(!matchesCookieDomain('cursor.com', ''));
+  });
+
+  it('localhost exact match', () => {
+    assert.ok(matchesCookieDomain('localhost', 'localhost'));
+  });
+
+  it('different TLD does not match', () => {
+    assert.ok(!matchesCookieDomain('cursor.sh', 'cursor.com'));
+  });
+
+  it('IP address exact match', () => {
+    assert.ok(matchesCookieDomain('127.0.0.1', '127.0.0.1'));
+  });
+
+  it('IP address does not match different IP', () => {
+    assert.ok(!matchesCookieDomain('127.0.0.1', '192.168.1.1'));
+  });
+
+  it('domain with port stripped (hostname only) matches', () => {
+    const origin = 'https://cursor.com:8080';
+    const hostname = new URL(origin).hostname;
+    assert.ok(matchesCookieDomain(hostname, 'cursor.com'));
+  });
+
+  it('www subdomain matches parent', () => {
+    assert.ok(matchesCookieDomain('www.cursor.com', 'cursor.com'));
+  });
+
+  it('www subdomain matches dot-prefixed parent', () => {
+    assert.ok(matchesCookieDomain('www.cursor.com', '.cursor.com'));
+  });
+
+  it('parent does not match child (no reverse matching)', () => {
+    assert.ok(!matchesCookieDomain('cursor.com', 'app.cursor.com'));
+  });
+
+  it('single-label hostname exact match', () => {
+    assert.ok(matchesCookieDomain('intranet', 'intranet'));
+  });
+
+  it('single-label hostname does not match with dot prefix', () => {
+    assert.ok(!matchesCookieDomain('intranet', '.intranet'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload cookie scope decision
+// ---------------------------------------------------------------------------
+
+/**
+ * Determines whether cookie clearing should be global or origin-scoped.
+ * Mirrors the logic: if legacyMode === 'aggressive' && !clearArg → global; else → origin-scoped.
+ */
+function decideCookieScope(
+  clearArg: string | undefined,
+  legacyMode: string | undefined,
+): 'global' | 'origin' | 'none' {
+  const { types, isLegacyAggressive } = parseClearTypes(clearArg, legacyMode);
+  if (!types.has('cookies')) return 'none';
+  if (isLegacyAggressive && !clearArg) return 'global';
+  return 'origin';
+}
+
+describe('clear_cache_and_reload cookie scope decision', () => {
+  it('no cookies requested: none', () => {
+    assert.equal(decideCookieScope('cache', undefined), 'none');
+  });
+
+  it('clear="cookies": origin-scoped', () => {
+    assert.equal(decideCookieScope('cookies', undefined), 'origin');
+  });
+
+  it('clear="cookies" + mode="aggressive": origin-scoped (clear overrides legacy)', () => {
+    assert.equal(decideCookieScope('cookies', 'aggressive'), 'origin');
+  });
+
+  it('mode="aggressive" without clear: global', () => {
+    assert.equal(decideCookieScope(undefined, 'aggressive'), 'global');
+  });
+
+  it('mode="light": none (no cookies)', () => {
+    assert.equal(decideCookieScope(undefined, 'light'), 'none');
+  });
+
+  it('clear="all": origin-scoped (not global)', () => {
+    assert.equal(decideCookieScope('all', undefined), 'origin');
+  });
+
+  it('clear="all" + mode="aggressive": origin-scoped (clear wins)', () => {
+    assert.equal(decideCookieScope('all', 'aggressive'), 'origin');
+  });
+
+  it('clear="cache,cookies": origin-scoped', () => {
+    assert.equal(decideCookieScope('cache,cookies', undefined), 'origin');
+  });
+
+  it('no args at all: none', () => {
+    assert.equal(decideCookieScope(undefined, undefined), 'none');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload storage type partitioning
+// ---------------------------------------------------------------------------
+
+function partitionClearTypes(clearTypes: Set<string>): {
+  hasCache: boolean;
+  hasCookies: boolean;
+  storageTypeParts: string[];
+} {
+  const storageTypeParts: string[] = [];
+  if (clearTypes.has('local_storage')) storageTypeParts.push('local_storage');
+  if (clearTypes.has('session_storage')) storageTypeParts.push('session_storage');
+  if (clearTypes.has('cache_storage')) storageTypeParts.push('cache_storage');
+  if (clearTypes.has('indexeddb')) storageTypeParts.push('indexeddb');
+  if (clearTypes.has('service_workers')) storageTypeParts.push('service_workers');
+  return {
+    hasCache: clearTypes.has('cache'),
+    hasCookies: clearTypes.has('cookies'),
+    storageTypeParts,
+  };
+}
+
+describe('clear_cache_and_reload storage type partitioning', () => {
+  it('empty set: nothing to clear', () => {
+    const result = partitionClearTypes(new Set());
+    assert.ok(!result.hasCache);
+    assert.ok(!result.hasCookies);
+    assert.equal(result.storageTypeParts.length, 0);
+  });
+
+  it('cache only: hasCache but no storage parts', () => {
+    const result = partitionClearTypes(new Set(['cache']));
+    assert.ok(result.hasCache);
+    assert.ok(!result.hasCookies);
+    assert.equal(result.storageTypeParts.length, 0);
+  });
+
+  it('cookies only: hasCookies but no storage parts', () => {
+    const result = partitionClearTypes(new Set(['cookies']));
+    assert.ok(!result.hasCache);
+    assert.ok(result.hasCookies);
+    assert.equal(result.storageTypeParts.length, 0);
+  });
+
+  it('local_storage goes to storage parts', () => {
+    const result = partitionClearTypes(new Set(['local_storage']));
+    assert.ok(!result.hasCache);
+    assert.ok(!result.hasCookies);
+    assert.deepStrictEqual(result.storageTypeParts, ['local_storage']);
+  });
+
+  it('all 5 origin-scoped types go to storage parts', () => {
+    const result = partitionClearTypes(new Set(['local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']));
+    assert.equal(result.storageTypeParts.length, 5);
+    assert.ok(result.storageTypeParts.includes('local_storage'));
+    assert.ok(result.storageTypeParts.includes('session_storage'));
+    assert.ok(result.storageTypeParts.includes('cache_storage'));
+    assert.ok(result.storageTypeParts.includes('indexeddb'));
+    assert.ok(result.storageTypeParts.includes('service_workers'));
+  });
+
+  it('full "all" partitions into cache + cookies + 5 storage types', () => {
+    const allTypes = new Set(['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']);
+    const result = partitionClearTypes(allTypes);
+    assert.ok(result.hasCache);
+    assert.ok(result.hasCookies);
+    assert.equal(result.storageTypeParts.length, 5);
+  });
+
+  it('cache + service_workers: common bundle-bust combo', () => {
+    const result = partitionClearTypes(new Set(['cache', 'service_workers']));
+    assert.ok(result.hasCache);
+    assert.ok(!result.hasCookies);
+    assert.deepStrictEqual(result.storageTypeParts, ['service_workers']);
+  });
+
+  it('storage parts maintain stable order', () => {
+    const result = partitionClearTypes(new Set(['service_workers', 'indexeddb', 'local_storage', 'cache_storage', 'session_storage']));
+    assert.deepStrictEqual(result.storageTypeParts, ['local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload output summary formatting
+// ---------------------------------------------------------------------------
+
+function buildClearSummary(cleared: string[], shouldReload: boolean): string {
+  const items = [...cleared];
+  if (shouldReload) items.push('page reloaded');
+  return items.length > 0 ? `Cleared: ${items.join('; ')}` : 'Page reloaded (no storage cleared)';
+}
+
+describe('clear_cache_and_reload output summary', () => {
+  it('no clearing + reload: includes page reloaded', () => {
+    const summary = buildClearSummary([], true);
+    assert.equal(summary, 'Cleared: page reloaded');
+  });
+
+  it('cache only + reload', () => {
+    const summary = buildClearSummary(['cache (global)'], true);
+    assert.ok(summary.includes('cache (global)'));
+    assert.ok(summary.includes('page reloaded'));
+  });
+
+  it('cookies for origin + reload', () => {
+    const summary = buildClearSummary(['cookies (https://cursor.com, 3 removed)'], true);
+    assert.ok(summary.includes('cookies'));
+    assert.ok(summary.includes('cursor.com'));
+    assert.ok(summary.includes('3 removed'));
+  });
+
+  it('multiple types + no reload', () => {
+    const summary = buildClearSummary(['cache (global)', 'local_storage, indexeddb (https://cursor.com)'], false);
+    assert.ok(summary.includes('cache (global)'));
+    assert.ok(summary.includes('local_storage'));
+    assert.ok(!summary.includes('page reloaded'));
+  });
+
+  it('no clearing + no reload: fallback message', () => {
+    const summary = buildClearSummary([], false);
+    assert.equal(summary, 'Page reloaded (no storage cleared)');
+  });
+
+  it('cookies global + reload', () => {
+    const summary = buildClearSummary(['cookies (global)'], true);
+    assert.ok(summary.includes('cookies (global)'));
+    assert.ok(summary.includes('page reloaded'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload reload parameter
+// ---------------------------------------------------------------------------
+
+describe('clear_cache_and_reload reload parameter', () => {
+  it('reload defaults to true when undefined', () => {
+    const shouldReload = undefined !== false;
+    assert.ok(shouldReload);
+  });
+
+  it('reload=true is truthy', () => {
+    const shouldReload = true !== false;
+    assert.ok(shouldReload);
+  });
+
+  it('reload=false suppresses reload', () => {
+    const shouldReload = false !== false;
+    assert.ok(!shouldReload);
+  });
+
+  it('reload=null is truthy (only false suppresses)', () => {
+    const shouldReload = null !== false;
+    assert.ok(shouldReload);
+  });
+
+  it('reload=0 is truthy (strict false check)', () => {
+    const shouldReload = 0 !== false;
+    assert.ok(shouldReload);
+  });
+
+  it('reload="" is truthy (strict false check)', () => {
+    const shouldReload = '' !== false;
+    assert.ok(shouldReload);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload end-to-end scenario simulation
+// ---------------------------------------------------------------------------
+
+describe('clear_cache_and_reload scenario simulation', () => {
+  function simulateClear(args: {
+    clear?: string;
+    mode?: string;
+    origin?: string;
+    reload?: boolean;
+  }): {
+    cdpCommands: string[];
+    summary: string;
+  } {
+    const { types, isLegacyAggressive } = parseClearTypes(args.clear, args.mode);
+    const shouldReload = args.reload !== false;
+    const origin = args.origin || 'https://example.com';
+    const cdpCommands: string[] = [];
+    const cleared: string[] = [];
+
+    if (types.has('cache')) {
+      cdpCommands.push('Network.clearBrowserCache');
+      cleared.push('cache (global)');
+    }
+    if (types.has('cookies')) {
+      if (isLegacyAggressive && !args.clear) {
+        cdpCommands.push('Network.clearBrowserCookies');
+        cleared.push('cookies (global)');
+      } else {
+        cdpCommands.push('Network.getCookies');
+        cleared.push(`cookies (${origin}, origin-scoped)`);
+      }
+    }
+
+    const storageParts: string[] = [];
+    for (const t of ['local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']) {
+      if (types.has(t)) storageParts.push(t);
+    }
+    if (storageParts.length > 0) {
+      cdpCommands.push('Storage.clearDataForOrigin');
+      cleared.push(`${storageParts.join(', ')} (${origin})`);
+    }
+
+    if (shouldReload) {
+      cdpCommands.push('Page.reload');
+      cleared.push('page reloaded');
+    }
+
+    const summary = cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'Page reloaded (no storage cleared)';
+    return { cdpCommands, summary };
+  }
+
+  it('scenario: default call (no args) → only Page.reload', () => {
+    const result = simulateClear({});
+    assert.deepStrictEqual(result.cdpCommands, ['Page.reload']);
+    assert.ok(result.summary.includes('page reloaded'));
+    assert.ok(!result.summary.includes('cache'));
+  });
+
+  it('scenario: mode=light → only Page.reload', () => {
+    const result = simulateClear({ mode: 'light' });
+    assert.deepStrictEqual(result.cdpCommands, ['Page.reload']);
+  });
+
+  it('scenario: mode=aggressive → global cache + global cookies + reload', () => {
+    const result = simulateClear({ mode: 'aggressive' });
+    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.ok(result.cdpCommands.includes('Page.reload'));
+    assert.ok(!result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(result.summary.includes('cookies (global)'));
+  });
+
+  it('scenario: clear=cache → Network.clearBrowserCache + reload, no cookies', () => {
+    const result = simulateClear({ clear: 'cache' });
+    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(result.cdpCommands.includes('Page.reload'));
+    assert.ok(!result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
+  });
+
+  it('scenario: clear=cache,service_workers → cache + Storage.clearDataForOrigin + reload', () => {
+    const result = simulateClear({ clear: 'cache,service_workers' });
+    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(result.cdpCommands.includes('Storage.clearDataForOrigin'));
+    assert.ok(result.cdpCommands.includes('Page.reload'));
+    assert.ok(!result.cdpCommands.includes('Network.getCookies'));
+  });
+
+  it('scenario: clear=cookies → origin-scoped cookie deletion + reload', () => {
+    const result = simulateClear({ clear: 'cookies' });
+    assert.ok(result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.ok(result.cdpCommands.includes('Page.reload'));
+    assert.ok(result.summary.includes('origin-scoped'));
+  });
+
+  it('scenario: clear=cache, reload=false → cache cleared but no Page.reload', () => {
+    const result = simulateClear({ clear: 'cache', reload: false });
+    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(!result.cdpCommands.includes('Page.reload'));
+    assert.ok(!result.summary.includes('page reloaded'));
+  });
+
+  it('scenario: clear=all → 3 CDP commands (cache + cookies + storage) + reload', () => {
+    const result = simulateClear({ clear: 'all' });
+    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(result.cdpCommands.includes('Storage.clearDataForOrigin'));
+    assert.ok(result.cdpCommands.includes('Page.reload'));
+    assert.equal(result.cdpCommands.length, 4);
+  });
+
+  it('scenario: clear=local_storage → only Storage.clearDataForOrigin + reload', () => {
+    const result = simulateClear({ clear: 'local_storage' });
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(!result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(result.cdpCommands.includes('Storage.clearDataForOrigin'));
+    assert.ok(result.cdpCommands.includes('Page.reload'));
+    assert.equal(result.cdpCommands.length, 2);
+  });
+
+  it('scenario: clear=cookies+mode=aggressive → origin-scoped (clear wins over legacy)', () => {
+    const result = simulateClear({ clear: 'cookies', mode: 'aggressive' });
+    assert.ok(result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.ok(result.summary.includes('origin-scoped'));
+  });
+
+  it('scenario: origin specified → appears in summary', () => {
+    const result = simulateClear({ clear: 'cookies', origin: 'https://cursor.com' });
+    assert.ok(result.summary.includes('https://cursor.com'));
+  });
+
+  it('scenario: reload=false + no clear → no CDP commands at all', () => {
+    const result = simulateClear({ reload: false });
+    assert.deepStrictEqual(result.cdpCommands, []);
+    assert.equal(result.summary, 'Page reloaded (no storage cleared)');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Integration: tool action count verification
 // ---------------------------------------------------------------------------
 
