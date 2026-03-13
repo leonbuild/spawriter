@@ -242,14 +242,15 @@ spawriter/src/
 - **强制模式（显式 tool）**：
 
   - `clear_cache_and_reload({ mode: "aggressive" })`：
-    - 扩展侧 `browsingData.remove({since:0},{cache:true,serviceWorkers:true})`
-    - 然后 `tabs.reload({ bypassCache:true })`
+    - `Network.clearBrowserCache`（全局缓存清除）
+    - 仅清除当前页面 origin 的 cookies（通过 `Network.getCookies` + `Network.deleteCookies` 按域名过滤，不会影响其他站点）
+    - 然后 `Page.reload({ ignoreCache: true })`
 
 - **触发条件（自动）**：
   - MCP 连接后发现 `window.importMapOverrides` 存在且 overrides 非空，但页面 UI 不符合预期（这很难自动判断，建议只做一次“连接时”刷新）
   - 或者 AI 明确要求“刷新/清缓存”
 
-> 注意：`browsingData.remove` 是全局级别，过于 aggressive 会影响人类；所以默认只做 ignoreCache reload，强制模式才做全量清缓存+SW。
+> 注意：cookie 清除始终限定在当前页面的 origin 范围内，不会影响用户在其他站点的登录状态。cache 清除是全局的（浏览器机制限制），但 cookies、localStorage 等均按 origin 隔离。
 
 ---
 

@@ -225,7 +225,7 @@ Notes: Simple, effective cache-busting reload.
 | Light mode | `mode: "light"` | `Cache cleared with mode: light` |
 | Aggressive mode | `mode: "aggressive"` | `Cache cleared with mode: aggressive` |
 
-Notes: Both modes work. Aggressive mode presumably clears more browser state (cookies, localStorage, etc.).
+Notes: Both modes work. Aggressive mode clears cache (global) and cookies (origin-scoped, only for the current page's domain). Other sites' cookies are never affected.
 
 ---
 

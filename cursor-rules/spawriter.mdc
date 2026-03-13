@@ -69,7 +69,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 |------|-------------|----------|
 | `navigate` | Navigate the attached tab to a URL | `url` |
 | `ensure_fresh_render` | Reload page with fresh cache | — |
-| `clear_cache_and_reload` | Granular cache/storage reset + reload | `clear?` (comma-separated types), `origin?`, `reload?` (boolean), `mode?` (deprecated) |
+| `clear_cache_and_reload` | Granular cache/storage reset + reload. Cookies are always scoped to current page origin (never clears other sites' cookies). | `clear?` (comma-separated types), `origin?`, `reload?` (boolean), `mode?` (deprecated) |
 
 ### Import-Map Override Management
 
@@ -297,6 +297,7 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 5. **Use incremental operations** — prefer targeted `override_app` over broad `reset_all`.
 6. **Handle page reloads gracefully** — after `clear_cache_and_reload` or `ensure_fresh_render`, wait before querying state.
 7. **Parallel calls are safe** — `dashboard_state` + `screenshot` can run concurrently without timeout issues.
+8. **Cookie clearing is origin-scoped** — `clear_cache_and_reload` only removes cookies for the current page's origin. Other sites' cookies are never affected, even with `mode: "aggressive"`.
 
 ## Troubleshooting
 
@@ -311,6 +312,7 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 | CSS inspect "Element not found" | Verify selector with `execute { code: "document.querySelector('...')" }` first |
 | Session limit reached | Sessions auto-evict oldest when max (5) reached; use `session_manager { action: "remove" }` to free slots |
 | Stale cached bundle | `clear_cache_and_reload { clear: "cache,service_workers" }` clears cache + service workers without wiping cookies |
+| Need to clear cookies too | `clear_cache_and_reload { clear: "cache,cookies" }` clears cache + cookies for current origin only (other sites unaffected) |
 | `playwright_execute` connection error | Call `reset` then retry; ensure relay server is running |
 | No console/network logs | Logs are captured after CDP connection is established; re-trigger the action |
 | Labeled screenshot shows no labels | Page may have no interactive elements; check `accessibility_snapshot` |

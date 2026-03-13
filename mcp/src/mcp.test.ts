@@ -7020,16 +7020,15 @@ describe('clear_cache_and_reload cookie domain matching', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Determines whether cookie clearing should be global or origin-scoped.
- * Mirrors the logic: if legacyMode === 'aggressive' && !clearArg → global; else → origin-scoped.
+ * Determines whether cookie clearing should be origin-scoped or skipped.
+ * All cookie clearing is now origin-scoped (never global).
  */
 function decideCookieScope(
   clearArg: string | undefined,
   legacyMode: string | undefined,
-): 'global' | 'origin' | 'none' {
-  const { types, isLegacyAggressive } = parseClearTypes(clearArg, legacyMode);
+): 'origin' | 'none' {
+  const { types } = parseClearTypes(clearArg, legacyMode);
   if (!types.has('cookies')) return 'none';
-  if (isLegacyAggressive && !clearArg) return 'global';
   return 'origin';
 }
 
@@ -7046,8 +7045,8 @@ describe('clear_cache_and_reload cookie scope decision', () => {
     assert.equal(decideCookieScope('cookies', 'aggressive'), 'origin');
   });
 
-  it('mode="aggressive" without clear: global', () => {
-    assert.equal(decideCookieScope(undefined, 'aggressive'), 'global');
+  it('mode="aggressive" without clear: origin-scoped (not global)', () => {
+    assert.equal(decideCookieScope(undefined, 'aggressive'), 'origin');
   });
 
   it('mode="light": none (no cookies)', () => {
@@ -7251,7 +7250,7 @@ describe('clear_cache_and_reload scenario simulation', () => {
     cdpCommands: string[];
     summary: string;
   } {
-    const { types, isLegacyAggressive } = parseClearTypes(args.clear, args.mode);
+    const { types } = parseClearTypes(args.clear, args.mode);
     const shouldReload = args.reload !== false;
     const origin = args.origin || 'https://example.com';
     const cdpCommands: string[] = [];
@@ -7262,13 +7261,8 @@ describe('clear_cache_and_reload scenario simulation', () => {
       cleared.push('cache (global)');
     }
     if (types.has('cookies')) {
-      if (isLegacyAggressive && !args.clear) {
-        cdpCommands.push('Network.clearBrowserCookies');
-        cleared.push('cookies (global)');
-      } else {
-        cdpCommands.push('Network.getCookies');
-        cleared.push(`cookies (${origin}, origin-scoped)`);
-      }
+      cdpCommands.push('Network.getCookies');
+      cleared.push(`cookies (${origin}, origin-scoped)`);
     }
 
     const storageParts: string[] = [];
@@ -7301,13 +7295,13 @@ describe('clear_cache_and_reload scenario simulation', () => {
     assert.deepStrictEqual(result.cdpCommands, ['Page.reload']);
   });
 
-  it('scenario: mode=aggressive → global cache + global cookies + reload', () => {
+  it('scenario: mode=aggressive → global cache + origin-scoped cookies + reload', () => {
     const result = simulateClear({ mode: 'aggressive' });
     assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
-    assert.ok(result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.ok(result.cdpCommands.includes('Network.getCookies'));
     assert.ok(result.cdpCommands.includes('Page.reload'));
-    assert.ok(!result.cdpCommands.includes('Network.getCookies'));
-    assert.ok(result.summary.includes('cookies (global)'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.ok(result.summary.includes('origin-scoped'));
   });
 
   it('scenario: clear=cache → Network.clearBrowserCache + reload, no cookies', () => {

@@ -916,7 +916,7 @@ Legacy "mode" parameter still works for backward compatibility.`,
           description: 'Scope storage/cookie clearing to this origin (e.g. "https://cursor.com"). Default: current page origin. Does not affect "cache" (always global).',
         },
         reload: { type: 'boolean', description: 'Whether to reload the page after clearing. Default: true' },
-        mode: { type: 'string', enum: ['light', 'aggressive'], description: '(Deprecated) Legacy mode. "light" = reload only, "aggressive" = clear all globally + reload. Overridden by "clear" if both are provided.' },
+        mode: { type: 'string', enum: ['light', 'aggressive'], description: '(Deprecated) Legacy mode. "light" = reload only, "aggressive" = clear cache (global) + cookies (current page origin only, not all browser cookies) + reload. Prefer "clear" parameter for granular control. Overridden by "clear" if both are provided.' },
       },
     },
   },
@@ -1458,21 +1458,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           cleared.push('cache (global)');
         }
         if (clearTypes.has('cookies')) {
-          if (legacyMode === 'aggressive' && !clearArg) {
-            await sendCdpCommand(session, 'Network.clearBrowserCookies', undefined, getCommandTimeout('Network.clearBrowserCookies'));
-            cleared.push('cookies (global)');
-          } else {
-            const cookieResult = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<{ name: string; domain: string }> };
-            const originHost = new URL(origin).hostname;
-            const matching = (cookieResult?.cookies || []).filter(c => {
-              const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-              return originHost === cd || originHost.endsWith('.' + cd);
-            });
-            for (const c of matching) {
-              await sendCdpCommand(session, 'Network.deleteCookies', { name: c.name, domain: c.domain });
-            }
-            cleared.push(`cookies (${origin}, ${matching.length} removed)`);
+          const cookieResult = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<{ name: string; domain: string }> };
+          const originHost = new URL(origin).hostname;
+          const matching = (cookieResult?.cookies || []).filter(c => {
+            const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+            return originHost === cd || originHost.endsWith('.' + cd);
+          });
+          for (const c of matching) {
+            await sendCdpCommand(session, 'Network.deleteCookies', { name: c.name, domain: c.domain });
           }
+          cleared.push(`cookies (${origin}, ${matching.length} removed)`);
         }
 
         const storageTypeParts: string[] = [];

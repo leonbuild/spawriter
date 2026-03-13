@@ -192,7 +192,7 @@ Configure your AI client to point to `mcp/dist/cli.js serve`. Example:
 | `execute` | Run arbitrary JavaScript in the page context |
 | `dashboard_state` | Read dashboard status, app states, whether overrides hit localhost |
 | `reset` | Reset the MCP connection |
-| `clear_cache_and_reload` | Clear browser cache/storage with granular control and reload |
+| `clear_cache_and_reload` | Clear browser cache/storage with granular control and reload. Cookies are origin-scoped (only current site). |
 | `ensure_fresh_render` | Wait for the page to stabilize after navigation |
 | `navigate` | Navigate to a URL |
 
