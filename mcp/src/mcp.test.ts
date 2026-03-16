@@ -7101,7 +7101,9 @@ describe('clear_cache_and_reload parameter parsing', () => {
 // ---------------------------------------------------------------------------
 
 function matchesCookieDomain(originHost: string, cookieDomain: string): boolean {
-  const cd = cookieDomain.startsWith('.') ? cookieDomain.slice(1) : cookieDomain;
+  const isDotPrefixed = cookieDomain.startsWith('.');
+  const cd = isDotPrefixed ? cookieDomain.slice(1) : cookieDomain;
+  if (isDotPrefixed && !originHost.includes('.')) return false;
   return originHost === cd || originHost.endsWith('.' + cd);
 }
 

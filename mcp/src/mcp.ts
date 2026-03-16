@@ -1461,7 +1461,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const cookieResult = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<{ name: string; domain: string }> };
           const originHost = new URL(origin).hostname;
           const matching = (cookieResult?.cookies || []).filter(c => {
-            const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+            const isDotPrefixed = c.domain.startsWith('.');
+            const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
+            if (isDotPrefixed && !originHost.includes('.')) return false;
             return originHost === cd || originHost.endsWith('.' + cd);
           });
           for (const c of matching) {
