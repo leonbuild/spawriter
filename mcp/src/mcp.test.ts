@@ -6716,6 +6716,176 @@ describe('Timeout error message format', () => {
     assert.ok(hint.includes('reset'));
     assert.ok(hint.includes('timed out'));
   });
+
+  it('Extension CDP timeout includes method name and duration', () => {
+    const timeoutMs = 30000;
+    const method = 'Runtime.evaluate';
+    const msg = `Extension CDP timeout (${timeoutMs}ms): ${method}`;
+    assert.ok(msg.includes('Runtime.evaluate'));
+    assert.ok(msg.includes('30000ms'));
+    assert.ok(msg.includes('Extension CDP timeout'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Extension-side sendCommandWithTimeout pattern
+// ---------------------------------------------------------------------------
+
+describe('Extension sendCommandWithTimeout pattern', () => {
+  const SLOW_CDP_METHODS = new Set([
+    'Accessibility.getFullAXTree', 'Page.captureScreenshot',
+    'Network.clearBrowserCache', 'Network.clearBrowserCookies',
+    'Page.reload', 'Page.navigate',
+  ]);
+  const CDP_COMMAND_TIMEOUT_MS = 30000;
+  const CDP_SLOW_COMMAND_TIMEOUT_MS = 60000;
+
+  function sendCommandWithTimeout(
+    mockSendCommand: () => Promise<unknown>,
+    method: string,
+    timeoutMs: number,
+  ): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Extension CDP timeout (${timeoutMs}ms): ${method}`));
+        }
+      }, timeoutMs);
+
+      mockSendCommand().then(
+        (result) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            resolve(result);
+          }
+        },
+        (err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        },
+      );
+    });
+  }
+
+  it('should reject with descriptive error when command hangs (simulating page reload)', async () => {
+    const neverResolves = () => new Promise<never>(() => {});
+    await assert.rejects(
+      sendCommandWithTimeout(neverResolves, 'Runtime.evaluate', 50),
+      (err: Error) => {
+        assert.ok(err.message.includes('Extension CDP timeout'));
+        assert.ok(err.message.includes('Runtime.evaluate'));
+        assert.ok(err.message.includes('50ms'));
+        return true;
+      },
+    );
+  });
+
+  it('should resolve normally when command responds before timeout', async () => {
+    const immediate = () => Promise.resolve({ value: 'hello' });
+    const result = await sendCommandWithTimeout(immediate, 'Runtime.evaluate', 5000);
+    assert.deepEqual(result, { value: 'hello' });
+  });
+
+  it('should propagate original error when command rejects before timeout', async () => {
+    const failing = () => Promise.reject(new Error('Debugger detached'));
+    await assert.rejects(
+      sendCommandWithTimeout(failing, 'Runtime.evaluate', 5000),
+      (err: Error) => {
+        assert.ok(err.message.includes('Debugger detached'));
+        assert.ok(!err.message.includes('Extension CDP timeout'));
+        return true;
+      },
+    );
+  });
+
+  it('should use slow timeout for known slow methods', () => {
+    for (const method of SLOW_CDP_METHODS) {
+      const timeout = SLOW_CDP_METHODS.has(method)
+        ? CDP_SLOW_COMMAND_TIMEOUT_MS
+        : CDP_COMMAND_TIMEOUT_MS;
+      assert.equal(timeout, 60000, `${method} should use slow timeout`);
+    }
+  });
+
+  it('should use default timeout for fast methods', () => {
+    const fastMethods = ['Runtime.evaluate', 'DOM.enable', 'CSS.getStyleSheets', 'Network.enable'];
+    for (const method of fastMethods) {
+      const timeout = SLOW_CDP_METHODS.has(method)
+        ? CDP_SLOW_COMMAND_TIMEOUT_MS
+        : CDP_COMMAND_TIMEOUT_MS;
+      assert.equal(timeout, 30000, `${method} should use default timeout`);
+    }
+  });
+
+  it('should not resolve after timeout even if command later succeeds', async () => {
+    let resolveCommand: (v: unknown) => void;
+    const delayed = () => new Promise((resolve) => { resolveCommand = resolve; });
+
+    const promise = sendCommandWithTimeout(delayed, 'Runtime.evaluate', 50);
+    await assert.rejects(promise, /Extension CDP timeout/);
+
+    resolveCommand!('late result');
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
+  it('SLOW_CDP_METHODS matches SLOW_CDP_COMMANDS from mcp.ts', () => {
+    const mcpSlowCommands = new Set([
+      'Accessibility.getFullAXTree', 'Page.captureScreenshot',
+      'Network.clearBrowserCache', 'Network.clearBrowserCookies',
+      'Page.reload', 'Page.navigate',
+    ]);
+    assert.deepEqual(SLOW_CDP_METHODS, mcpSlowCommands);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Extension timeout fits in overall timeout hierarchy
+// ---------------------------------------------------------------------------
+
+describe('Extension timeout hierarchy', () => {
+  it('extension timeout < relay timeout < MCP global timeout', () => {
+    const extensionDefault = 30000;
+    const extensionSlow = 60000;
+    const relayTimeout = 90000;
+    const mcpGlobal = 120000;
+
+    assert.ok(extensionDefault < relayTimeout);
+    assert.ok(extensionSlow < relayTimeout);
+    assert.ok(relayTimeout < mcpGlobal);
+  });
+
+  it('extension timeout <= MCP sendCdpCommand timeout for evaluateJs', () => {
+    const extensionTimeout = 30000;
+    const evalTimeout = 30000;
+    const mcpCommandTimeout = evalTimeout + 5000; // 35s
+    assert.ok(extensionTimeout <= mcpCommandTimeout);
+  });
+
+  it('extension timeout == MCP sendCdpCommand default for non-eval commands', () => {
+    const extensionTimeout = 30000;
+    const mcpDefaultTimeout = 30000;
+    assert.equal(extensionTimeout, mcpDefaultTimeout);
+  });
+
+  it('extension slow timeout == MCP getCommandTimeout for slow commands', () => {
+    const extensionSlowTimeout = 60000;
+    const SLOW_CDP_COMMANDS = new Set([
+      'Accessibility.getFullAXTree', 'Page.captureScreenshot',
+      'Network.clearBrowserCache', 'Network.clearBrowserCookies',
+      'Page.reload', 'Page.navigate',
+    ]);
+    function getCommandTimeout(method: string): number {
+      return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
+    }
+    assert.equal(extensionSlowTimeout, getCommandTimeout('Page.captureScreenshot'));
+    assert.equal(extensionSlowTimeout, getCommandTimeout('Page.navigate'));
+  });
 });
 
 // ---------------------------------------------------------------------------

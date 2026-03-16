@@ -340,6 +340,48 @@ import browser from "webextension-polyfill";
     };
   }
 
+  const SLOW_CDP_METHODS = new Set([
+    "Accessibility.getFullAXTree",
+    "Page.captureScreenshot",
+    "Network.clearBrowserCache",
+    "Network.clearBrowserCookies",
+    "Page.reload",
+    "Page.navigate",
+  ]);
+  const CDP_COMMAND_TIMEOUT_MS = 30000;
+  const CDP_SLOW_COMMAND_TIMEOUT_MS = 60000;
+
+  function sendCommandWithTimeout(tabId, method, params, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Extension CDP timeout (${timeoutMs}ms): ${method}`));
+        }
+      }, timeoutMs);
+
+      chrome.debugger
+        .sendCommand({ tabId }, method, params)
+        .then(
+          (result) => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              resolve(result);
+            }
+          },
+          (err) => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              reject(err);
+            }
+          }
+        );
+    });
+  }
+
   async function handleCDPCommand(message) {
     const { id, params } = message;
     const { method, sessionId, params: cdpParams } = params;
@@ -388,10 +430,14 @@ import browser from "webextension-polyfill";
         }
       }
 
-      const result = await chrome.debugger.sendCommand(
-        { tabId: targetTabId },
+      const timeoutMs = SLOW_CDP_METHODS.has(method)
+        ? CDP_SLOW_COMMAND_TIMEOUT_MS
+        : CDP_COMMAND_TIMEOUT_MS;
+      const result = await sendCommandWithTimeout(
+        targetTabId,
         method,
-        cdpParams
+        cdpParams,
+        timeoutMs
       );
       sendMessage({ id, result });
     } catch (err) {
