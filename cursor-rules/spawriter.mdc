@@ -1,7 +1,7 @@
 # spawriter
 
 ---
-description: spawriter - AI-assisted browser automation & debugging for single-spa micro-frontend projects
+description: spawriter - AI-assisted browser automation & debugging for single-spa micro-frontend projects. Use proactively to view, verify, and explore web pages whenever browser context would help.
 globs: "**"
 alwaysApply: false
 ---
@@ -9,6 +9,8 @@ alwaysApply: false
 # spawriter MCP Tools
 
 You have access to **spawriter** MCP tools that control the user's real Chrome tab via CDP (Chrome DevTools Protocol). This is NOT a headless browser — all actions affect the user's visible browser.
+
+**You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it.
 
 ## Available Tools (23)
 
@@ -89,6 +91,80 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 |------|-------------|----------|
 | `session_manager` | Manage multiple Playwright executor sessions | `action`: `list` / `create` / `switch` / `remove` / `remove_all`; `sessionId?` |
 | `reset` | Reset CDP + Playwright connections, clear all logs/network/debugger/sessions | — |
+
+---
+
+## Connection Awareness
+
+Before using any spawriter tool, you must have an active browser connection. If a tool call fails with a connection error or timeout:
+
+1. **Ask the user to connect** — say: "I need browser access to [reason]. Please make sure spawriter is connected to your Chrome tab (click the spawriter toolbar button to attach)."
+2. Call `reset` to re-establish the connection, then retry.
+3. If still failing, guide the user: check that the MCP server is running (`node dist/cli.js serve`), the extension is loaded, and the tab is a normal web page (not `chrome://` or `edge://`).
+
+**Proactively request connection** when you anticipate needing browser access — don't wait until a tool call fails. For example, if the user asks you to fix a UI bug, immediately check if the browser is reachable before diving into code.
+
+---
+
+## Proactive Browser Engagement
+
+**This is the most important section.** You MUST actively use spawriter tools in these situations — do NOT wait for the user to ask:
+
+### When to proactively use the browser
+
+| Situation | What to do | Why |
+|-----------|-----------|-----|
+| **User shares a URL or mentions a page** | `navigate` to the URL, then `screenshot` + `accessibility_snapshot` | Understand what the user is seeing before responding |
+| **User describes a UI problem** | `screenshot` + `console_logs { level: "error" }` + `network_log { status_filter: "error" }` | Get real visual + runtime evidence instead of guessing from code alone |
+| **You need a design/layout reference** | `navigate` to the reference URL, `screenshot`, study the layout, then come back | Ground your implementation in real visual context |
+| **You just made code changes (CSS, HTML, JS, Vue, React, etc.)** | `ensure_fresh_render` → `screenshot` → compare with before | **Always verify your changes visually** — never assume they look correct |
+| **User asks "how does X look?"** or **"what's on the page?"** | `screenshot { labels: true }` + `accessibility_snapshot` | Give a concrete answer based on what's actually rendered |
+| **You're implementing a UI feature** | Screenshot the current state **before** starting, then screenshot **after** each significant change | Maintain visual awareness throughout the implementation |
+| **User mentions an error or unexpected behavior** | `console_logs` + `network_log` + `screenshot` | Gather all runtime evidence in one shot |
+| **You're debugging an API issue** | `network_log` → find the request → `network_detail` for headers + body | See the actual request/response, not just the code that sends it |
+| **User asks to match a design or another site** | `navigate` to the reference, `screenshot`, analyze, then navigate back and compare | Visual side-by-side is far more reliable than verbal description |
+| **You're exploring an unfamiliar page/app** | `dashboard_state` + `screenshot { labels: true }` + `accessibility_snapshot` | Build a mental model of the page structure and available interactions |
+| **After setting up or changing an override** | `dashboard_state` + `ensure_fresh_render` + `screenshot` | Confirm the override actually took effect |
+| **User says "it doesn't work" or "it looks wrong"** | `screenshot` immediately — see what they see | Don't ask the user to describe it; look at it yourself |
+
+### Verification-after-changes protocol
+
+Whenever you modify code that affects the UI, follow this sequence **automatically**:
+
+1. `ensure_fresh_render` or `clear_cache_and_reload` (if cache might be stale)
+2. `screenshot` — capture the result
+3. Compare with your expectations
+4. If something looks wrong: `console_logs { level: "error" }` + `network_log { status_filter: "error" }` to diagnose
+5. Report the visual result to the user ("Here's how it looks now — [describe what you see]")
+
+**Never tell the user "I've made the change, please check it" without checking it yourself first.**
+
+### Reference-gathering protocol
+
+When you need visual context (e.g., user says "make it look like X", or you want to see how a component library renders):
+
+1. `navigate { url: "..." }` — go to the reference page
+2. `screenshot` — capture the visual
+3. `accessibility_snapshot` or `page_content { action: "get_html", selector: "..." }` — understand the structure
+4. Navigate back to the working page
+5. Use what you learned to inform your implementation
+
+### Exploration protocol
+
+When you encounter an unfamiliar page or the user asks about page state:
+
+1. `dashboard_state` — understand app-level structure (single-spa apps, overrides)
+2. `screenshot { labels: true }` — see all interactive elements with numbered labels
+3. `accessibility_snapshot` — get the semantic structure
+4. `page_content { action: "get_metadata" }` — understand page identity
+5. If needed: `execute { code: "..." }` to query specific DOM state
+
+### When NOT to use the browser
+
+- Pure backend/algorithmic code changes with no UI impact
+- User explicitly says they don't want browser interaction
+- Configuration file edits that don't affect rendering
+- When the user hasn't set up spawriter yet and the task doesn't require it
 
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: spawriter
-description: Control the user's real Chrome tab through spawriter (extension + relay + MCP server). Use this for single-spa dashboard workflows and AI-assisted runtime checks without launching a second browser.
+description: Control the user's real Chrome tab through spawriter (extension + relay + MCP server). Proactively use for viewing, verifying, and exploring web pages whenever browser context would help — don't wait for the user to ask.
 ---
 
 ## REQUIRED: Read Full Documentation First
@@ -24,6 +24,48 @@ Or:
 ```bash
 node dist/cli.js serve
 ```
+
+## Connection awareness
+
+Before using any spawriter tool, ensure the browser is connected. If a tool call fails:
+
+1. Ask the user to connect: "I need browser access to [reason]. Please click the spawriter toolbar button to attach your Chrome tab."
+2. Call `reset` to re-establish the connection, then retry.
+3. If still failing, guide the user: check MCP server is running, extension is loaded, tab is a normal web page.
+
+**Proactively request connection** when you anticipate needing browser access — don't wait for a tool call to fail.
+
+## Proactive browser engagement (IMPORTANT)
+
+**You MUST actively use spawriter in these situations — do NOT wait for the user to ask:**
+
+- **User shares a URL or mentions a page** → `navigate` + `screenshot` + `accessibility_snapshot`
+- **User describes a UI problem** → `screenshot` + `console_logs { level: "error" }` + `network_log { status_filter: "error" }`
+- **You need a design/layout reference** → `navigate` to the reference, `screenshot`, study it, navigate back
+- **You just made code changes** → `ensure_fresh_render` → `screenshot` → compare with before
+- **User asks "how does X look?"** → `screenshot { labels: true }` + `accessibility_snapshot`
+- **You're implementing a UI feature** → screenshot before starting, screenshot after each significant change
+- **User mentions an error** → `console_logs` + `network_log` + `screenshot`
+- **You're debugging an API issue** → `network_log` → `network_detail` for headers + body
+- **User says "it doesn't work"** → `screenshot` immediately — see what they see
+- **After setting or changing an override** → `dashboard_state` + `ensure_fresh_render` + `screenshot`
+
+### Verification-after-changes protocol
+
+After modifying UI code, **always** run this sequence automatically:
+
+1. `ensure_fresh_render` (or `clear_cache_and_reload` if cache might be stale)
+2. `screenshot` — capture the result
+3. Compare with expectations; if wrong: `console_logs` + `network_log` to diagnose
+4. Report the visual result to the user
+
+**Never tell the user "please check it" without checking it yourself first.**
+
+### When NOT to use the browser
+
+- Pure backend/algorithmic code with no UI impact
+- User explicitly says they don't want browser interaction
+- Configuration edits that don't affect rendering
 
 ## Recommended workflow
 
