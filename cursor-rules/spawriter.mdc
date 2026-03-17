@@ -211,8 +211,14 @@ playwright_execute { code: "state.formData = await page.inputValue('#email')" }
 playwright_execute { code: "await page.fill('#name', 'Test User')" }
 ```
 
-Use `playwright_execute` for: Playwright locators, form filling, multi-step flows, assertions.
+Use `playwright_execute` for: Playwright locators, form filling, multi-step flows, assertions, file downloads.
 Use `execute` for: quick JS evaluation in page context, reading DOM values, calling page APIs.
+
+**File downloads** — the relay maps `Browser.setDownloadBehavior` to per-page `Page.setDownloadBehavior` and synthesizes `Browser.download*` events, so Playwright downloads work in extension mode:
+
+```
+playwright_execute { code: "const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-btn')]); const path = await download.path(); return path;" }
+```
 
 ### 5. Debug with console and network logs
 
@@ -555,3 +561,4 @@ network_intercept { action: "add_rule", url_pattern: "/api/xml", mock_status: 20
 | `playwright_execute` connection error | Call `reset` then retry; ensure relay server is running |
 | No console/network logs | Logs are captured after CDP connection is established; re-trigger the action |
 | Labeled screenshot shows no labels | Page may have no interactive elements; check `accessibility_snapshot` |
+| Cookie read fails in `playwright_execute` | Use `Network.getCookies` via CDP session, **not** `Storage.getCookies`. In extension relay mode, `Storage.getCookies` is a root-session command and will fail. Example: `const cdp = await page.context().newCDPSession(page); const { cookies } = await cdp.send('Network.getCookies', { urls: [page.url()] });` |

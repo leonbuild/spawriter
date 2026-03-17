@@ -44,6 +44,11 @@ interface AttachedTarget {
   targetInfo?: TargetInfo;
 }
 
+interface DownloadBehavior {
+  behavior: string;
+  downloadPath?: string;
+}
+
 const app = new Hono();
 
 interface ExtensionCmdPending {
@@ -54,6 +59,7 @@ interface ExtensionCmdPending {
 let extensionWs: WebSocket | null = null;
 const cdpClients = new Map<string, CDPClient>();
 const attachedTargets = new Map<string, AttachedTarget>();
+let activeDownloadBehavior: DownloadBehavior | null = null;
 const pendingRequests = new Map<number, PendingRequest>();
 const pendingExtensionCmdRequests = new Map<number, ExtensionCmdPending>();
 let nextExtensionRequestId = 1;
@@ -318,6 +324,61 @@ function sendTargetCreatedEvents(clientId: string): void {
   }
 }
 
+function toPageDownloadParams(dl: DownloadBehavior): { behavior: string; downloadPath?: string } {
+  const pageBehavior = dl.behavior === 'allowAndName' ? 'allow' : dl.behavior;
+  const result: { behavior: string; downloadPath?: string } = { behavior: pageBehavior };
+  if (pageBehavior === 'allow' && dl.downloadPath) {
+    result.downloadPath = dl.downloadPath;
+  }
+  return result;
+}
+
+// Fire-and-forget: responses are intentionally not tracked since download
+// behavior is best-effort and extension CDP may reorder responses.
+function applyDownloadBehaviorToAllPages(dl: DownloadBehavior): void {
+  if (!isExtensionConnected()) return;
+  const pageParams = toPageDownloadParams(dl);
+  for (const target of attachedTargets.values()) {
+    if ((target.targetInfo?.type ?? 'page') === 'page') {
+      const relayId = nextExtensionRequestId++;
+      sendToExtension({
+        id: relayId,
+        method: 'forwardCDPCommand',
+        params: {
+          method: 'Page.setDownloadBehavior',
+          sessionId: target.sessionId,
+          params: pageParams,
+        },
+      });
+    }
+  }
+}
+
+function applyDownloadBehaviorToTarget(targetSessionId: string): void {
+  if (!isExtensionConnected() || !activeDownloadBehavior) return;
+  const pageParams = toPageDownloadParams(activeDownloadBehavior);
+  const relayId = nextExtensionRequestId++;
+  sendToExtension({
+    id: relayId,
+    method: 'forwardCDPCommand',
+    params: {
+      method: 'Page.setDownloadBehavior',
+      sessionId: targetSessionId,
+      params: pageParams,
+    },
+  });
+}
+
+function maybeSynthesizeBrowserDownloadEvent(method: string, params: unknown): void {
+  const browserMethod =
+    method === 'Page.downloadWillBegin' ? 'Browser.downloadWillBegin' :
+    method === 'Page.downloadProgress' ? 'Browser.downloadProgress' :
+    null;
+  if (browserMethod) {
+    broadcastToCDPClients({ method: browserMethod, params });
+  }
+}
+
 function handleServerCdpCommand(
   clientId: string,
   message: { id: number; method: string; params?: Record<string, unknown>; sessionId?: string }
@@ -341,6 +402,19 @@ function handleServerCdpCommand(
     }
 
     case 'Browser.setDownloadBehavior': {
+      const dlParams = params as { behavior?: string; downloadPath?: string } | undefined;
+      if (!dlParams?.behavior) {
+        sendCdpError(clientId, { id, sessionId, error: 'behavior is required for Browser.setDownloadBehavior' });
+        return true;
+      }
+
+      activeDownloadBehavior = {
+        behavior: dlParams.behavior,
+        downloadPath: dlParams.downloadPath,
+      };
+
+      applyDownloadBehaviorToAllPages(dlParams);
+
       sendCdpResponse(clientId, { id, sessionId, result: {} });
       return true;
     }
@@ -452,6 +526,10 @@ function handleExtensionMessage(data: Buffer) {
           targetInfo,
         });
 
+        if ((targetInfo?.type ?? 'page') === 'page') {
+          applyDownloadBehaviorToTarget(sessionId);
+        }
+
         const enrichedTargetInfo = buildTargetInfo(attachedTargets.get(sessionId)!);
         broadcastToCDPClients({
           method,
@@ -472,6 +550,7 @@ function handleExtensionMessage(data: Buffer) {
         }
       }
 
+      maybeSynthesizeBrowserDownloadEvent(method, params);
       broadcastToCDPClients({ method, params, sessionId });
       return;
     }
@@ -658,6 +737,7 @@ export async function startRelayServer(): Promise<void> {
           extensionWs = null;
         }
         attachedTargets.clear();
+        activeDownloadBehavior = null;
         for (const pending of pendingRequests.values()) {
           clearTimeout(pending.timeoutId);
           sendCdpError(pending.clientId, {

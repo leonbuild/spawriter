@@ -160,6 +160,10 @@ import browser from "webextension-polyfill";
 
   function ensureDebuggerEventListener() {
     if (debuggerEventListenerRegistered) return;
+    if (!chrome.debugger?.onEvent || !chrome.debugger?.onDetach) {
+      error("chrome.debugger API not available — extension may lack 'debugger' permission");
+      return;
+    }
 
     chrome.debugger.onEvent.addListener((source, method, params) => {
       const tabId = source?.tabId;
@@ -485,7 +489,7 @@ import browser from "webextension-polyfill";
     updateIcons();
     syncTabGroup();
 
-    if (attachedTabs.size === 0) {
+    if (attachedTabs.size === 0 && ws?.readyState !== WebSocket.OPEN) {
       stopMaintainLoop();
     }
   }
@@ -653,10 +657,14 @@ import browser from "webextension-polyfill";
   }
 
   async function clearCacheAndReload(tabId) {
-    await browser.browsingData.remove(
-      { since: 0 },
-      { cache: true, serviceWorkers: true }
-    );
+    if (browser.browsingData?.remove) {
+      await browser.browsingData.remove(
+        { since: 0 },
+        { cache: true, serviceWorkers: true }
+      );
+    } else {
+      warn("browsingData API not available, skipping cache clear");
+    }
     await browser.tabs.reload(tabId, { bypassCache: true });
     log(`Cleared cache and reloaded tab ${tabId}`);
   }
@@ -664,7 +672,8 @@ import browser from "webextension-polyfill";
   function startMaintainLoop() {
     stopMaintainLoop();
     async function loop() {
-      if (attachedTabs.size === 0) return;
+      const hasWork = attachedTabs.size > 0 || ws?.readyState === WebSocket.OPEN;
+      if (!hasWork) return;
       try {
         await ensureConnection();
         reportConnectionRecovery();
@@ -672,7 +681,8 @@ import browser from "webextension-polyfill";
         reportConnectionFailure(err);
       } finally {
         updateIcons();
-        if (attachedTabs.size > 0) {
+        const shouldContinue = attachedTabs.size > 0 || ws?.readyState === WebSocket.OPEN;
+        if (shouldContinue) {
           maintainLoopTimer = setTimeout(loop, 5000);
         }
       }

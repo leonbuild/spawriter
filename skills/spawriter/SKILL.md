@@ -96,6 +96,14 @@ switch_tab { targetId: "session-work" } → switch back → screenshot → compa
 
 **On switch_tab:** console logs, network entries, intercept rules, debugger state, and snapshot baseline are cleared. Playwright sessions (`session_manager` / `playwright_execute`) are preserved but maintain their own CDP connection — they may not automatically follow the tab switch.
 
+## File downloads via Playwright
+
+The relay maps `Browser.setDownloadBehavior` to per-page `Page.setDownloadBehavior` and synthesizes `Browser.download*` events, so Playwright downloads work in extension mode:
+
+```
+playwright_execute { code: "const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-btn')]); return await download.path();" }
+```
+
 ## Offline UI testing with mock responses
 
 You do NOT need real API servers to test UI. spawriter provides full network interception via `network_intercept`:

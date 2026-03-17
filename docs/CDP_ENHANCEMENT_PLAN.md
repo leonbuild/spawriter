@@ -494,6 +494,33 @@ await sendCdpCommand(session, 'Runtime.enable');
 
 ---
 
+## 附录 A：CDP API 选择决策记录
+
+### A.1 Cookie 读取：Network.getCookies vs Storage.getCookies
+
+**决策**：spawriter 使用 `Network.getCookies` 读取页面 cookie，不使用 `Storage.getCookies`。
+
+**原因**：extension relay 模式下，CDP 命令通过 page session 路由（`chrome.debugger.sendCommand({ tabId })`）。`Storage.getCookies` 是 Browser target（root session）命令，在 page session 上不可用，调用会返回 `No tab found for method Storage.getCookies` 错误。`Network.getCookies` 是 page-level 命令，可正确工作。
+
+**影响范围**：
+- `mcp.ts` 中 `storage` tool 的 `get_cookies` action 使用 `Network.getCookies` ✅
+- `mcp.ts` 中 `clear_cache_and_reload` 的 cookie 枚举使用 `Network.getCookies` ✅
+- `playwright_execute` 中如需操作 cookie，也必须通过 CDP session 的 `Network.getCookies`
+
+**参考**：playwriter issue #66 发现并记录了相同问题。
+
+### A.2 文件下载：Browser.setDownloadBehavior → Page.setDownloadBehavior
+
+**决策**：relay 层将 `Browser.setDownloadBehavior` 映射为 `Page.setDownloadBehavior`，分发到所有已连接的 page target。
+
+**原因**：extension 模式下 CDP 命令通过 page session 路由，`Browser.setDownloadBehavior` 是 Browser target 命令。Playwright 调用此命令时需要 relay 层翻译为等效的 page-level 命令。同时缓存 behavior 配置，使新 attach 的 page 自动继承。合成 `Browser.downloadWillBegin/downloadProgress` 事件确保 Playwright 的 download event 能正常触发。
+
+**注意**：`Browser.setDownloadBehavior` 的 `browserContextId` 参数被忽略。Extension 模式下通常只有一个 browser context，此参数无意义。Relay 会对所有已连接的 page target 统一应用配置。
+
+**参考**：playwriter issue #65 修复实现了相同的 Browser/Page 兼容性桥接。
+
+---
+
 ## 6. 总结
 
 CDP 作为 Chrome 浏览器的底层协议，提供了 50+ 个域、数百个命令。spawriter 当前仅使用了约 8 个域（Network, Runtime, Page, Accessibility, Debugger, CSS, DOM, DOMStorage 部分）。

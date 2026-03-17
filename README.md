@@ -235,6 +235,14 @@ network_intercept { action: "add_rule", url_pattern: "/ads/", block: true }
 
 Use cases: testing error handling UI, empty states, loading states (block request), developing before backend is ready, reproducing specific bugs.
 
+### File downloads via Playwright
+
+The relay bridges `Browser.setDownloadBehavior` to per-page `Page.setDownloadBehavior` and synthesizes `Browser.download*` events, enabling Playwright file downloads in extension mode:
+
+```
+playwright_execute { code: "const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-btn')]); return await download.path();" }
+```
+
 ### Cursor Rules (auto-context for AI agents in Cursor IDE)
 
 In Cursor IDE, `.cursor/rules/*.mdc` files inject MCP usage knowledge into the AI automatically.

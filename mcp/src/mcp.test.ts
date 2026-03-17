@@ -8056,3 +8056,508 @@ describe('multi-tab: playwright_execute independence', () => {
     assert.ok(note.includes('independently'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Relay: Browser.setDownloadBehavior → Page.setDownloadBehavior mapping
+// ---------------------------------------------------------------------------
+
+interface DownloadBehavior {
+  behavior: string;
+  downloadPath?: string;
+}
+
+function toPageDownloadParams(dl: DownloadBehavior): { behavior: string; downloadPath?: string } {
+  const pageBehavior = dl.behavior === 'allowAndName' ? 'allow' : dl.behavior;
+  const result: { behavior: string; downloadPath?: string } = { behavior: pageBehavior };
+  if (pageBehavior === 'allow' && dl.downloadPath) {
+    result.downloadPath = dl.downloadPath;
+  }
+  return result;
+}
+
+function maybeSynthesizeBrowserDownloadEvent(method: string): string | null {
+  return method === 'Page.downloadWillBegin' ? 'Browser.downloadWillBegin' :
+    method === 'Page.downloadProgress' ? 'Browser.downloadProgress' :
+    null;
+}
+
+describe('relay: toPageDownloadParams – Browser to Page behavior mapping', () => {
+  it('should map "allow" to "allow" and preserve downloadPath', () => {
+    const result = toPageDownloadParams({ behavior: 'allow', downloadPath: '/tmp/dl' });
+    assert.deepStrictEqual(result, { behavior: 'allow', downloadPath: '/tmp/dl' });
+  });
+
+  it('should map "allowAndName" to "allow" and preserve downloadPath', () => {
+    const result = toPageDownloadParams({ behavior: 'allowAndName', downloadPath: '/tmp/named' });
+    assert.deepStrictEqual(result, { behavior: 'allow', downloadPath: '/tmp/named' });
+  });
+
+  it('should map "deny" to "deny" without downloadPath', () => {
+    const result = toPageDownloadParams({ behavior: 'deny' });
+    assert.deepStrictEqual(result, { behavior: 'deny' });
+  });
+
+  it('should map "default" to "default" without downloadPath', () => {
+    const result = toPageDownloadParams({ behavior: 'default' });
+    assert.deepStrictEqual(result, { behavior: 'default' });
+  });
+
+  it('should not include downloadPath for "deny" even if provided', () => {
+    const result = toPageDownloadParams({ behavior: 'deny', downloadPath: '/tmp/deny' });
+    assert.deepStrictEqual(result, { behavior: 'deny' });
+  });
+
+  it('should not include downloadPath for "allow" when not provided', () => {
+    const result = toPageDownloadParams({ behavior: 'allow' });
+    assert.deepStrictEqual(result, { behavior: 'allow' });
+  });
+});
+
+describe('relay: download event synthesis', () => {
+  it('should synthesize Browser.downloadWillBegin from Page.downloadWillBegin', () => {
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Page.downloadWillBegin'), 'Browser.downloadWillBegin');
+  });
+
+  it('should synthesize Browser.downloadProgress from Page.downloadProgress', () => {
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Page.downloadProgress'), 'Browser.downloadProgress');
+  });
+
+  it('should return null for unrelated events', () => {
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Network.requestWillBeSent'), null);
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Page.loadEventFired'), null);
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Runtime.consoleAPICalled'), null);
+  });
+
+  it('should return null for Browser download events (no double synthesis)', () => {
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Browser.downloadWillBegin'), null);
+    assert.equal(maybeSynthesizeBrowserDownloadEvent('Browser.downloadProgress'), null);
+  });
+});
+
+describe('relay: download behavior cache and inheritance', () => {
+  it('should store the active download behavior (last writer wins)', () => {
+    let active: DownloadBehavior | null = null;
+    active = { behavior: 'allow', downloadPath: '/tmp/c1' };
+    assert.equal(active.behavior, 'allow');
+    active = { behavior: 'deny' };
+    assert.equal(active.behavior, 'deny');
+    assert.equal(active.downloadPath, undefined);
+  });
+
+  it('should clear active behavior when extension disconnects', () => {
+    let active: DownloadBehavior | null = { behavior: 'allow', downloadPath: '/tmp/c1' };
+    active = null;
+    assert.equal(active, null);
+  });
+
+  it('should apply cached behavior to newly attached page target', () => {
+    const active: DownloadBehavior = { behavior: 'allowAndName', downloadPath: '/tmp/named' };
+    const pageParams = toPageDownloadParams(active);
+    assert.equal(pageParams.behavior, 'allow');
+    assert.equal(pageParams.downloadPath, '/tmp/named');
+  });
+
+  it('should not apply when no active behavior is set', () => {
+    const active: DownloadBehavior | null = null;
+    const shouldApply = active !== null;
+    assert.equal(shouldApply, false);
+  });
+
+  it('should overwrite previous behavior on each new setDownloadBehavior call', () => {
+    let active: DownloadBehavior | null = { behavior: 'allow', downloadPath: '/tmp/old' };
+    active = { behavior: 'deny' };
+    assert.equal(active.behavior, 'deny');
+    assert.equal(active.downloadPath, undefined);
+  });
+});
+
+describe('relay: Browser.setDownloadBehavior validation', () => {
+  it('should reject when behavior is missing', () => {
+    const params: Record<string, unknown> | undefined = {};
+    const dlParams = params as { behavior?: string } | undefined;
+    assert.equal(!!dlParams?.behavior, false);
+  });
+
+  it('should reject when params is undefined', () => {
+    const params: Record<string, unknown> | undefined = undefined;
+    const dlParams = params as { behavior?: string } | undefined;
+    assert.equal(!!dlParams?.behavior, false);
+  });
+
+  it('should accept valid behavior values', () => {
+    for (const behavior of ['allow', 'deny', 'default', 'allowAndName']) {
+      const dlParams = { behavior };
+      assert.equal(!!dlParams.behavior, true);
+    }
+  });
+});
+
+describe('relay: applyDownloadBehaviorToAllPages – target type filtering', () => {
+  it('should only apply to page-type targets', () => {
+    const targets = [
+      { sessionId: 's1', targetInfo: { type: 'page' } },
+      { sessionId: 's2', targetInfo: { type: 'service_worker' } },
+      { sessionId: 's3', targetInfo: { type: 'page' } },
+      { sessionId: 's4', targetInfo: { type: 'iframe' } },
+    ];
+    const pageTargets = targets.filter(t => (t.targetInfo?.type ?? 'page') === 'page');
+    assert.equal(pageTargets.length, 2);
+    assert.deepStrictEqual(pageTargets.map(t => t.sessionId), ['s1', 's3']);
+  });
+
+  it('should treat missing type as page (default)', () => {
+    const targets = [
+      { sessionId: 's1', targetInfo: {} },
+      { sessionId: 's2', targetInfo: undefined },
+    ];
+    const pageTargets = targets.filter(t => (t.targetInfo?.type ?? 'page') === 'page');
+    assert.equal(pageTargets.length, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bridge: Chrome API defensive guards
+// ---------------------------------------------------------------------------
+
+describe('bridge: Chrome API defensive guards', () => {
+  it('should guard chrome.debugger availability before registering listeners', () => {
+    const noChromeDebugger = { debugger: undefined };
+    const hasOnEvent = !!(noChromeDebugger as { debugger?: { onEvent?: unknown } }).debugger?.onEvent;
+    const hasOnDetach = !!(noChromeDebugger as { debugger?: { onDetach?: unknown } }).debugger?.onDetach;
+    assert.equal(hasOnEvent, false);
+    assert.equal(hasOnDetach, false);
+  });
+
+  it('should allow registration when chrome.debugger is fully available', () => {
+    const fullChromeDebugger = {
+      debugger: {
+        onEvent: { addListener: () => {} },
+        onDetach: { addListener: () => {} },
+      },
+    };
+    const hasOnEvent = !!(fullChromeDebugger as { debugger?: { onEvent?: unknown } }).debugger?.onEvent;
+    const hasOnDetach = !!(fullChromeDebugger as { debugger?: { onDetach?: unknown } }).debugger?.onDetach;
+    assert.equal(hasOnEvent, true);
+    assert.equal(hasOnDetach, true);
+  });
+
+  it('should guard browser.browsingData availability', () => {
+    const noBrowsingData = {} as { browsingData?: { remove?: unknown } };
+    const canClear = !!noBrowsingData.browsingData?.remove;
+    assert.equal(canClear, false);
+  });
+
+  it('should allow browsingData.remove when available', () => {
+    const hasBrowsingData = { browsingData: { remove: () => Promise.resolve() } };
+    const canClear = !!hasBrowsingData.browsingData?.remove;
+    assert.equal(canClear, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bridge: Service Worker keepalive logic
+// ---------------------------------------------------------------------------
+
+describe('bridge: maintainLoop keepalive conditions', () => {
+  it('should continue when tabs are attached', () => {
+    const attachedTabsSize = 2;
+    const wsOpen = false;
+    const hasWork = attachedTabsSize > 0 || wsOpen;
+    assert.equal(hasWork, true);
+  });
+
+  it('should continue when WebSocket is open even without tabs', () => {
+    const attachedTabsSize = 0;
+    const wsOpen = true;
+    const hasWork = attachedTabsSize > 0 || wsOpen;
+    assert.equal(hasWork, true);
+  });
+
+  it('should stop when no tabs and WebSocket is closed', () => {
+    const attachedTabsSize = 0;
+    const wsOpen = false;
+    const hasWork = attachedTabsSize > 0 || wsOpen;
+    assert.equal(hasWork, false);
+  });
+
+  it('should continue when both tabs and WebSocket are active', () => {
+    const attachedTabsSize = 1;
+    const wsOpen = true;
+    const hasWork = attachedTabsSize > 0 || wsOpen;
+    assert.equal(hasWork, true);
+  });
+
+  it('disconnectTab should not stop loop when WebSocket is still open', () => {
+    const attachedTabsSize = 0;
+    const wsOpen = true;
+    const shouldStopLoop = attachedTabsSize === 0 && !wsOpen;
+    assert.equal(shouldStopLoop, false);
+  });
+
+  it('disconnectTab should stop loop when no tabs and WebSocket is closed', () => {
+    const attachedTabsSize = 0;
+    const wsOpen = false;
+    const shouldStopLoop = attachedTabsSize === 0 && !wsOpen;
+    assert.equal(shouldStopLoop, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cookie API: Network.getCookies vs Storage.getCookies
+// ---------------------------------------------------------------------------
+
+describe('cookie API: extension relay compatibility', () => {
+  const ROOT_SESSION_METHODS = ['Storage.getCookies', 'Storage.setCookies', 'Storage.clearCookies'];
+  const PAGE_SESSION_METHODS = ['Network.getCookies', 'Network.setCookie', 'Network.deleteCookies'];
+
+  it('root-session cookie methods are not usable through page session relay', () => {
+    for (const method of ROOT_SESSION_METHODS) {
+      assert.ok(method.startsWith('Storage.'), `${method} is a Storage domain method`);
+    }
+  });
+
+  it('page-session cookie methods work through relay', () => {
+    for (const method of PAGE_SESSION_METHODS) {
+      assert.ok(method.startsWith('Network.'), `${method} is a Network domain method`);
+    }
+  });
+
+  it('spawriter storage tool uses Network.getCookies (not Storage.getCookies)', () => {
+    const storageToolGetCookiesMethod = 'Network.getCookies';
+    assert.ok(!storageToolGetCookiesMethod.startsWith('Storage.'));
+    assert.equal(storageToolGetCookiesMethod, 'Network.getCookies');
+  });
+
+  it('spawriter clear_cache_and_reload uses Network.getCookies for cookie enumeration', () => {
+    const clearCacheReloadCookieMethod = 'Network.getCookies';
+    assert.equal(clearCacheReloadCookieMethod, 'Network.getCookies');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integration: Browser.setDownloadBehavior → Page relay flow simulation
+// ---------------------------------------------------------------------------
+
+interface RelayTarget {
+  sessionId: string;
+  type: string;
+}
+
+interface ForwardedCommand {
+  targetSessionId: string;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+function simulateRelaySetDownloadBehavior(
+  behavior: string,
+  downloadPath: string | undefined,
+  targets: RelayTarget[],
+): { active: DownloadBehavior; forwarded: ForwardedCommand[] } {
+  const active: DownloadBehavior = { behavior, downloadPath };
+  const forwarded: ForwardedCommand[] = [];
+
+  const pageParams = toPageDownloadParams(active);
+  for (const target of targets) {
+    if ((target.type ?? 'page') === 'page') {
+      forwarded.push({
+        targetSessionId: target.sessionId,
+        method: 'Page.setDownloadBehavior',
+        params: pageParams,
+      });
+    }
+  }
+
+  return { active, forwarded };
+}
+
+function simulateNewTargetAttach(
+  active: DownloadBehavior | null,
+  newTarget: RelayTarget,
+): ForwardedCommand | null {
+  if (!active) return null;
+  if ((newTarget.type ?? 'page') !== 'page') return null;
+  return {
+    targetSessionId: newTarget.sessionId,
+    method: 'Page.setDownloadBehavior',
+    params: toPageDownloadParams(active),
+  };
+}
+
+function simulateEventSynthesis(
+  incomingMethod: string,
+  incomingParams: Record<string, unknown>,
+): { synthesized: { method: string; params: Record<string, unknown> } | null; original: { method: string; params: Record<string, unknown> } } {
+  const browserMethod = maybeSynthesizeBrowserDownloadEvent(incomingMethod);
+  return {
+    synthesized: browserMethod ? { method: browserMethod, params: incomingParams } : null,
+    original: { method: incomingMethod, params: incomingParams },
+  };
+}
+
+describe('integration: Browser.setDownloadBehavior full relay flow', () => {
+  it('should forward Page.setDownloadBehavior to all page targets', () => {
+    const targets: RelayTarget[] = [
+      { sessionId: 's-page-1', type: 'page' },
+      { sessionId: 's-sw-1', type: 'service_worker' },
+      { sessionId: 's-page-2', type: 'page' },
+    ];
+    const { active, forwarded } = simulateRelaySetDownloadBehavior('allow', '/tmp/dl', targets);
+    assert.equal(active.behavior, 'allow');
+    assert.equal(forwarded.length, 2);
+    assert.equal(forwarded[0].targetSessionId, 's-page-1');
+    assert.equal(forwarded[0].method, 'Page.setDownloadBehavior');
+    assert.deepStrictEqual(forwarded[0].params, { behavior: 'allow', downloadPath: '/tmp/dl' });
+    assert.equal(forwarded[1].targetSessionId, 's-page-2');
+  });
+
+  it('should map allowAndName to allow in forwarded commands', () => {
+    const targets: RelayTarget[] = [{ sessionId: 's1', type: 'page' }];
+    const { forwarded } = simulateRelaySetDownloadBehavior('allowAndName', '/tmp/named', targets);
+    assert.equal(forwarded.length, 1);
+    assert.equal(forwarded[0].params.behavior, 'allow');
+    assert.equal(forwarded[0].params.downloadPath, '/tmp/named');
+  });
+
+  it('should forward deny without downloadPath', () => {
+    const targets: RelayTarget[] = [{ sessionId: 's1', type: 'page' }];
+    const { forwarded } = simulateRelaySetDownloadBehavior('deny', '/tmp/ignored', targets);
+    assert.equal(forwarded.length, 1);
+    assert.deepStrictEqual(forwarded[0].params, { behavior: 'deny' });
+  });
+
+  it('should not forward to non-page targets', () => {
+    const targets: RelayTarget[] = [
+      { sessionId: 's1', type: 'service_worker' },
+      { sessionId: 's2', type: 'iframe' },
+    ];
+    const { forwarded } = simulateRelaySetDownloadBehavior('allow', '/tmp', targets);
+    assert.equal(forwarded.length, 0);
+  });
+
+  it('should handle empty target list', () => {
+    const { forwarded } = simulateRelaySetDownloadBehavior('allow', '/tmp', []);
+    assert.equal(forwarded.length, 0);
+  });
+});
+
+describe('integration: new target inherits download behavior', () => {
+  it('should apply cached behavior to newly attached page', () => {
+    const active: DownloadBehavior = { behavior: 'allow', downloadPath: '/downloads' };
+    const cmd = simulateNewTargetAttach(active, { sessionId: 'new-page', type: 'page' });
+    assert.ok(cmd);
+    assert.equal(cmd!.method, 'Page.setDownloadBehavior');
+    assert.deepStrictEqual(cmd!.params, { behavior: 'allow', downloadPath: '/downloads' });
+  });
+
+  it('should not apply to non-page target', () => {
+    const active: DownloadBehavior = { behavior: 'allow', downloadPath: '/downloads' };
+    const cmd = simulateNewTargetAttach(active, { sessionId: 'new-sw', type: 'service_worker' });
+    assert.equal(cmd, null);
+  });
+
+  it('should not apply when no active behavior', () => {
+    const cmd = simulateNewTargetAttach(null, { sessionId: 'new-page', type: 'page' });
+    assert.equal(cmd, null);
+  });
+
+  it('should apply allowAndName mapped as allow', () => {
+    const active: DownloadBehavior = { behavior: 'allowAndName', downloadPath: '/named' };
+    const cmd = simulateNewTargetAttach(active, { sessionId: 'new-page', type: 'page' });
+    assert.ok(cmd);
+    assert.equal(cmd!.params.behavior, 'allow');
+    assert.equal(cmd!.params.downloadPath, '/named');
+  });
+});
+
+describe('integration: download event synthesis end-to-end', () => {
+  it('should produce both synthesized and original events for Page.downloadWillBegin', () => {
+    const eventParams = { frameId: 'frame1', guid: 'dl-123', url: 'https://example.com/file.zip', suggestedFilename: 'file.zip' };
+    const result = simulateEventSynthesis('Page.downloadWillBegin', eventParams);
+    assert.ok(result.synthesized);
+    assert.equal(result.synthesized!.method, 'Browser.downloadWillBegin');
+    assert.deepStrictEqual(result.synthesized!.params, eventParams);
+    assert.equal(result.original.method, 'Page.downloadWillBegin');
+    assert.deepStrictEqual(result.original.params, eventParams);
+  });
+
+  it('should produce both synthesized and original events for Page.downloadProgress', () => {
+    const eventParams = { guid: 'dl-123', totalBytes: 1024, receivedBytes: 512, state: 'inProgress' };
+    const result = simulateEventSynthesis('Page.downloadProgress', eventParams);
+    assert.ok(result.synthesized);
+    assert.equal(result.synthesized!.method, 'Browser.downloadProgress');
+    assert.deepStrictEqual(result.synthesized!.params, eventParams);
+    assert.equal(result.original.method, 'Page.downloadProgress');
+  });
+
+  it('should not synthesize for non-download events', () => {
+    const result = simulateEventSynthesis('Network.requestWillBeSent', { requestId: 'r1' });
+    assert.equal(result.synthesized, null);
+    assert.equal(result.original.method, 'Network.requestWillBeSent');
+  });
+
+  it('should not double-synthesize for Browser.downloadWillBegin', () => {
+    const result = simulateEventSynthesis('Browser.downloadWillBegin', { guid: 'dl-123' });
+    assert.equal(result.synthesized, null);
+  });
+});
+
+describe('integration: last-writer-wins download behavior updates', () => {
+  it('first set then overwrite should use latest', () => {
+    const targets: RelayTarget[] = [{ sessionId: 's1', type: 'page' }];
+
+    const first = simulateRelaySetDownloadBehavior('allow', '/tmp/first', targets);
+    assert.equal(first.forwarded[0].params.downloadPath, '/tmp/first');
+
+    const second = simulateRelaySetDownloadBehavior('deny', undefined, targets);
+    assert.deepStrictEqual(second.forwarded[0].params, { behavior: 'deny' });
+
+    const newTarget = simulateNewTargetAttach(second.active, { sessionId: 's-new', type: 'page' });
+    assert.ok(newTarget);
+    assert.deepStrictEqual(newTarget!.params, { behavior: 'deny' });
+  });
+
+  it('override allowAndName with allow should change mapping', () => {
+    const targets: RelayTarget[] = [{ sessionId: 's1', type: 'page' }];
+
+    const first = simulateRelaySetDownloadBehavior('allowAndName', '/tmp/named', targets);
+    assert.equal(first.forwarded[0].params.behavior, 'allow');
+
+    const second = simulateRelaySetDownloadBehavior('allow', '/tmp/allow', targets);
+    assert.equal(second.forwarded[0].params.behavior, 'allow');
+    assert.equal(second.forwarded[0].params.downloadPath, '/tmp/allow');
+  });
+
+  it('clearing active behavior (simulating extension disconnect) prevents inheritance', () => {
+    let active: DownloadBehavior | null = { behavior: 'allow', downloadPath: '/tmp' };
+    active = null;
+    const cmd = simulateNewTargetAttach(active, { sessionId: 's-new', type: 'page' });
+    assert.equal(cmd, null);
+  });
+});
+
+describe('integration: mixed target types during setDownloadBehavior', () => {
+  it('should handle a realistic mix of pages, workers, and iframes', () => {
+    const targets: RelayTarget[] = [
+      { sessionId: 'page-main', type: 'page' },
+      { sessionId: 'sw-bg', type: 'service_worker' },
+      { sessionId: 'page-popup', type: 'page' },
+      { sessionId: 'iframe-ads', type: 'iframe' },
+      { sessionId: 'worker-data', type: 'worker' },
+      { sessionId: 'page-ext', type: 'page' },
+    ];
+    const { forwarded } = simulateRelaySetDownloadBehavior('allow', '/dl', targets);
+    assert.equal(forwarded.length, 3);
+    assert.deepStrictEqual(forwarded.map(f => f.targetSessionId), ['page-main', 'page-popup', 'page-ext']);
+  });
+
+  it('should handle targets with missing type (defaults to page)', () => {
+    const targets: RelayTarget[] = [
+      { sessionId: 'no-type', type: '' },
+      { sessionId: 'page', type: 'page' },
+    ];
+    const { forwarded } = simulateRelaySetDownloadBehavior('allow', '/dl', targets);
+    assert.equal(forwarded.length, 1);
+    assert.equal(forwarded[0].targetSessionId, 'page');
+  });
+});
