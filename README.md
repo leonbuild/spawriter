@@ -185,12 +185,59 @@ Configure your AI client to point to `mcp/dist/cli.js serve`. Example:
 
 ### Multi-tab support
 
-The extension can attach to multiple Chrome tabs simultaneously (click the toolbar button on each tab). The MCP server provides two tools for tab management:
+The extension can attach to multiple Chrome tabs simultaneously (click the toolbar button on each tab). The MCP server provides tools for tab management:
 
 - `list_tabs` — list all attached tabs with session IDs, titles, URLs, and which tab is active
 - `switch_tab` — switch the CDP session to a different attached tab (clears console/network/intercept/debugger state; Playwright sessions are preserved)
+- `connect_tab` — programmatically attach a tab by URL match, tab ID, or create a new one
+- `release_tab` — release your lease on a tab, making it available to other agents
 
 After switching, all tools (`screenshot`, `execute`, `dashboard_state`, etc.) operate on the new tab.
+
+### Multi-agent support (Tab Lease System)
+
+When multiple AI agents (e.g., two Cursor windows) share the same relay server, spawriter automatically isolates their tab access:
+
+- Each MCP server process gets a unique client ID
+- Agents acquire exclusive leases on tabs; the relay enforces ownership
+- CDP events are routed only to the lease holder, preventing cross-agent interference
+- Leases auto-release on agent disconnect or tab closure
+
+#### Environment variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `SSPA_AGENT_LABEL` | Human-readable label for the agent | `"frontend-team"` |
+| `SSPA_PROJECT_URL` | URL substring for automatic tab matching | `"localhost:8080"` |
+
+#### MCP client configuration (multi-agent)
+
+```json
+{
+  "mcpServers": {
+    "spawriter-agent1": {
+      "command": "node",
+      "args": ["D:/dev/side/spawriter/mcp/dist/cli.js", "serve"],
+      "env": {
+        "SSPA_AGENT_LABEL": "agent-1",
+        "SSPA_PROJECT_URL": "localhost:8080"
+      }
+    },
+    "spawriter-agent2": {
+      "command": "node",
+      "args": ["D:/dev/side/spawriter/mcp/dist/cli.js", "serve"],
+      "env": {
+        "SSPA_AGENT_LABEL": "agent-2",
+        "SSPA_PROJECT_URL": "localhost:9090"
+      }
+    }
+  }
+}
+```
+
+Agents automatically negotiate tab ownership on startup. Use `list_tabs` to see lease status, `connect_tab` to attach new tabs, and `release_tab` to free tabs for other agents.
+
+Single-agent setups work exactly as before — no configuration changes needed.
 
 ### MCP tools
 
@@ -219,6 +266,8 @@ After switching, all tools (`screenshot`, `execute`, `dashboard_state`, etc.) op
 | `clear_cache_and_reload` | Clear browser cache/storage with granular control and reload |
 | `list_tabs` | List all attached Chrome tabs (session ID, title, URL, active) |
 | `switch_tab` | Switch CDP session to a different attached Chrome tab |
+| `connect_tab` | Programmatically attach a Chrome tab by URL, tab ID, or create new |
+| `release_tab` | Release your tab lease, making it available to other agents |
 | `session_manager` | Manage multiple Playwright executor sessions |
 | `reset` | Reset the MCP connection |
 
@@ -311,6 +360,7 @@ Following the "CLI + MCP + Skill" pattern pioneered by [`remorses/playwriter`](h
 - `doc/CHROME_INSTALL_TEST_GUIDE.md`
 - `doc/MCP_DEV_GUIDE.md`
 - `doc/PUBLISH_GUIDE.md`
+- `docs/MULTI_AGENT_TAB_LEASE_DESIGN.md`
 
 ---
 

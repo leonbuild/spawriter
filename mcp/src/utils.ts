@@ -54,3 +54,15 @@ export function log(...args: unknown[]): void {
 export function error(...args: unknown[]): void {
   process.stderr.write(`[SPAWRITER ERROR] ${new Date().toISOString()} ${args.map(String).join(' ')}\n`);
 }
+
+export function getAgentLabel(): string | undefined {
+  return getEnv('SSPA_AGENT_LABEL') || undefined;
+}
+
+export function getProjectUrl(): string | undefined {
+  return getEnv('SSPA_PROJECT_URL') || undefined;
+}
+
+export function generateMcpClientId(): string {
+  return `mcp-${process.pid}-${Date.now().toString(36)}`;
+}

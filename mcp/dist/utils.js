@@ -41,4 +41,13 @@ export function log(...args) {
 export function error(...args) {
     process.stderr.write(`[SPAWRITER ERROR] ${new Date().toISOString()} ${args.map(String).join(' ')}\n`);
 }
+export function getAgentLabel() {
+    return getEnv('SSPA_AGENT_LABEL') || undefined;
+}
+export function getProjectUrl() {
+    return getEnv('SSPA_PROJECT_URL') || undefined;
+}
+export function generateMcpClientId() {
+    return `mcp-${process.pid}-${Date.now().toString(36)}`;
+}
 //# sourceMappingURL=utils.js.map

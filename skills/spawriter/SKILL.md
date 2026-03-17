@@ -79,6 +79,8 @@ After modifying UI code, **always** run this sequence automatically:
 
 ## Tab scope & cross-page comparison
 
+> In multi-agent setups, each agent can only operate on tabs it has leased. See "Multi-agent tab isolation" below.
+
 spawriter can work with **multiple attached Chrome tabs** using `list_tabs` and `switch_tab`. The user attaches tabs via the toolbar button; the agent switches between them.
 
 - `list_tabs` — shows all attached tabs (session ID, tab ID, title, URL, active indicator)
@@ -117,6 +119,31 @@ You do NOT need real API servers to test UI. spawriter provides full network int
 Always `network_intercept { action: "enable" }` before adding rules, and `network_intercept { action: "disable" }` when done.
 
 Use mock testing when: backend is unavailable, testing error handling UI, testing edge cases, reproducing specific bugs, or testing loading/skeleton states.
+
+## Multi-agent tab isolation
+
+When multiple AI agents share the same relay server, spawriter's Tab Lease System ensures each agent gets its own tab(s):
+
+- Each agent process gets a unique client ID; the relay enforces exclusive tab leases
+- CDP events are routed only to the lease holder — no cross-agent pollution
+- Leases auto-release on disconnect or tab close
+
+**Environment variables** (set in MCP client config):
+- `SSPA_AGENT_LABEL` — human-readable name shown in `list_tabs` (e.g., `"frontend-agent"`)
+- `SSPA_PROJECT_URL` — URL substring for automatic tab matching (e.g., `"localhost:8080"`)
+
+**New tools for multi-agent:**
+- `connect_tab { url: "..." }` — attach a tab by URL match, or `connect_tab { url: "...", create: true }` to create one
+- `release_tab` — release lease on current tab; `release_tab { targetId: "..." }` for specific tab
+
+**Enhanced tools:**
+- `list_tabs` — now shows `MINE`, `LEASED by <label>`, `AVAILABLE` markers with summary counts
+- `switch_tab` — lease-aware: rejects switching to tabs leased by others
+- `reset` — releases all leases before resetting connections
+
+**Session negotiation is automatic:** the agent reconnects to its own leased tab, finds unleased tabs matching `SSPA_PROJECT_URL`, auto-attaches by URL, or reports all-leased status with guidance.
+
+**Backward compatible:** single-agent setups work unchanged; old relays are detected and fall back gracefully.
 
 ## Safety rules
 

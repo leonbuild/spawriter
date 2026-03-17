@@ -330,7 +330,7 @@ import browser from "webextension-polyfill";
           return;
         }
 
-        if (message.method === "connectActiveTab") {
+        if (message.method === "connectActiveTab" || message.method === "connectTabByMatch") {
           handleRelayMessage(message)
             .then((result) => sendMessage({ id: message.id, ...result }))
             .catch((e) => sendMessage({ id: message.id, success: false, error: e.message }));
@@ -701,6 +701,63 @@ import browser from "webextension-polyfill";
     if (message.method === "connectActiveTab") {
       const tabId = await ensureActiveTabAttached();
       return { success: true, tabId };
+    }
+
+    if (message.method === "connectTabByMatch") {
+      const { url, tabId, create } = message.params || {};
+
+      if (tabId) {
+        try {
+          const tab = await browser.tabs.get(tabId);
+          if (isRestrictedUrl(tab?.url)) {
+            return { success: false, error: `Cannot attach restricted URL: ${tab.url}` };
+          }
+          if (!attachedTabs.has(tabId)) {
+            await connectTab(tabId);
+          }
+          return { success: true, tabId };
+        } catch (e) {
+          return { success: false, error: `Tab ${tabId} not found: ${e.message}` };
+        }
+      }
+
+      if (url) {
+        const allTabs = await browser.tabs.query({});
+        let match = allTabs.find(
+          (t) => t.url && t.url.includes(url) && !isRestrictedUrl(t.url)
+        );
+        if (!match) {
+          match = allTabs.find(
+            (t) =>
+              t.title &&
+              t.title.toLowerCase().includes(url.toLowerCase()) &&
+              !isRestrictedUrl(t.url)
+          );
+        }
+
+        if (match) {
+          if (!attachedTabs.has(match.id)) {
+            await connectTab(match.id);
+          }
+          return { success: true, tabId: match.id };
+        }
+
+        if (create) {
+          const fullUrl = url.startsWith("http") ? url : `https://${url}`;
+          const newTab = await browser.tabs.create({ url: fullUrl, active: false });
+          await sleep(1500);
+          await connectTab(newTab.id);
+          return { success: true, tabId: newTab.id, created: true };
+        }
+
+        return {
+          success: false,
+          error: `No tab matching "${url}" found. Set create: true to create one.`,
+        };
+      }
+
+      const activeTabId = await ensureActiveTabAttached();
+      return { success: true, tabId: activeTabId };
     }
 
     if (message.method === "clearCacheAndReload") {

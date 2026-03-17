@@ -58,4 +58,19 @@ export interface CDPEvent {
     method: string;
     params?: Record<string, unknown>;
 }
+export interface LeaseInfo {
+    clientId: string;
+    label?: string;
+    acquiredAt: number;
+}
+export interface TargetWithLease {
+    id: string;
+    tabId?: number;
+    type: string;
+    title: string;
+    url: string;
+    webSocketDebuggerUrl: string;
+    lease: LeaseInfo | null;
+}
+export declare const LEASE_ERROR_CODE = -32001;
 //# sourceMappingURL=protocol.d.ts.map

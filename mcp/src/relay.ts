@@ -16,7 +16,9 @@ import type {
   ExtensionEventMessage,
   ExtensionLogMessage,
   ExtensionMessage,
+  LeaseInfo,
 } from './protocol.js';
+import { LEASE_ERROR_CODE } from './protocol.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -64,6 +66,42 @@ const pendingRequests = new Map<number, PendingRequest>();
 const pendingExtensionCmdRequests = new Map<number, ExtensionCmdPending>();
 let nextExtensionRequestId = 1;
 
+// ---------------------------------------------------------------------------
+// Tab Lease System — multi-agent tab isolation
+// ---------------------------------------------------------------------------
+
+interface TabLease {
+  sessionId: string;
+  clientId: string;
+  label?: string;
+  acquiredAt: number;
+}
+
+const tabLeases = new Map<string, TabLease>();
+
+function getLeaseInfo(sessionId: string): LeaseInfo | null {
+  const lease = tabLeases.get(sessionId);
+  if (!lease) return null;
+  return { clientId: lease.clientId, label: lease.label, acquiredAt: lease.acquiredAt };
+}
+
+function releaseClientLeases(clientId: string, reason: string): void {
+  for (const [sid, lease] of tabLeases) {
+    if (lease.clientId === clientId) {
+      tabLeases.delete(sid);
+      log(`Auto-released lease on ${sid} (${reason})`);
+      broadcastToCDPClients({
+        method: 'Target.leaseReleased',
+        params: { sessionId: sid, reason },
+      });
+    }
+  }
+}
+
+function isPlaywrightClient(clientId: string): boolean {
+  return clientId.startsWith('pw-');
+}
+
 const ALLOWED_EXTENSION_IDS = getAllowedExtensionIds();
 const ALLOW_ANY_EXTENSION = ALLOWED_EXTENSION_IDS.length === 0;
 
@@ -106,6 +144,43 @@ app.post('/connect-active-tab', async (c) => {
   });
 });
 
+app.post('/connect-tab', async (c) => {
+  if (!isExtensionConnected()) {
+    return c.json({ success: false, error: 'Extension not connected' }, 503);
+  }
+
+  const body = await c.req.json<{ url?: string; tabId?: number; create?: boolean }>().catch(() => ({}));
+
+  return new Promise<Response>((resolve) => {
+    const relayId = nextExtensionRequestId++;
+    const timeoutId = setTimeout(() => {
+      pendingExtensionCmdRequests.delete(relayId);
+      resolve(c.json({ success: false, error: 'Timeout waiting for extension' }, 504));
+    }, 20000);
+
+    const mockWs = {
+      send(data: string) {
+        clearTimeout(timeoutId);
+        pendingExtensionCmdRequests.delete(relayId);
+        try {
+          resolve(c.json(JSON.parse(data)));
+        } catch {
+          resolve(c.json({ success: false, error: 'Invalid response' }, 500));
+        }
+      },
+      readyState: 1,
+    } as unknown as WebSocket;
+
+    pendingExtensionCmdRequests.set(relayId, { ws: mockWs, timeoutId });
+
+    sendToExtension({
+      id: relayId,
+      method: 'connectTabByMatch',
+      params: body,
+    });
+  });
+});
+
 app.get('/version', (c) => {
   return c.json({ version: VERSION });
 });
@@ -129,6 +204,7 @@ app.get('/json/list', (c) => {
       title: targetInfo.title ?? '',
       url: targetInfo.url ?? '',
       webSocketDebuggerUrl: getCdpUrl(getRelayPort(), target.sessionId),
+      lease: getLeaseInfo(target.sessionId),
     };
   });
   return c.json(targets);
@@ -413,7 +489,7 @@ function handleServerCdpCommand(
         downloadPath: dlParams.downloadPath,
       };
 
-      applyDownloadBehaviorToAllPages(dlParams);
+      applyDownloadBehaviorToAllPages(activeDownloadBehavior);
 
       sendCdpResponse(clientId, { id, sessionId, result: {} });
       return true;
@@ -439,6 +515,7 @@ function handleServerCdpCommand(
       const targetInfos = Array.from(attachedTargets.values()).map((target) => ({
         ...buildTargetInfo(target),
         attached: true,
+        lease: getLeaseInfo(target.sessionId),
       }));
       sendCdpResponse(clientId, { id, sessionId, result: { targetInfos } });
       return true;
@@ -493,6 +570,97 @@ function handleServerCdpCommand(
       return true;
     }
 
+    // -----------------------------------------------------------------------
+    // Tab Lease commands
+    // -----------------------------------------------------------------------
+
+    case 'Target.acquireLease': {
+      const leaseSessionId = (params as { sessionId?: string } | undefined)?.sessionId;
+      const leaseLabel = (params as { label?: string } | undefined)?.label;
+
+      if (!leaseSessionId) {
+        sendCdpError(clientId, { id, sessionId, error: 'Target.acquireLease requires params.sessionId' });
+        return true;
+      }
+
+      if (!attachedTargets.has(leaseSessionId)) {
+        sendCdpError(clientId, { id, sessionId, error: `Target ${leaseSessionId} not found` });
+        return true;
+      }
+
+      const existing = tabLeases.get(leaseSessionId);
+      if (existing && existing.clientId !== clientId) {
+        const holderDesc = existing.label ? `"${existing.label}" (${existing.clientId})` : existing.clientId;
+        sendToCDPClient(clientId, {
+          id,
+          sessionId,
+          error: {
+            code: LEASE_ERROR_CODE,
+            message: `Tab is leased by ${holderDesc}`,
+          },
+          holder: { clientId: existing.clientId, label: existing.label },
+        });
+        return true;
+      }
+
+      const lease: TabLease = {
+        sessionId: leaseSessionId,
+        clientId,
+        label: leaseLabel,
+        acquiredAt: Date.now(),
+      };
+      tabLeases.set(leaseSessionId, lease);
+      log(`Lease granted: ${leaseSessionId} → ${clientId}${leaseLabel ? ` (${leaseLabel})` : ''}`);
+
+      sendCdpResponse(clientId, {
+        id,
+        sessionId,
+        result: { granted: true, lease: getLeaseInfo(leaseSessionId) },
+      });
+      return true;
+    }
+
+    case 'Target.releaseLease': {
+      const releaseSessionId = (params as { sessionId?: string } | undefined)?.sessionId;
+
+      if (!releaseSessionId) {
+        sendCdpError(clientId, { id, sessionId, error: 'Target.releaseLease requires params.sessionId' });
+        return true;
+      }
+
+      const existing = tabLeases.get(releaseSessionId);
+      if (!existing) {
+        sendCdpResponse(clientId, { id, sessionId, result: { released: true } });
+        return true;
+      }
+
+      if (existing.clientId !== clientId) {
+        sendCdpError(clientId, { id, sessionId, error: 'Not the lease holder' });
+        return true;
+      }
+
+      tabLeases.delete(releaseSessionId);
+      log(`Lease released: ${releaseSessionId} by ${clientId}`);
+      broadcastToCDPClients({
+        method: 'Target.leaseReleased',
+        params: { sessionId: releaseSessionId, reason: 'explicit-release' },
+      });
+
+      sendCdpResponse(clientId, { id, sessionId, result: { released: true } });
+      return true;
+    }
+
+    case 'Target.listLeases': {
+      const leases = Array.from(tabLeases.values()).map(l => ({
+        sessionId: l.sessionId,
+        clientId: l.clientId,
+        label: l.label,
+        acquiredAt: l.acquiredAt,
+      }));
+      sendCdpResponse(clientId, { id, sessionId, result: { leases } });
+      return true;
+    }
+
     default:
       return false;
   }
@@ -540,6 +708,17 @@ function handleExtensionMessage(data: Buffer) {
           },
           sessionId,
         });
+
+        broadcastToCDPClients({
+          method: 'Target.tabAvailable',
+          params: {
+            sessionId,
+            targetInfo: enrichedTargetInfo,
+            totalAttached: attachedTargets.size,
+            totalLeased: tabLeases.size,
+            totalAvailable: attachedTargets.size - tabLeases.size,
+          },
+        });
         return;
       }
 
@@ -547,11 +726,20 @@ function handleExtensionMessage(data: Buffer) {
         const detachedSessionId = (params as { sessionId?: string }).sessionId;
         if (detachedSessionId) {
           attachedTargets.delete(detachedSessionId);
+          const lease = tabLeases.get(detachedSessionId);
+          if (lease) {
+            tabLeases.delete(detachedSessionId);
+            log(`Lease cleaned up for detached tab ${detachedSessionId}`);
+            sendToCDPClient(lease.clientId, {
+              method: 'Target.leaseLost',
+              params: { sessionId: detachedSessionId, reason: 'tab-detached' },
+            });
+          }
         }
       }
 
       maybeSynthesizeBrowserDownloadEvent(method, params);
-      broadcastToCDPClients({ method, params, sessionId });
+      routeCdpEvent(method, params, sessionId);
       return;
     }
 
@@ -589,6 +777,38 @@ function handleExtensionMessage(data: Buffer) {
   }
 }
 
+function checkLeaseEnforcement(clientId: string, sessionId: string | undefined, id: number): boolean {
+  if (!sessionId || isPlaywrightClient(clientId)) return true;
+
+  const lease = tabLeases.get(sessionId);
+  if (!lease) return true;
+
+  if (lease.clientId !== clientId) {
+    const holderDesc = lease.label ? `"${lease.label}" (${lease.clientId})` : lease.clientId;
+    sendCdpError(clientId, {
+      id,
+      sessionId,
+      error: `Tab is leased by ${holderDesc}. Acquire a different tab or wait for release.`,
+    });
+    return false;
+  }
+  return true;
+}
+
+function routeCdpEvent(method: string, params: unknown, sessionId?: string): void {
+  if (sessionId && tabLeases.has(sessionId)) {
+    const lease = tabLeases.get(sessionId)!;
+    sendToCDPClient(lease.clientId, { method, params, sessionId });
+    for (const [cid, client] of cdpClients) {
+      if (isPlaywrightClient(cid) && client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(JSON.stringify({ method, params, sessionId }));
+      }
+    }
+    return;
+  }
+  broadcastToCDPClients({ method, params, sessionId });
+}
+
 function handleCDPMessage(data: Buffer, clientId: string) {
   try {
     const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
@@ -600,6 +820,9 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       if (!params || id === undefined) {
         return;
       }
+
+      if (!checkLeaseEnforcement(clientId, params.sessionId, id)) return;
+
       const relayId = nextExtensionRequestId++;
       if (!isExtensionConnected()) {
         sendCdpError(clientId, {
@@ -639,6 +862,8 @@ function handleCDPMessage(data: Buffer, clientId: string) {
     if (serverHandled) {
       return;
     }
+
+    if (!checkLeaseEnforcement(clientId, sessionId, id)) return;
 
     const relayId = nextExtensionRequestId++;
     if (!isExtensionConnected()) {
@@ -736,6 +961,15 @@ export async function startRelayServer(): Promise<void> {
         if (extensionWs === ws) {
           extensionWs = null;
         }
+
+        for (const [sid, lease] of tabLeases) {
+          sendToCDPClient(lease.clientId, {
+            method: 'Target.leaseLost',
+            params: { sessionId: sid, reason: 'extension-disconnected' },
+          });
+        }
+        tabLeases.clear();
+
         attachedTargets.clear();
         activeDownloadBehavior = null;
         for (const pending of pendingRequests.values()) {
@@ -788,6 +1022,7 @@ export async function startRelayServer(): Promise<void> {
       ws.on('close', () => {
         log(`CDP WebSocket disconnected: ${clientId}`);
         cdpClients.delete(clientId);
+        releaseClientLeases(clientId, `client ${clientId} disconnected`);
         for (const [requestId, pending] of pendingRequests.entries()) {
           if (pending.clientId === clientId) {
             clearTimeout(pending.timeoutId);

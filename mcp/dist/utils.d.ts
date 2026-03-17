@@ -10,4 +10,7 @@ export declare function getExtensionUrl(port: number): string;
 export declare function isLocalhost(address: string): boolean;
 export declare function log(...args: unknown[]): void;
 export declare function error(...args: unknown[]): void;
+export declare function getAgentLabel(): string | undefined;
+export declare function getProjectUrl(): string | undefined;
+export declare function generateMcpClientId(): string;
 //# sourceMappingURL=utils.d.ts.map

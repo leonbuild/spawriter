@@ -12,7 +12,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 **You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it.
 
-## Available Tools (25)
+## Available Tools (27)
 
 ### Inspection & State
 
@@ -89,15 +89,17 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 | Tool | Description | Key Args |
 |------|-------------|----------|
-| `list_tabs` | List all attached Chrome tabs with session IDs, titles, URLs, and active indicator | — |
-| `switch_tab` | Switch CDP session to a different attached Chrome tab | `targetId` (session ID from `list_tabs`) |
+| `list_tabs` | List all attached Chrome tabs with lease ownership status (MINE, LEASED by X, AVAILABLE), session IDs, titles, URLs | — |
+| `switch_tab` | Switch CDP session to a different attached Chrome tab (lease-aware: rejects if leased by another agent) | `targetId` (session ID from `list_tabs`) |
+| `connect_tab` | Programmatically attach a Chrome tab by URL match, tab ID, or create a new tab | `url?`, `tabId?`, `create?` (boolean) |
+| `release_tab` | Release your lease on a tab, making it available to other agents | `targetId?` |
 
 ### Session & Connection
 
 | Tool | Description | Key Args |
 |------|-------------|----------|
 | `session_manager` | Manage multiple Playwright executor sessions | `action`: `list` / `create` / `switch` / `remove` / `remove_all`; `sessionId?` |
-| `reset` | Reset CDP + Playwright connections, clear all logs/network/debugger/sessions | — |
+| `reset` | Release all tab leases, reset CDP + Playwright connections, clear all logs/network/debugger/sessions | — |
 
 ---
 
@@ -379,6 +381,8 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 
 ## Tab Scope & Cross-Page Comparison
 
+> **Multi-agent note:** In multi-agent environments, tab ownership is managed by the Tab Lease System. Each agent can only operate on tabs it has leased. See "Multi-Agent Tab Isolation" below.
+
 spawriter operates on **one Chrome tab at a time**, but supports **multiple attached tabs**. Use `list_tabs` to see all attached tabs and `switch_tab` to change which tab the MCP session operates on. By default, the MCP server connects to the first available target; after `switch_tab`, it remembers and reconnects to the chosen target.
 
 ### Multi-tab tools
@@ -532,6 +536,98 @@ network_intercept { action: "add_rule", url_pattern: "/api/xml", mock_status: 20
 
 ---
 
+## Multi-Agent Tab Isolation (Tab Lease System)
+
+When multiple AI agents share the same spawriter relay server, the Tab Lease System ensures each agent operates on its own dedicated tab(s) without interference.
+
+### How it works
+
+- Each MCP server process has a unique client ID (`mcp-{pid}-{timestamp}`)
+- When connecting to a tab, the agent acquires an exclusive **lease** on that tab
+- The relay enforces lease ownership: only the lease holder can send CDP commands to the tab
+- CDP events are routed only to the lease holder, preventing cross-agent event pollution
+- Leases are automatically released when an agent disconnects or a tab is closed
+
+### Environment variables for multi-agent setup
+
+Configure these in your MCP client config to improve automatic tab selection:
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `SSPA_AGENT_LABEL` | Human-readable label for this agent (shown in `list_tabs`) | `"frontend-team"` |
+| `SSPA_PROJECT_URL` | URL substring to auto-match tabs to this agent | `"localhost:8080"` |
+
+Example MCP config with environment variables:
+
+```json
+{
+  "mcpServers": {
+    "spawriter": {
+      "command": "node",
+      "args": ["D:/dev/side/spawriter/mcp/dist/cli.js", "serve"],
+      "env": {
+        "SSPA_AGENT_LABEL": "agent-1",
+        "SSPA_PROJECT_URL": "localhost:8080"
+      }
+    }
+  }
+}
+```
+
+### Session negotiation (automatic)
+
+When an agent needs a browser tab, `doEnsureSession` follows this priority:
+
+1. **Reconnect** to a tab already leased by this agent
+2. **Find an unleased tab** (prioritizing `SSPA_PROJECT_URL` match)
+3. **Auto-attach** a Chrome tab matching `SSPA_PROJECT_URL` via the extension
+4. **Fallback** — ask the extension to attach the active tab (only when no tabs exist)
+5. **Error** — if all tabs are leased by other agents, report who holds what and suggest using `connect_tab`
+
+### Multi-agent tools
+
+| Tool | Usage |
+|------|-------|
+| `list_tabs` | Shows lease status: `MINE`, `LEASED by <label>`, `AVAILABLE` + summary counts |
+| `switch_tab` | Lease-aware switching: rejects if target is leased by another agent, acquires lease on new tab |
+| `connect_tab` | Attach a tab by URL, tab ID, or create new: `connect_tab { url: "localhost:8080" }` or `connect_tab { url: "example.com", create: true }` |
+| `release_tab` | Release a lease: `release_tab` (active tab) or `release_tab { targetId: "session-id" }` |
+| `reset` | Releases all leases before resetting connections |
+
+### Multi-agent workflow
+
+```
+# Agent 1 (configured with SSPA_PROJECT_URL=localhost:8080)
+# Automatically acquires lease on tab matching localhost:8080
+list_tabs → shows "Tab A (MINE), Tab B (LEASED by agent-2), Tab C (AVAILABLE)"
+
+# Agent 2 (configured with SSPA_PROJECT_URL=localhost:9090)
+# Automatically acquires lease on tab matching localhost:9090
+list_tabs → shows "Tab A (LEASED by agent-1), Tab B (MINE), Tab C (AVAILABLE)"
+
+# If an agent needs an additional tab:
+connect_tab { url: "example.com", create: true }
+```
+
+### What happens when...
+
+| Event | Behavior |
+|-------|----------|
+| Agent crashes or disconnects | All its leases are automatically released |
+| Tab is closed by user | Lease is removed, agent gets `Target.leaseLost` event |
+| Agent calls `reset` | All its leases are released first |
+| Two agents race for same tab | First one wins; second gets rejection and tries the next available tab |
+| No tabs available | Agent reports which tabs are leased by whom and suggests `connect_tab` |
+| Old relay (no lease support) | Agent falls back to classic mode without isolation |
+
+### Backward compatibility
+
+- Single-agent setups work exactly as before — no configuration needed
+- Leases are transparent: if only one agent is connected, it simply acquires a lease automatically
+- Old MCP clients connecting to a new relay continue to work (unleased tabs accept commands from anyone)
+
+---
+
 ## Safety Rules
 
 1. **Only operate on normal web pages** — never target `chrome://`, `edge://`, or extension pages.
@@ -562,3 +658,5 @@ network_intercept { action: "add_rule", url_pattern: "/api/xml", mock_status: 20
 | No console/network logs | Logs are captured after CDP connection is established; re-trigger the action |
 | Labeled screenshot shows no labels | Page may have no interactive elements; check `accessibility_snapshot` |
 | Cookie read fails in `playwright_execute` | Use `Network.getCookies` via CDP session, **not** `Storage.getCookies`. In extension relay mode, `Storage.getCookies` is a root-session command and will fail. Example: `const cdp = await page.context().newCDPSession(page); const { cookies } = await cdp.send('Network.getCookies', { urls: [page.url()] });` |
+| All tabs leased by other agents | Use `connect_tab { url: "your-url" }` to attach a new tab, or ask another agent to `release_tab` |
+| Tab lease rejected | Another agent holds the lease; use `list_tabs` to see ownership, then pick an AVAILABLE tab or use `connect_tab` |

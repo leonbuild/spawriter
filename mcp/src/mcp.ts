@@ -7,11 +7,15 @@ import {
   getRelayPort,
   getCdpUrl,
   getRelayToken,
+  getAgentLabel,
+  getProjectUrl,
+  generateMcpClientId,
   log,
   error,
   sleep,
   VERSION,
 } from './utils.js';
+import type { LeaseInfo } from './protocol.js';
 import { PlaywrightExecutor, ExecutorManager } from './pw-executor.js';
 
 let relayServerProcess: ReturnType<typeof import('child_process').spawn> | null = null;
@@ -26,6 +30,10 @@ interface CdpSession {
 let cdpSession: CdpSession | null = null;
 let sessionPromise: Promise<CdpSession> | null = null;
 let preferredTargetId: string | null = null;
+
+const MCP_CLIENT_ID = generateMcpClientId();
+const agentLabel = getAgentLabel();
+const projectUrl = getProjectUrl();
 
 const pwExecutor = new PlaywrightExecutor();
 const executorManager = new ExecutorManager();
@@ -351,6 +359,7 @@ interface TargetListItem {
   title: string;
   url: string;
   webSocketDebuggerUrl: string;
+  lease?: LeaseInfo | null;
 }
 
 async function getTargets(): Promise<TargetListItem[]> {
@@ -368,7 +377,7 @@ async function getTargets(): Promise<TargetListItem[]> {
 function connectCdp(sessionId: string): Promise<CdpSession> {
   const port = getRelayPort();
   const token = getRelayToken();
-  const baseUrl = `ws://127.0.0.1:${port}/cdp/mcp-client`;
+  const baseUrl = `ws://127.0.0.1:${port}/cdp/${MCP_CLIENT_ID}`;
   const wsUrl = token ? `${baseUrl}?token=${token}` : baseUrl;
 
   return new Promise((resolve, reject) => {
@@ -426,6 +435,7 @@ function connectCdp(sessionId: string): Promise<CdpSession> {
           if (msg.method && msg.params) {
             handleCdpEvent(msg.method, msg.params);
             handleDebuggerEvent(msg.method, msg.params);
+            handleLeaseEvent(msg.method, msg.params);
             if (msg.method === 'Fetch.requestPaused' && interceptEnabled) {
               handleFetchPaused(session, msg.params).catch(() => {});
             }
@@ -486,6 +496,78 @@ function sendCdpCommand(session: CdpSession, method: string, params?: Record<str
   });
 }
 
+let leaseSupported: boolean | null = null;
+
+async function acquireLease(session: CdpSession, targetSessionId: string): Promise<boolean> {
+  if (leaseSupported === false) return true;
+  try {
+    const result = await sendCdpCommand(session, 'Target.acquireLease', {
+      sessionId: targetSessionId,
+      label: agentLabel,
+    }) as { granted?: boolean };
+    leaseSupported = true;
+    return !!result?.granted;
+  } catch (e) {
+    log(`Lease acquisition failed for ${targetSessionId}: ${e}`);
+    if (leaseSupported === null) {
+      log('Lease commands not supported by relay — running without isolation');
+      leaseSupported = false;
+      return true;
+    }
+    return false;
+  }
+}
+
+async function releaseLease(session: CdpSession, targetSessionId: string): Promise<void> {
+  try {
+    await sendCdpCommand(session, 'Target.releaseLease', { sessionId: targetSessionId });
+  } catch {
+    // Best effort
+  }
+}
+
+async function releaseAllMyLeases(session: CdpSession): Promise<void> {
+  try {
+    const targets = await getTargets();
+    for (const t of targets) {
+      if (t.lease?.clientId === MCP_CLIENT_ID) {
+        await releaseLease(session, t.id);
+      }
+    }
+  } catch {
+    // Best effort
+  }
+}
+
+async function enableDomains(session: CdpSession): Promise<void> {
+  try {
+    await sendCdpCommand(session, 'Network.enable', {
+      maxTotalBufferSize: 10 * 1024 * 1024,
+      maxResourceBufferSize: 5 * 1024 * 1024,
+      maxPostDataSize: 65536,
+    });
+    await sendCdpCommand(session, 'Runtime.enable');
+  } catch {
+    log('Domain enable failed (may already be enabled by relay)');
+  }
+}
+
+async function requestConnectTab(params: { url?: string; tabId?: number; create?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
+  const port = getRelayPort();
+  try {
+    const response = await fetch(`http://localhost:${port}/connect-tab`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+      signal: AbortSignal.timeout(20000),
+    });
+    return await response.json() as { success: boolean; tabId?: number; created?: boolean };
+  } catch (e) {
+    error('Failed to request connect-tab:', e);
+    return { success: false };
+  }
+}
+
 async function ensureSession(): Promise<CdpSession> {
   if (cdpSession?.ws.readyState === WebSocket.OPEN) {
     return cdpSession;
@@ -508,47 +590,107 @@ async function doEnsureSession(): Promise<CdpSession> {
   await ensureRelayServer();
 
   let targets = await getTargets();
-  if (targets.length === 0) {
-    log('No targets found, requesting extension to attach active tab...');
-    await requestExtensionAttachTab();
-    for (let i = 0; i < 10 && targets.length === 0; i++) {
+
+  // Phase 1: Reconnect to my existing lease
+  const myLeased = targets.find(t => t.lease?.clientId === MCP_CLIENT_ID);
+  if (myLeased) {
+    log(`Reconnecting to previously leased tab: ${myLeased.url}`);
+    cdpSession = await connectCdp(myLeased.id);
+    await enableDomains(cdpSession);
+    return cdpSession;
+  }
+
+  // Phase 2: Find an unleased tab
+  let unleased = targets.filter(t => !t.lease);
+
+  if (projectUrl && unleased.length > 1) {
+    const matching = unleased.filter(t => t.url?.includes(projectUrl));
+    if (matching.length > 0) {
+      unleased = [...matching, ...unleased.filter(t => !t.url?.includes(projectUrl))];
+    }
+  }
+
+  if (preferredTargetId) {
+    const preferred = unleased.find(t => t.id === preferredTargetId);
+    if (preferred) {
+      unleased = [preferred, ...unleased.filter(t => t.id !== preferredTargetId)];
+    }
+  }
+
+  for (const candidate of unleased) {
+    try {
+      cdpSession = await connectCdp(candidate.id);
+      const leased = await acquireLease(cdpSession, candidate.id);
+      if (leased) {
+        log(`Acquired lease on tab: ${candidate.url}`);
+        preferredTargetId = candidate.id;
+        await enableDomains(cdpSession);
+        return cdpSession;
+      }
+      cdpSession.ws.close();
+      cdpSession = null;
+    } catch (e) {
+      log(`Failed to connect to candidate ${candidate.id}: ${e}`);
+      if (cdpSession) { cdpSession.ws.close(); cdpSession = null; }
+    }
+  }
+
+  // Phase 3: Auto-attach by project URL
+  if (projectUrl) {
+    log(`No unleased tabs, attempting auto-attach by URL: ${projectUrl}`);
+    const attached = await requestConnectTab({ url: projectUrl });
+    if (attached.success) {
       await sleep(1000);
       targets = await getTargets();
+      const newTarget = targets.find(t => !t.lease || t.lease.clientId === MCP_CLIENT_ID);
+      if (newTarget) {
+        cdpSession = await connectCdp(newTarget.id);
+        await acquireLease(cdpSession, newTarget.id);
+        preferredTargetId = newTarget.id;
+        await enableDomains(cdpSession);
+        return cdpSession;
+      }
     }
   }
 
+  // Phase 4: Fallback — request active tab
   if (targets.length === 0) {
-    throw new Error('No browser tab attached. Click the extension toolbar icon on a web page tab to attach it, then retry.');
-  }
-
-  let chosen = targets[0];
-  if (preferredTargetId) {
-    const preferred = targets.find(t => t.id === preferredTargetId);
-    if (preferred) {
-      chosen = preferred;
-    } else {
-      log(`Preferred target ${preferredTargetId} no longer available, falling back to first target`);
-      preferredTargetId = null;
+    log('No targets at all, requesting extension to attach active tab...');
+    await requestExtensionAttachTab();
+    for (let i = 0; i < 10; i++) {
+      await sleep(1000);
+      targets = await getTargets();
+      const available = targets.find(t => !t.lease);
+      if (available) {
+        cdpSession = await connectCdp(available.id);
+        await acquireLease(cdpSession, available.id);
+        preferredTargetId = available.id;
+        await enableDomains(cdpSession);
+        return cdpSession;
+      }
+      if (targets.length > 0) break;
     }
   }
 
-  const sessionId = chosen.id;
-  log('Connecting to CDP relay, target:', chosen.url);
-  cdpSession = await connectCdp(sessionId);
-  log('CDP session established');
-
-  try {
-    await sendCdpCommand(cdpSession, 'Network.enable', {
-      maxTotalBufferSize: 10 * 1024 * 1024,
-      maxResourceBufferSize: 5 * 1024 * 1024,
-      maxPostDataSize: 65536,
-    });
-    await sendCdpCommand(cdpSession, 'Runtime.enable');
-  } catch {
-    log('Domain enable after connect failed (may already be enabled by relay)');
+  // Phase 5: All tabs leased by others
+  const leasedCount = targets.filter(t => t.lease).length;
+  if (targets.length > 0 && leasedCount === targets.length) {
+    const holders = targets.map(t => {
+      const l = t.lease!;
+      return `  - ${t.url || '(no url)'} — leased by ${l.label || l.clientId}`;
+    }).join('\n');
+    throw new Error(
+      `All ${targets.length} attached tab(s) are leased by other agents:\n${holders}\n\n` +
+      `To get a tab for this agent:\n` +
+      `  1. Use connect_tab { url: "your-app-url" } to auto-attach a matching Chrome tab\n` +
+      `  2. Open a Chrome tab and click the spawriter toolbar icon\n` +
+      `  3. Use connect_tab { url: "your-url", create: true } to create and attach a new tab`
+    );
   }
 
-  return cdpSession;
+  throw new Error(
+    'No browser tab attached. Click the extension toolbar icon on a web page tab to attach it, or use connect_tab to attach one.'
+  );
 }
 
 const SLOW_CDP_COMMANDS = new Set([
@@ -674,6 +816,24 @@ function handleDebuggerEvent(method: string, params: Record<string, unknown>) {
       }
       break;
     }
+  }
+}
+
+function handleLeaseEvent(method: string, params: Record<string, unknown>) {
+  if (method === 'Target.leaseLost') {
+    const lostSessionId = params.sessionId as string | undefined;
+    const reason = params.reason as string | undefined;
+    log(`Lease lost for tab ${lostSessionId}: ${reason}`);
+    if (cdpSession?.sessionId === lostSessionId) {
+      cdpSession = null;
+    }
+  }
+  if (method === 'Target.tabAvailable') {
+    const info = params.targetInfo as { url?: string } | undefined;
+    log(`New tab available: ${info?.url || '(unknown)'} (${params.totalAvailable} total available)`);
+  }
+  if (method === 'Target.leaseReleased') {
+    log(`Tab lease released: ${params.sessionId} (${params.reason})`);
   }
 }
 
@@ -1025,18 +1185,40 @@ Actions: enable, set_breakpoint, remove_breakpoint, list_breakpoints, resume, st
   },
   {
     name: 'list_tabs',
-    description: 'List all Chrome tabs currently attached to spawriter. Shows session ID, tab ID, title, URL, and which tab is active (connected to this MCP session).',
+    description: 'List all Chrome tabs currently attached to spawriter. Shows session ID, tab ID, title, URL, which tab is active, and lease status (MINE / LEASED by X / AVAILABLE). In multi-agent setups, tabs are isolated via leases.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'switch_tab',
-    description: 'Switch the MCP session to a different attached Chrome tab. Closes the current CDP connection and reconnects to the specified target. Cleared on switch: console logs, network entries, intercept rules, debugger state, snapshot baseline. Preserved: Playwright sessions (session_manager/playwright_execute).',
+    description: 'Switch the MCP session to a different attached Chrome tab. Cannot switch to a tab leased by another agent. Acquires lease on the new tab if available. Cleared on switch: console logs, network entries, intercept rules, debugger state, snapshot baseline. Preserved: Playwright sessions and leases on other tabs.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         targetId: { type: 'string', description: 'Session ID of the target tab (from list_tabs output)' },
       },
       required: ['targetId'],
+    },
+  },
+  {
+    name: 'connect_tab',
+    description: 'Request the extension to find and attach a Chrome tab by URL pattern or tab ID. Can optionally create a new tab if none matches. After connecting, use switch_tab to activate it, or it will be auto-selected on next tool call.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        url: { type: 'string', description: 'URL substring to match against open Chrome tabs (e.g., "localhost:9100", "example.com/dashboard")' },
+        tabId: { type: 'number', description: 'Exact Chrome tab ID to attach' },
+        create: { type: 'boolean', description: 'If true and no matching tab found, create a new tab with the given URL and attach it' },
+      },
+    },
+  },
+  {
+    name: 'release_tab',
+    description: 'Release your lease on a tab, making it available to other agents. If no targetId specified, releases the currently active tab.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        targetId: { type: 'string', description: 'Session ID of the tab to release. Omit to release the active tab.' },
+      },
     },
   },
   {
@@ -1208,6 +1390,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'reset') {
     if (cdpSession) {
+      await releaseAllMyLeases(cdpSession);
       cdpSession.ws.close();
       cdpSession = null;
     }
@@ -1223,26 +1406,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     currentCallFrameId = null;
     knownScripts.clear();
     await executorManager.resetAll();
-    return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, and sessions cleared.' }] };
+    return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, leases, and sessions cleared.' }] };
   }
 
   if (name === 'list_tabs') {
     await ensureRelayServer();
     const targets = await getTargets();
     if (targets.length === 0) {
-      return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab to attach it.' }] };
+      return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab, or use connect_tab to attach one.' }] };
     }
     const activeSessionId = cdpSession?.sessionId ?? null;
-    const preferredLabel = preferredTargetId && preferredTargetId !== activeSessionId ? `, preferred: ${preferredTargetId}` : '';
+    const myTabs = targets.filter(t => t.lease?.clientId === MCP_CLIENT_ID);
+    const otherTabs = targets.filter(t => t.lease && t.lease.clientId !== MCP_CLIENT_ID);
+    const availableTabs = targets.filter(t => !t.lease);
+
     const lines = targets.map((t, i) => {
       const markers: string[] = [];
-      if (t.id === activeSessionId) markers.push('active');
-      if (t.id === preferredTargetId && t.id !== activeSessionId) markers.push('preferred');
-      const markerStr = markers.length > 0 ? ` ← ${markers.join(', ')}` : '';
+      if (t.id === activeSessionId) markers.push('ACTIVE');
+      if (t.lease?.clientId === MCP_CLIENT_ID) {
+        markers.push('MINE');
+      } else if (t.lease) {
+        markers.push(`LEASED by ${t.lease.label || t.lease.clientId}`);
+      } else {
+        markers.push('AVAILABLE');
+      }
+      const markerStr = markers.join(', ');
       const tabLabel = t.tabId != null ? ` (tabId: ${t.tabId})` : '';
-      return `${i + 1}. [${t.id}]${tabLabel}${markerStr}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
+      return `${i + 1}. [${t.id}]${tabLabel} ← ${markerStr}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
     });
-    const summary = `${targets.length} tab(s) attached${activeSessionId ? `, active: ${activeSessionId}` : ''}${preferredLabel}`;
+
+    const summary = [
+      `${targets.length} tab(s) attached`,
+      `${myTabs.length} mine`,
+      `${otherTabs.length} leased by others`,
+      `${availableTabs.length} available`,
+    ].join(', ');
+
     return { content: [{ type: 'text', text: `${summary}\n\n${lines.join('\n\n')}` }] };
   }
 
@@ -1258,6 +1457,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!target) {
       const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
       return { content: [{ type: 'text', text: `Error: target "${targetId}" not found.\n\nAvailable targets:\n${available}` }], isError: true };
+    }
+
+    if (target.lease && target.lease.clientId !== MCP_CLIENT_ID) {
+      const holder = target.lease.label || target.lease.clientId;
+      return {
+        content: [{ type: 'text', text:
+          `Error: Tab is leased by "${holder}". You cannot switch to a tab owned by another agent.\n\n` +
+          `Use list_tabs to find an available tab, or use connect_tab to attach a new one.`
+        }],
+        isError: true,
+      };
     }
 
     if (cdpSession?.sessionId === targetId && cdpSession.ws.readyState === WebSocket.OPEN) {
@@ -1285,18 +1495,62 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: 'text', text: `Error: failed to connect to tab "${targetId}". The tab may have been closed or the relay may be unreachable.\nDetail: ${String(e)}\n\nUse list_tabs to see available tabs, or call reset and retry.` }], isError: true };
     }
     preferredTargetId = targetId;
-    try {
-      await sendCdpCommand(cdpSession, 'Network.enable', {
-        maxTotalBufferSize: 10 * 1024 * 1024,
-        maxResourceBufferSize: 5 * 1024 * 1024,
-        maxPostDataSize: 65536,
-      });
-      await sendCdpCommand(cdpSession, 'Runtime.enable');
-    } catch {
-      log('Domain enable after switch_tab failed (may already be enabled)');
+
+    if (!target.lease || target.lease.clientId !== MCP_CLIENT_ID) {
+      const leased = await acquireLease(cdpSession, targetId);
+      if (!leased) {
+        return { content: [{ type: 'text', text: 'Error: Failed to acquire lease on this tab (another agent may have just claimed it). Use list_tabs to see available tabs.' }], isError: true };
+      }
     }
 
-    return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}\nSession: ${targetId}\n\nCleared: console logs, network entries, intercept rules, debugger state, snapshot baseline.\nPreserved: Playwright sessions.` }] };
+    await enableDomains(cdpSession);
+
+    return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}\nSession: ${targetId}\n\nCleared: console logs, network entries, intercept rules, debugger state, snapshot baseline.\nPreserved: Playwright sessions, leases on other tabs.` }] };
+  }
+
+  if (name === 'connect_tab') {
+    await ensureRelayServer();
+    const url = args.url as string | undefined;
+    const tabId = args.tabId as number | undefined;
+    const create = args.create as boolean | undefined;
+
+    if (!url && tabId === undefined) {
+      return { content: [{ type: 'text', text: 'Error: Provide either url or tabId.' }], isError: true };
+    }
+
+    const result = await requestConnectTab({ url, tabId, create });
+
+    if (!result.success) {
+      return { content: [{ type: 'text', text: `Failed to connect tab: ${(result as { error?: string }).error || 'Unknown error'}` }], isError: true };
+    }
+
+    await sleep(500);
+    const targets = await getTargets();
+    const newTarget = targets.find(t => t.tabId === result.tabId);
+    const created = result.created ? ' (newly created)' : '';
+    const info = newTarget
+      ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}\n\nUse switch_tab with targetId "${newTarget.id}" to activate it, or it will be auto-selected on the next tool call.`
+      : `Tab attached${created} (tabId: ${result.tabId}). Use list_tabs to see it.`;
+
+    return { content: [{ type: 'text', text: info }] };
+  }
+
+  if (name === 'release_tab') {
+    const targetId = (args.targetId as string | undefined) || cdpSession?.sessionId;
+    if (!targetId) {
+      return { content: [{ type: 'text', text: 'No active tab to release. Specify targetId or ensure a session is active.' }], isError: true };
+    }
+
+    try {
+      const session = await ensureSession();
+      await releaseLease(session, targetId);
+      if (targetId === cdpSession?.sessionId) {
+        cdpSession = null;
+      }
+      return { content: [{ type: 'text', text: `Released lease on tab ${targetId}. It is now available to other agents.` }] };
+    } catch (e) {
+      return { content: [{ type: 'text', text: `Error releasing lease: ${e}` }], isError: true };
+    }
   }
 
   if (name === 'playwright_execute') {
@@ -2530,6 +2784,7 @@ async function main() {
   process.on('SIGINT', async () => {
     log('Shutting down...');
     if (cdpSession) {
+      await releaseAllMyLeases(cdpSession).catch(() => {});
       cdpSession.ws.close();
     }
     process.exit(0);
