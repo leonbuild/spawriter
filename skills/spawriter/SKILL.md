@@ -77,9 +77,43 @@ After modifying UI code, **always** run this sequence automatically:
 6. Use `clear_cache_and_reload` only when explicit cache reset is required.
 7. If CDP/session is unstable, call `reset` and continue.
 
+## Tab scope & cross-page comparison
+
+spawriter can work with **multiple attached Chrome tabs** using `list_tabs` and `switch_tab`. The user attaches tabs via the toolbar button; the agent switches between them.
+
+- `list_tabs` — shows all attached tabs (session ID, tab ID, title, URL, active indicator)
+- `switch_tab { targetId: "..." }` — switches to a different tab, clears console/network/intercept/debugger state (Playwright sessions preserved)
+- `session_manager` manages Playwright executor VM sessions (isolated JS sandboxes), not Chrome tabs
+
+**Multi-tab comparison workflow:**
+```
+list_tabs → see attached tabs
+switch_tab { targetId: "session-ref" } → switch to reference tab → screenshot
+switch_tab { targetId: "session-work" } → switch back → screenshot → compare
+```
+
+**Single-tab alternative:** use `navigate` to switch URLs within one tab, saving data in `playwright_execute` state.
+
+**On switch_tab:** console logs, network entries, intercept rules, debugger state, and snapshot baseline are cleared. Playwright sessions (`session_manager` / `playwright_execute`) are preserved but maintain their own CDP connection — they may not automatically follow the tab switch.
+
+## Offline UI testing with mock responses
+
+You do NOT need real API servers to test UI. spawriter provides full network interception via `network_intercept`:
+
+- **Mock success responses:** `network_intercept { action: "add_rule", url_pattern: "/api/data", mock_status: 200, mock_body: "[{\"id\":1}]" }`
+- **Mock errors:** `network_intercept { action: "add_rule", url_pattern: "/api/data", mock_status: 500, mock_body: "{\"error\":\"fail\"}" }`
+- **Block requests** (test loading/offline): `network_intercept { action: "add_rule", url_pattern: "/api/slow", block: true }`
+- **Test empty states:** mock with `mock_body: "[]"`
+- **Combine with interaction:** set up mock → `playwright_execute` to fill forms and submit → `screenshot` to verify
+
+Always `network_intercept { action: "enable" }` before adding rules, and `network_intercept { action: "disable" }` when done.
+
+Use mock testing when: backend is unavailable, testing error handling UI, testing edge cases, reproducing specific bugs, or testing loading/skeleton states.
+
 ## Safety rules
 
 - Prefer normal web pages; avoid `chrome://`, `edge://`, and extension pages.
 - Do not infer single-spa state from static HTML alone; verify via runtime checks.
 - Keep operations incremental and verify with screenshot between major actions.
 - For project development tasks, do not assume your code change is active until `dashboard_state` confirms localhost override is effective.
+- Mock rules persist until disabled — always clean up with `network_intercept { action: "disable" }` or `reset` after mock testing.

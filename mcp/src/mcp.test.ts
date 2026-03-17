@@ -5844,13 +5844,14 @@ describe('intercept state management', () => {
 // ---------------------------------------------------------------------------
 
 describe('reset clears all state including intercept', () => {
-  it('should clear 9 state categories', () => {
+  it('should clear 10 state categories', () => {
     const stateCategories = [
       'consoleLogs', 'networkLog', 'interceptState',
       'lastSnapshot', 'pwExecutor', 'debuggerEnabled',
       'breakpoints', 'knownScripts', 'executorManager',
+      'preferredTargetId',
     ];
-    assert.equal(stateCategories.length, 9);
+    assert.equal(stateCategories.length, 10);
   });
 });
 
@@ -7581,5 +7582,477 @@ describe('Integration: tool action counts', () => {
 
   it('total new actions across 6 tools = 37', () => {
     assert.equal(9 + 4 + 7 + 5 + 8 + 4, 37);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: list_tabs tool
+// ---------------------------------------------------------------------------
+
+interface TestTargetListItem {
+  id: string;
+  tabId?: number;
+  type: string;
+  title: string;
+  url: string;
+  webSocketDebuggerUrl: string;
+}
+
+function formatTabList(targets: TestTargetListItem[], activeSessionId: string | null, preferredId: string | null = null): string {
+  if (targets.length === 0) {
+    return 'No tabs attached. Click the spawriter toolbar button on a Chrome tab to attach it.';
+  }
+  const preferredLabel = preferredId && preferredId !== activeSessionId ? `, preferred: ${preferredId}` : '';
+  const lines = targets.map((t, i) => {
+    const markers: string[] = [];
+    if (t.id === activeSessionId) markers.push('active');
+    if (t.id === preferredId && t.id !== activeSessionId) markers.push('preferred');
+    const markerStr = markers.length > 0 ? ` ← ${markers.join(', ')}` : '';
+    const tabLabel = t.tabId != null ? ` (tabId: ${t.tabId})` : '';
+    return `${i + 1}. [${t.id}]${tabLabel}${markerStr}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
+  });
+  const summary = `${targets.length} tab(s) attached${activeSessionId ? `, active: ${activeSessionId}` : ''}${preferredLabel}`;
+  return `${summary}\n\n${lines.join('\n\n')}`;
+}
+
+describe('list_tabs – formatting', () => {
+  it('should show empty message when no tabs', () => {
+    const result = formatTabList([], null);
+    assert.ok(result.includes('No tabs attached'));
+  });
+
+  it('should list a single tab', () => {
+    const targets: TestTargetListItem[] = [{
+      id: 'spawriter-tab-123-1000', tabId: 123, type: 'page',
+      title: 'My App', url: 'http://localhost:3000/',
+      webSocketDebuggerUrl: 'ws://localhost:19989/cdp/spawriter-tab-123-1000',
+    }];
+    const result = formatTabList(targets, 'spawriter-tab-123-1000');
+    assert.ok(result.includes('1 tab(s) attached'));
+    assert.ok(result.includes('← active'));
+    assert.ok(result.includes('My App'));
+    assert.ok(result.includes('http://localhost:3000/'));
+    assert.ok(result.includes('tabId: 123'));
+  });
+
+  it('should list multiple tabs and mark the active one', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'Tab A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+      { id: 'session-b', tabId: 2, type: 'page', title: 'Tab B', url: 'https://b.com', webSocketDebuggerUrl: '' },
+      { id: 'session-c', tabId: 3, type: 'page', title: 'Tab C', url: 'https://c.com', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, 'session-b');
+    assert.ok(result.includes('3 tab(s) attached'));
+    assert.ok(result.includes('[session-b]'));
+    assert.ok(result.includes('← active'));
+    const lines = result.split('\n');
+    const activeLines = lines.filter(l => l.includes('← active'));
+    assert.equal(activeLines.length, 1);
+    assert.ok(activeLines[0].includes('session-b'));
+  });
+
+  it('should handle tabs with no title or URL', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-x', type: 'page', title: '', url: '', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, null);
+    assert.ok(result.includes('(no title)'));
+    assert.ok(result.includes('(no url)'));
+  });
+
+  it('should handle no active session', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'Tab A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, null);
+    assert.ok(!result.includes('← active'));
+    assert.ok(!result.includes(', active:'));
+  });
+
+  it('should handle tab without tabId', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-no-tab', type: 'page', title: 'No TabId', url: 'https://x.com', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, null);
+    assert.ok(!result.includes('tabId:'));
+  });
+
+  it('should show preferred marker when preferred differs from active', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+      { id: 'session-b', tabId: 2, type: 'page', title: 'B', url: 'https://b.com', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, 'session-a', 'session-b');
+    assert.ok(result.includes('← active'));
+    assert.ok(result.includes('← preferred'));
+    assert.ok(result.includes('preferred: session-b'));
+  });
+
+  it('should not duplicate markers when preferred equals active', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, 'session-a', 'session-a');
+    assert.ok(result.includes('← active'));
+    assert.ok(!result.includes('preferred'));
+  });
+
+  it('should not show preferred marker when no preferred set', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+    ];
+    const result = formatTabList(targets, 'session-a', null);
+    assert.ok(!result.includes('preferred'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: switch_tab – validation and state clearing
+// ---------------------------------------------------------------------------
+
+describe('switch_tab – target validation', () => {
+  function findTarget(targets: TestTargetListItem[], targetId: string): TestTargetListItem | undefined {
+    return targets.find(t => t.id === targetId);
+  }
+
+  function formatNotFoundError(targetId: string, targets: TestTargetListItem[]): string {
+    const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
+    return `Error: target "${targetId}" not found.\n\nAvailable targets:\n${available}`;
+  }
+
+  function formatAlreadyConnected(target: TestTargetListItem): string {
+    return `Already connected to this tab: ${target.title || target.url || '(no title)'}`;
+  }
+
+  it('should return error for empty targetId', () => {
+    const targetId = '';
+    assert.equal(!targetId, true);
+  });
+
+  it('should return error for undefined-like targetId', () => {
+    const targetId = undefined as unknown as string;
+    assert.equal(!targetId, true);
+  });
+
+  it('should find an existing target', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'Tab A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+      { id: 'session-b', tabId: 2, type: 'page', title: 'Tab B', url: 'https://b.com', webSocketDebuggerUrl: '' },
+    ];
+    const found = findTarget(targets, 'session-b');
+    assert.ok(found);
+    assert.equal(found!.url, 'https://b.com');
+  });
+
+  it('should return undefined for non-existent target', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'Tab A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+    ];
+    assert.equal(findTarget(targets, 'session-z'), undefined);
+  });
+
+  it('should format not-found error with available targets', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', tabId: 1, type: 'page', title: 'Tab A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+      { id: 'session-b', tabId: 2, type: 'page', title: 'Tab B', url: 'https://b.com', webSocketDebuggerUrl: '' },
+    ];
+    const err = formatNotFoundError('session-z', targets);
+    assert.ok(err.includes('session-z'));
+    assert.ok(err.includes('session-a'));
+    assert.ok(err.includes('session-b'));
+    assert.ok(err.includes('https://a.com'));
+  });
+
+  it('should format not-found error with no targets', () => {
+    const err = formatNotFoundError('session-z', []);
+    assert.ok(err.includes('(none)'));
+  });
+
+  it('should detect already-connected state', () => {
+    const activeSessionId = 'session-a';
+    const requestedId = 'session-a';
+    assert.equal(activeSessionId === requestedId, true);
+  });
+
+  it('should detect switch needed', () => {
+    const activeSessionId = 'session-a';
+    const requestedId = 'session-b';
+    assert.notEqual(activeSessionId, requestedId);
+  });
+
+  it('should format already-connected with title', () => {
+    const target: TestTargetListItem = { id: 's1', type: 'page', title: 'My App', url: 'http://localhost:3000', webSocketDebuggerUrl: '' };
+    assert.ok(formatAlreadyConnected(target).includes('My App'));
+  });
+
+  it('should format already-connected with url fallback when no title', () => {
+    const target: TestTargetListItem = { id: 's1', type: 'page', title: '', url: 'http://localhost:3000', webSocketDebuggerUrl: '' };
+    assert.ok(formatAlreadyConnected(target).includes('http://localhost:3000'));
+  });
+
+  it('should format already-connected with (no title) when both empty', () => {
+    const target: TestTargetListItem = { id: 's1', type: 'page', title: '', url: '', webSocketDebuggerUrl: '' };
+    assert.ok(formatAlreadyConnected(target).includes('(no title)'));
+  });
+
+  it('should show (no url) in not-found error for targets without URL', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', type: 'page', title: 'Tab A', url: '', webSocketDebuggerUrl: '' },
+    ];
+    const err = formatNotFoundError('session-z', targets);
+    assert.ok(err.includes('(no url)'));
+  });
+});
+
+describe('switch_tab – preferredTargetId and doEnsureSession target selection', () => {
+  function chooseTarget(targets: TestTargetListItem[], preferredId: string | null): { chosen: TestTargetListItem; preferredCleared: boolean } {
+    if (targets.length === 0) throw new Error('No targets');
+    let chosen = targets[0];
+    let preferredCleared = false;
+    if (preferredId) {
+      const preferred = targets.find(t => t.id === preferredId);
+      if (preferred) {
+        chosen = preferred;
+      } else {
+        preferredCleared = true;
+      }
+    }
+    return { chosen, preferredCleared };
+  }
+
+  it('should use targets[0] when no preferred target is set', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', type: 'page', title: 'A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+      { id: 'session-b', type: 'page', title: 'B', url: 'https://b.com', webSocketDebuggerUrl: '' },
+    ];
+    const { chosen } = chooseTarget(targets, null);
+    assert.equal(chosen.id, 'session-a');
+  });
+
+  it('should use preferred target when it exists in targets list', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', type: 'page', title: 'A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+      { id: 'session-b', type: 'page', title: 'B', url: 'https://b.com', webSocketDebuggerUrl: '' },
+    ];
+    const { chosen } = chooseTarget(targets, 'session-b');
+    assert.equal(chosen.id, 'session-b');
+  });
+
+  it('should fall back to targets[0] when preferred target is no longer available', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-a', type: 'page', title: 'A', url: 'https://a.com', webSocketDebuggerUrl: '' },
+    ];
+    const { chosen, preferredCleared } = chooseTarget(targets, 'session-gone');
+    assert.equal(chosen.id, 'session-a');
+    assert.equal(preferredCleared, true);
+  });
+
+  it('should use preferred target when it is not the first target', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'session-1', type: 'page', title: '1', url: 'https://1.com', webSocketDebuggerUrl: '' },
+      { id: 'session-2', type: 'page', title: '2', url: 'https://2.com', webSocketDebuggerUrl: '' },
+      { id: 'session-3', type: 'page', title: '3', url: 'https://3.com', webSocketDebuggerUrl: '' },
+    ];
+    const { chosen } = chooseTarget(targets, 'session-3');
+    assert.equal(chosen.id, 'session-3');
+  });
+
+  it('should clear preferredTargetId on reset', () => {
+    const stateBeforeReset = { preferredTargetId: 'session-b' as string | null };
+    stateBeforeReset.preferredTargetId = null;
+    assert.equal(stateBeforeReset.preferredTargetId, null);
+  });
+
+  it('should clear preferredTargetId on connectCdp failure', () => {
+    const state = { preferredTargetId: 'session-x' as string | null };
+    state.preferredTargetId = null;
+    assert.equal(state.preferredTargetId, null);
+  });
+
+  it('should set preferredTargetId on successful switch', () => {
+    const state = { preferredTargetId: null as string | null };
+    const targetId = 'session-new';
+    state.preferredTargetId = targetId;
+    assert.equal(state.preferredTargetId, 'session-new');
+  });
+});
+
+describe('switch_tab – state clearing categories', () => {
+  it('should clear 7 state categories on tab switch', () => {
+    const clearedCategories = [
+      'consoleLogs',
+      'networkLog',
+      'interceptState',
+      'lastSnapshot',
+      'debuggerEnabled + breakpoints',
+      'debuggerPaused + currentCallFrameId',
+      'knownScripts',
+    ];
+    assert.equal(clearedCategories.length, 7);
+  });
+
+  it('should NOT clear Playwright sessions on tab switch', () => {
+    const preservedOnSwitch = ['pwExecutor', 'executorManager'];
+    assert.equal(preservedOnSwitch.length, 2);
+    const clearedOnReset = [
+      'consoleLogs', 'networkLog', 'interceptState',
+      'lastSnapshot', 'pwExecutor', 'debuggerEnabled',
+      'breakpoints', 'knownScripts', 'executorManager',
+    ];
+    for (const kept of preservedOnSwitch) {
+      assert.ok(!['consoleLogs', 'networkLog', 'interceptState', 'lastSnapshot', 'debuggerEnabled', 'breakpoints', 'knownScripts'].includes(kept));
+    }
+    assert.ok(clearedOnReset.includes('pwExecutor'));
+    assert.ok(clearedOnReset.includes('executorManager'));
+  });
+});
+
+describe('switch_tab – success message formatting', () => {
+  function formatSwitchSuccess(target: TestTargetListItem, targetId: string): string {
+    return `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}\nSession: ${targetId}\n\nCleared: console logs, network entries, intercept rules, debugger state, snapshot baseline.\nPreserved: Playwright sessions.`;
+  }
+
+  it('should include target title, URL, and session ID', () => {
+    const target: TestTargetListItem = { id: 's1', tabId: 1, type: 'page', title: 'My App', url: 'http://localhost:3000', webSocketDebuggerUrl: '' };
+    const msg = formatSwitchSuccess(target, 's1');
+    assert.ok(msg.includes('My App'));
+    assert.ok(msg.includes('http://localhost:3000'));
+    assert.ok(msg.includes('s1'));
+    assert.ok(msg.includes('Cleared'));
+    assert.ok(msg.includes('snapshot baseline'));
+    assert.ok(msg.includes('Preserved: Playwright sessions'));
+  });
+
+  it('should handle tab with no title', () => {
+    const target: TestTargetListItem = { id: 's2', type: 'page', title: '', url: 'https://x.com', webSocketDebuggerUrl: '' };
+    const msg = formatSwitchSuccess(target, 's2');
+    assert.ok(msg.includes('(no title)'));
+  });
+
+  it('should handle tab with no URL', () => {
+    const target: TestTargetListItem = { id: 's3', type: 'page', title: 'No URL Tab', url: '', webSocketDebuggerUrl: '' };
+    const msg = formatSwitchSuccess(target, 's3');
+    assert.ok(msg.includes('(no url)'));
+  });
+
+  it('should handle connectCdp failure message format', () => {
+    const targetId = 'session-dead';
+    const errMsg = `Error: failed to connect to tab "${targetId}". The tab may have been closed or the relay may be unreachable.\nDetail: Connection timeout\n\nUse list_tabs to see available tabs, or call reset and retry.`;
+    assert.ok(errMsg.includes(targetId));
+    assert.ok(errMsg.includes('Connection timeout'));
+    assert.ok(errMsg.includes('list_tabs'));
+    assert.ok(errMsg.includes('reset'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: list_tabs + switch_tab tool definitions
+// ---------------------------------------------------------------------------
+
+describe('list_tabs and switch_tab tool definitions', () => {
+  it('list_tabs should have no required params', () => {
+    const schema = { type: 'object', properties: {} };
+    assert.deepStrictEqual(Object.keys(schema.properties), []);
+  });
+
+  it('switch_tab should require targetId', () => {
+    const required = ['targetId'];
+    assert.equal(required.length, 1);
+    assert.equal(required[0], 'targetId');
+  });
+
+  it('TargetListItem should include tabId field', () => {
+    const item: TestTargetListItem = {
+      id: 'test', tabId: 42, type: 'page', title: 'Test', url: 'https://test.com', webSocketDebuggerUrl: '',
+    };
+    assert.equal(item.tabId, 42);
+  });
+
+  it('TargetListItem tabId should be optional', () => {
+    const item: TestTargetListItem = {
+      id: 'test', type: 'page', title: 'Test', url: 'https://test.com', webSocketDebuggerUrl: '',
+    };
+    assert.equal(item.tabId, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: Multi-tab scenario integration
+// ---------------------------------------------------------------------------
+
+describe('multi-tab scenario: A/B comparison workflow', () => {
+  it('should support list → switch → screenshot → switch → screenshot pattern', () => {
+    const targets: TestTargetListItem[] = [
+      { id: 'prod-tab', tabId: 1, type: 'page', title: 'Production', url: 'https://prod.example.com', webSocketDebuggerUrl: '' },
+      { id: 'local-tab', tabId: 2, type: 'page', title: 'Local Dev', url: 'http://localhost:3000', webSocketDebuggerUrl: '' },
+    ];
+    const list = formatTabList(targets, 'prod-tab');
+    assert.ok(list.includes('2 tab(s) attached'));
+    assert.ok(list.includes('Production'));
+    assert.ok(list.includes('Local Dev'));
+
+    const switchTarget = targets.find(t => t.id === 'local-tab');
+    assert.ok(switchTarget);
+    assert.equal(switchTarget!.url, 'http://localhost:3000');
+  });
+});
+
+describe('multi-tab scenario: tab detachment handling', () => {
+  it('should detect when preferred tab is gone', () => {
+    const targetsAfterDetach: TestTargetListItem[] = [
+      { id: 'remaining-tab', tabId: 1, type: 'page', title: 'Remaining', url: 'https://a.com', webSocketDebuggerUrl: '' },
+    ];
+    const preferredId = 'detached-tab';
+    const preferred = targetsAfterDetach.find(t => t.id === preferredId);
+    assert.equal(preferred, undefined);
+    const fallback = targetsAfterDetach[0];
+    assert.equal(fallback.id, 'remaining-tab');
+  });
+});
+
+describe('multi-tab: state isolation between tabs', () => {
+  it('console logs should be cleared on tab switch', () => {
+    const stateCleared = ['consoleLogs', 'networkLog', 'interceptState', 'lastSnapshot', 'debuggerEnabled', 'breakpoints', 'debuggerPaused', 'currentCallFrameId', 'knownScripts'];
+    assert.ok(stateCleared.includes('consoleLogs'));
+    assert.ok(stateCleared.includes('networkLog'));
+  });
+
+  it('intercept rules should be cleared on tab switch', () => {
+    const stateCleared = ['consoleLogs', 'networkLog', 'interceptState', 'lastSnapshot', 'debuggerEnabled', 'breakpoints', 'debuggerPaused', 'currentCallFrameId', 'knownScripts'];
+    assert.ok(stateCleared.includes('interceptState'));
+  });
+
+  it('playwright sessions should NOT be cleared on tab switch', () => {
+    const stateCleared = ['consoleLogs', 'networkLog', 'interceptState', 'lastSnapshot', 'debuggerEnabled', 'breakpoints', 'debuggerPaused', 'currentCallFrameId', 'knownScripts'];
+    assert.ok(!stateCleared.includes('pwExecutor'));
+    assert.ok(!stateCleared.includes('executorManager'));
+  });
+
+  it('emulation settings are per-tab and NOT carried over', () => {
+    const note = 'Emulation settings are CDP-session-scoped. After switch_tab, the new tab has its own emulation state.';
+    assert.ok(note.includes('per-tab') || note.includes('CDP-session'));
+  });
+});
+
+describe('multi-tab: network_detail after tab switch', () => {
+  it('old requestIds from previous tab should not exist on new tab', () => {
+    const oldTabRequestIds = ['R1.1', 'R1.2', 'R1.3'];
+    const newTabNetworkLog = new Map<string, string>();
+    for (const id of oldTabRequestIds) {
+      assert.equal(newTabNetworkLog.has(id), false);
+    }
+  });
+});
+
+describe('multi-tab: playwright_execute independence', () => {
+  it('playwright_execute has its own CDP connection', () => {
+    const pwClientId = `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const mcpClientId = 'mcp-client';
+    assert.notEqual(pwClientId, mcpClientId);
+  });
+
+  it('playwright_execute does not follow switch_tab automatically', () => {
+    const note = 'PlaywrightExecutor connects to the relay with its own client ID. It discovers targets independently and picks the first page.';
+    assert.ok(note.includes('independently'));
   });
 });

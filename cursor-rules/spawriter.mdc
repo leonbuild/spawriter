@@ -12,7 +12,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 **You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it.
 
-## Available Tools (23)
+## Available Tools (25)
 
 ### Inspection & State
 
@@ -84,6 +84,13 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 | Tool | Description | Key Args |
 |------|-------------|----------|
 | `app_action` | Control single-spa app lifecycle | `action`: `mount` / `unmount` / `unload`; `appName` |
+
+### Tab Management
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `list_tabs` | List all attached Chrome tabs with session IDs, titles, URLs, and active indicator | — |
+| `switch_tab` | Switch CDP session to a different attached Chrome tab | `targetId` (session ID from `list_tabs`) |
 
 ### Session & Connection
 
@@ -364,6 +371,161 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 
 ---
 
+## Tab Scope & Cross-Page Comparison
+
+spawriter operates on **one Chrome tab at a time**, but supports **multiple attached tabs**. Use `list_tabs` to see all attached tabs and `switch_tab` to change which tab the MCP session operates on. By default, the MCP server connects to the first available target; after `switch_tab`, it remembers and reconnects to the chosen target.
+
+### Multi-tab tools
+
+Two MCP tools are available for working with multiple attached tabs:
+
+| Tool | Description | Key Args |
+|------|-------------|----------|
+| `list_tabs` | List all Chrome tabs currently attached to spawriter, showing session ID, tab ID, title, URL, and which tab is active | — |
+| `switch_tab` | Switch the MCP session to a different attached Chrome tab | `targetId` (session ID from `list_tabs`) |
+
+### How multi-tab works
+
+- The user attaches tabs by clicking the spawriter toolbar button on each tab.
+- `list_tabs` shows all attached tabs and marks which one is currently active.
+- `switch_tab` closes the current CDP session and reconnects to the specified target. Console logs, network entries, intercept rules, and debugger state are cleared on switch (Playwright sessions are preserved).
+- After switching, all tools (`screenshot`, `execute`, `dashboard_state`, etc.) operate on the new tab.
+- `session_manager` manages Playwright executor VM sessions (isolated JS sandboxes), **not** Chrome tabs.
+
+### Multi-tab workflow: compare two pages
+
+```
+list_tabs                                      → see all attached tabs
+switch_tab { targetId: "spawriter-tab-123-..." } → switch to reference tab
+screenshot                                     → capture reference
+accessibility_snapshot                         → capture reference structure
+switch_tab { targetId: "spawriter-tab-456-..." } → switch to working tab
+screenshot                                     → capture your page
+```
+
+### Single-tab comparison alternative
+
+If only one tab is attached, use navigate-and-snapshot:
+
+1. `navigate { url: "https://reference-page.example.com" }` → go to reference
+2. `screenshot` → capture reference visual
+3. `navigate { url: "http://localhost:8080/your-page" }` → go back to your page
+4. `screenshot` → capture your page visual
+5. Compare the two screenshots
+
+For persistent data across navigations, use `playwright_execute` state:
+
+```
+playwright_execute { code: "state.refLayout = { header: '64px', sidebar: '240px' };" }
+```
+
+### What happens on tab switch
+
+When you call `switch_tab`, the following state is **cleared** (because it's per-tab):
+- Console logs, network log entries
+- Network intercept rules and enabled state
+- Debugger state (breakpoints, known scripts, paused state)
+- Accessibility snapshot diff baseline
+
+The following state is **preserved** (because it's independent of tabs):
+- Playwright executor sessions (`session_manager` / `playwright_execute`)
+- Playwright `state` object (persists across switches)
+
+**Important:** `playwright_execute` maintains its own CDP connection to the relay, independent of `switch_tab`. After switching tabs, `playwright_execute` may still operate on the previously connected page. Call `pwExecutor.reset()` (via the `reset` tool) if you need `playwright_execute` to reconnect.
+
+### What happens when a tab is detached
+
+If the active tab is closed or detached while tools are in use:
+- CDP commands will timeout and return errors
+- Call `list_tabs` to see what's still available
+- Call `switch_tab` to connect to another tab, or `reset` to reconnect to `targets[0]`
+
+If the `preferredTargetId` tab is gone when the session needs to reconnect, `doEnsureSession` automatically falls back to `targets[0]`.
+
+---
+
+## Offline UI Testing with Mock Responses
+
+You do **not** need real API servers or network access to test UI and interactions. spawriter provides full network interception capabilities via the CDP Fetch domain. Use mocks proactively to:
+
+- Test UI rendering with specific API responses (success, error, edge cases)
+- Develop and verify frontend features before the backend is ready
+- Simulate error states (500, 404, timeout) to test error handling UI
+- Test loading states by blocking requests temporarily
+- Reproduce bugs that depend on specific API responses
+
+### Mock testing workflow
+
+#### 1. Enable interception and set up mock rules
+
+```
+network_intercept { action: "enable" }
+network_intercept { action: "add_rule", url_pattern: "/api/users", mock_status: 200, mock_body: "[{\"id\":1,\"name\":\"Test User\"}]" }
+```
+
+#### 2. Test error states
+
+```
+network_intercept { action: "add_rule", url_pattern: "/api/data", mock_status: 500, mock_body: "{\"error\":\"Internal Server Error\"}" }
+network_intercept { action: "add_rule", url_pattern: "/api/auth", mock_status: 401, mock_body: "{\"message\":\"Unauthorized\"}" }
+```
+
+#### 3. Test empty / edge-case states
+
+```
+network_intercept { action: "add_rule", url_pattern: "/api/list", mock_status: 200, mock_body: "[]" }
+network_intercept { action: "add_rule", url_pattern: "/api/list", mock_status: 200, mock_body: "[{\"id\":1,\"name\":\"" }
+```
+
+#### 4. Block requests to test loading / offline states
+
+```
+network_intercept { action: "add_rule", url_pattern: "/api/slow-endpoint", block: true }
+```
+
+#### 5. Verify with screenshot after mock is active
+
+```
+ensure_fresh_render
+screenshot
+console_logs { level: "error" }
+```
+
+#### 6. Combine with Playwright for interaction testing
+
+```
+network_intercept { action: "add_rule", url_pattern: "/api/submit", mock_status: 200, mock_body: "{\"success\":true}" }
+playwright_execute { code: "await page.fill('#name', 'Test'); await page.click('button[type=submit]');" }
+screenshot
+```
+
+#### 7. Clean up when done
+
+```
+network_intercept { action: "disable" }
+```
+
+### When to prefer mock testing
+
+| Situation | Approach |
+|-----------|----------|
+| Backend not available or not deployed yet | Mock the expected API responses |
+| Testing error handling UI | Mock 4xx / 5xx responses |
+| Testing empty states or extreme data | Mock with `[]`, very long strings, etc. |
+| Reproducing a specific bug | Mock the exact response that triggers it |
+| Testing loading / skeleton states | Block the request entirely |
+| Normal development with backend running | Use real APIs, inspect with `network_log` / `network_detail` |
+
+### Custom response headers
+
+Pass `mock_headers` as a JSON string to control Content-Type or other headers:
+
+```
+network_intercept { action: "add_rule", url_pattern: "/api/xml", mock_status: 200, mock_headers: "{\"Content-Type\":\"application/xml\"}", mock_body: "<response><status>ok</status></response>" }
+```
+
+---
+
 ## Safety Rules
 
 1. **Only operate on normal web pages** — never target `chrome://`, `edge://`, or extension pages.
@@ -374,6 +536,7 @@ After any override change, the extension DevTools panel auto-detects and syncs w
 6. **Handle page reloads gracefully** — after `clear_cache_and_reload` or `ensure_fresh_render`, wait before querying state.
 7. **Parallel calls are safe** — `dashboard_state` + `screenshot` can run concurrently without timeout issues.
 8. **Cookie clearing is origin-scoped** — `clear_cache_and_reload` only removes cookies for the current page's origin. Other sites' cookies are never affected, even with `mode: "aggressive"`.
+9. **Mock rules persist until disabled** — always call `network_intercept { action: "disable" }` or `reset` when done with mock testing, so real API traffic is not silently intercepted.
 
 ## Troubleshooting
 

@@ -25,6 +25,7 @@ interface CdpSession {
 
 let cdpSession: CdpSession | null = null;
 let sessionPromise: Promise<CdpSession> | null = null;
+let preferredTargetId: string | null = null;
 
 const pwExecutor = new PlaywrightExecutor();
 const executorManager = new ExecutorManager();
@@ -345,6 +346,7 @@ async function requestExtensionAttachTab(): Promise<boolean> {
 
 interface TargetListItem {
   id: string;
+  tabId?: number;
   type: string;
   title: string;
   url: string;
@@ -519,8 +521,19 @@ async function doEnsureSession(): Promise<CdpSession> {
     throw new Error('No browser tab attached. Click the extension toolbar icon on a web page tab to attach it, then retry.');
   }
 
-  const sessionId = targets[0].id;
-  log('Connecting to CDP relay, target:', targets[0].url);
+  let chosen = targets[0];
+  if (preferredTargetId) {
+    const preferred = targets.find(t => t.id === preferredTargetId);
+    if (preferred) {
+      chosen = preferred;
+    } else {
+      log(`Preferred target ${preferredTargetId} no longer available, falling back to first target`);
+      preferredTargetId = null;
+    }
+  }
+
+  const sessionId = chosen.id;
+  log('Connecting to CDP relay, target:', chosen.url);
   cdpSession = await connectCdp(sessionId);
   log('CDP session established');
 
@@ -1011,6 +1024,22 @@ Actions: enable, set_breakpoint, remove_breakpoint, list_breakpoints, resume, st
     },
   },
   {
+    name: 'list_tabs',
+    description: 'List all Chrome tabs currently attached to spawriter. Shows session ID, tab ID, title, URL, and which tab is active (connected to this MCP session).',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  {
+    name: 'switch_tab',
+    description: 'Switch the MCP session to a different attached Chrome tab. Closes the current CDP connection and reconnects to the specified target. Cleared on switch: console logs, network entries, intercept rules, debugger state, snapshot baseline. Preserved: Playwright sessions (session_manager/playwright_execute).',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        targetId: { type: 'string', description: 'Session ID of the target tab (from list_tabs output)' },
+      },
+      required: ['targetId'],
+    },
+  },
+  {
     name: 'storage',
     description: `Manage browser storage: cookies, localStorage, sessionStorage, cache.
 Actions: get_cookies, set_cookie, delete_cookie, get_local_storage, set_local_storage, remove_local_storage, get_session_storage, clear_storage, get_storage_usage.`,
@@ -1182,6 +1211,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       cdpSession.ws.close();
       cdpSession = null;
     }
+    preferredTargetId = null;
     clearConsoleLogs();
     clearNetworkLog();
     clearInterceptState();
@@ -1194,6 +1224,79 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     knownScripts.clear();
     await executorManager.resetAll();
     return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, and sessions cleared.' }] };
+  }
+
+  if (name === 'list_tabs') {
+    await ensureRelayServer();
+    const targets = await getTargets();
+    if (targets.length === 0) {
+      return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab to attach it.' }] };
+    }
+    const activeSessionId = cdpSession?.sessionId ?? null;
+    const preferredLabel = preferredTargetId && preferredTargetId !== activeSessionId ? `, preferred: ${preferredTargetId}` : '';
+    const lines = targets.map((t, i) => {
+      const markers: string[] = [];
+      if (t.id === activeSessionId) markers.push('active');
+      if (t.id === preferredTargetId && t.id !== activeSessionId) markers.push('preferred');
+      const markerStr = markers.length > 0 ? ` ← ${markers.join(', ')}` : '';
+      const tabLabel = t.tabId != null ? ` (tabId: ${t.tabId})` : '';
+      return `${i + 1}. [${t.id}]${tabLabel}${markerStr}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
+    });
+    const summary = `${targets.length} tab(s) attached${activeSessionId ? `, active: ${activeSessionId}` : ''}${preferredLabel}`;
+    return { content: [{ type: 'text', text: `${summary}\n\n${lines.join('\n\n')}` }] };
+  }
+
+  if (name === 'switch_tab') {
+    const targetId = args.targetId as string;
+    if (!targetId) {
+      return { content: [{ type: 'text', text: 'Error: targetId is required. Use list_tabs to see available targets.' }], isError: true };
+    }
+
+    await ensureRelayServer();
+    const targets = await getTargets();
+    const target = targets.find(t => t.id === targetId);
+    if (!target) {
+      const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
+      return { content: [{ type: 'text', text: `Error: target "${targetId}" not found.\n\nAvailable targets:\n${available}` }], isError: true };
+    }
+
+    if (cdpSession?.sessionId === targetId && cdpSession.ws.readyState === WebSocket.OPEN) {
+      return { content: [{ type: 'text', text: `Already connected to this tab: ${target.title || target.url || '(no title)'}` }] };
+    }
+
+    if (cdpSession) {
+      cdpSession.ws.close();
+      cdpSession = null;
+    }
+    clearConsoleLogs();
+    clearNetworkLog();
+    clearInterceptState();
+    lastSnapshot = null;
+    debuggerEnabled = false;
+    breakpoints.clear();
+    debuggerPaused = false;
+    currentCallFrameId = null;
+    knownScripts.clear();
+
+    try {
+      cdpSession = await connectCdp(targetId);
+    } catch (e) {
+      preferredTargetId = null;
+      return { content: [{ type: 'text', text: `Error: failed to connect to tab "${targetId}". The tab may have been closed or the relay may be unreachable.\nDetail: ${String(e)}\n\nUse list_tabs to see available tabs, or call reset and retry.` }], isError: true };
+    }
+    preferredTargetId = targetId;
+    try {
+      await sendCdpCommand(cdpSession, 'Network.enable', {
+        maxTotalBufferSize: 10 * 1024 * 1024,
+        maxResourceBufferSize: 5 * 1024 * 1024,
+        maxPostDataSize: 65536,
+      });
+      await sendCdpCommand(cdpSession, 'Runtime.enable');
+    } catch {
+      log('Domain enable after switch_tab failed (may already be enabled)');
+    }
+
+    return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}\nSession: ${targetId}\n\nCleared: console logs, network entries, intercept rules, debugger state, snapshot baseline.\nPreserved: Playwright sessions.` }] };
   }
 
   if (name === 'playwright_execute') {

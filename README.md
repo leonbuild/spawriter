@@ -183,6 +183,15 @@ Configure your AI client to point to `mcp/dist/cli.js serve`. Example:
 }
 ```
 
+### Multi-tab support
+
+The extension can attach to multiple Chrome tabs simultaneously (click the toolbar button on each tab). The MCP server provides two tools for tab management:
+
+- `list_tabs` — list all attached tabs with session IDs, titles, URLs, and which tab is active
+- `switch_tab` — switch the CDP session to a different attached tab (clears console/network/intercept/debugger state; Playwright sessions are preserved)
+
+After switching, all tools (`screenshot`, `execute`, `dashboard_state`, etc.) operate on the new tab.
+
 ### MCP tools
 
 | Tool | Description |
@@ -190,11 +199,41 @@ Configure your AI client to point to `mcp/dist/cli.js serve`. Example:
 | `screenshot` | Capture a screenshot of the current page |
 | `accessibility_snapshot` | Read the accessibility tree of the current page |
 | `execute` | Run arbitrary JavaScript in the page context |
+| `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API |
 | `dashboard_state` | Read dashboard status, app states, whether overrides hit localhost |
-| `reset` | Reset the MCP connection |
-| `clear_cache_and_reload` | Clear browser cache/storage with granular control and reload. Cookies are origin-scoped (only current site). |
-| `ensure_fresh_render` | Wait for the page to stabilize after navigation |
+| `console_logs` | Get captured browser console logs with filtering |
+| `network_log` | Get captured network requests with filtering |
+| `network_detail` | Get full details of a specific request (headers, body) |
+| `network_intercept` | Intercept, mock, or block network requests (Fetch domain) |
+| `debugger` | Control JavaScript debugger: breakpoints, stepping, variable inspection |
+| `css_inspect` | Get computed CSS styles for an element by selector |
+| `editor` | View and edit page JS/CSS sources in real-time |
+| `storage` | Manage cookies, localStorage, sessionStorage, cache |
+| `performance` | Runtime metrics, Web Vitals, memory, resource timing |
+| `emulation` | Device, network, geolocation, timezone, media feature emulation |
+| `page_content` | Get clean HTML, text, metadata, or search the DOM |
+| `override_app` | Manage import-map-overrides |
+| `app_action` | Control single-spa app lifecycle (mount / unmount / unload) |
 | `navigate` | Navigate to a URL |
+| `ensure_fresh_render` | Wait for the page to stabilize after navigation |
+| `clear_cache_and_reload` | Clear browser cache/storage with granular control and reload |
+| `list_tabs` | List all attached Chrome tabs (session ID, title, URL, active) |
+| `switch_tab` | Switch CDP session to a different attached Chrome tab |
+| `session_manager` | Manage multiple Playwright executor sessions |
+| `reset` | Reset the MCP connection |
+
+### Offline UI testing with mock responses
+
+You don't need a running backend to test UI. The `network_intercept` tool uses the CDP Fetch domain to intercept any request and return custom responses:
+
+```
+network_intercept { action: "enable" }
+network_intercept { action: "add_rule", url_pattern: "/api/users", mock_status: 200, mock_body: "[{\"id\":1}]" }
+network_intercept { action: "add_rule", url_pattern: "/api/error", mock_status: 500, mock_body: "{\"error\":\"fail\"}" }
+network_intercept { action: "add_rule", url_pattern: "/ads/", block: true }
+```
+
+Use cases: testing error handling UI, empty states, loading states (block request), developing before backend is ready, reproducing specific bugs.
 
 ### Cursor Rules (auto-context for AI agents in Cursor IDE)
 
