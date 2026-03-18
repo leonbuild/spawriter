@@ -8,8 +8,8 @@ description: Control the user's real Chrome tab through spawriter (extension + r
 Before using this skill, you MUST read these docs:
 
 1. `README.md` (Part 2: MCP 使用)
-2. `doc/CHROME_INSTALL_TEST_GUIDE.md`
-3. `doc/MCP_DEV_GUIDE.md`
+2. `docs/CHROME_INSTALL_TEST_GUIDE.md`
+3. `docs/MCP_DEV_GUIDE.md`
 
 Do NOT skip this step. Most failures come from missing setup (extension not loaded, MCP not running, or tab restrictions).
 
@@ -29,11 +29,11 @@ node dist/cli.js serve
 
 Before using any spawriter tool, ensure the browser is connected. If a tool call fails:
 
-1. Ask the user to connect: "I need browser access to [reason]. Please click the spawriter toolbar button to attach your Chrome tab."
-2. Call `reset` to re-establish the connection, then retry.
-3. If still failing, guide the user: check MCP server is running, extension is loaded, tab is a normal web page.
+1. First try `connect_tab { url: "about:blank", create: true }` to auto-create a browser tab
+2. If that fails, call `reset` and retry
+3. Only if that also fails, check that Chrome is open, extension is loaded, and MCP relay is running
 
-**Proactively request connection** when you anticipate needing browser access — don't wait for a tool call to fail.
+**Proactively use `connect_tab`** when you anticipate needing browser access — agents can create and attach tabs without any user interaction.
 
 ## Proactive browser engagement (IMPORTANT)
 

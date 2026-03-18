@@ -2,9 +2,8 @@
   "name": "spawriter",
   "version": "1.0.0",
   "type": "module",
-  "description": "MCP server for spawriter - AI bridge to real Chrome tabs",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "description": "spawriter MCP server + CDP relay — AI-assisted browser automation with zero-touch tab management, multi-agent isolation (Tab Lease System), and 27 MCP tools for Chrome DevTools Protocol access",
+  "main": "dist/cli.js",
   "bin": {
     "spawriter": "./bin.js"
   },

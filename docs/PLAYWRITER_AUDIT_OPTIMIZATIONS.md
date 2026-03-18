@@ -63,7 +63,7 @@ Playwriter 在 commit 36f3801 中发现 `chrome.contextMenus` 在某些环境（
 
 ### spawriter bridge.js 现状分析
 
-审查 `src/ai_bridge/bridge.js`，spawriter 当前使用的 Chrome API 及其防御状态：
+审查 `ext/src/ai_bridge/bridge.js`，spawriter 当前使用的 Chrome API 及其防御状态：
 
 | API | 使用位置 | 是否有防御 |
 |-----|---------|-----------|
@@ -163,7 +163,7 @@ spawriter 在 `mcp.ts` 中**已经正确使用 `Network.getCookies`**：
 
 虽然代码正确，但文档中没有明确说明这个约束。建议在以下位置补充：
 
-1. **`cursor-rules/spawriter.mdc`** Troubleshooting 表中添加：
+1. **`mcp/cursor-rules/spawriter.mdc`** Troubleshooting 表中添加：
 
 ```
 | Cookie 读取失败 | spawriter 使用 `Network.getCookies`（非 `Storage.getCookies`）。
@@ -171,7 +171,7 @@ spawriter 在 `mcp.ts` 中**已经正确使用 `Network.getCookies`**：
 `Network.getCookies` 而非 `Storage.getCookies` |
 ```
 
-2. **`skills/spawriter/SKILL.md`** 中无 cookie 相关内容，如果未来添加 `playwright_execute` cookie 操作示例，需使用 `Network.getCookies`。
+2. **`mcp/skills/spawriter/SKILL.md`** 中无 cookie 相关内容，如果未来添加 `playwright_execute` cookie 操作示例，需使用 `Network.getCookies`。
 
 3. **`docs/MCP_DEV_GUIDE.md`** 或 `docs/CDP_ENHANCEMENT_PLAN.md` 中记录设计决策：
 

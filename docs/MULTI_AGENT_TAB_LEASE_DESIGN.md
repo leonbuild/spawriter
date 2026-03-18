@@ -778,10 +778,10 @@ Chrome Manifest V3 service workers are ephemeral — they terminate after ~30 se
 - `"background"`: Changed from `"scripts"` (MV2/Firefox) to `"service_worker"` (Chrome MV3)
 
 **Files**:
-- `src/offscreen.html` — Minimal HTML that loads `offscreen.js`
-- `src/offscreen.js` — WebSocket owner, relay bridge
-- `src/ai_bridge/bridge.js` — Service worker, delegates WS to offscreen
-- `webpack.config.js` — New entry point + HTML copy for offscreen
+- `ext/src/offscreen.html` — Minimal HTML that loads `offscreen.js`
+- `ext/src/offscreen.js` — WebSocket owner, relay bridge
+- `ext/src/ai_bridge/bridge.js` — Service worker, delegates WS to offscreen
+- `ext/webpack.config.js` — New entry point + HTML copy for offscreen
 
 ### 6.1 New Handler: `connectTabByMatch`
 
@@ -1079,11 +1079,11 @@ The "time-of-check to time-of-use" race between `getTargets()` and `acquireLease
 | `mcp/src/mcp.ts` | Modified | Unique clientId, env vars, enhanced session negotiation, lease-aware switch_tab, new tools (connect_tab, release_tab), enhanced list_tabs, event handling | +150 |
 | `mcp/src/protocol.ts` | Modified | LeaseInfo type, TargetWithLease type | +15 |
 | `mcp/src/utils.ts` | Modified | Export agent label/project URL getters | +10 |
-| `src/ai_bridge/bridge.js` | Modified | Offscreen-based WS delegation, `connectTabByMatch` handler | +80 |
-| `src/offscreen.html` | New | Offscreen document HTML shell | +5 |
-| `src/offscreen.js` | New | Persistent WebSocket owner, relay bridge | +130 |
-| `manifest.json` | Modified | `service_worker` background, `offscreen` permission | +2 |
-| `webpack.config.js` | Modified | New entry point + HTML copy for offscreen | +3 |
+| `ext/src/ai_bridge/bridge.js` | Modified | Offscreen-based WS delegation, `connectTabByMatch` handler | +80 |
+| `ext/src/offscreen.html` | New | Offscreen document HTML shell | +5 |
+| `ext/src/offscreen.js` | New | Persistent WebSocket owner, relay bridge | +130 |
+| `ext/manifest.json` | Modified | `service_worker` background, `offscreen` permission | +2 |
+| `ext/webpack.config.js` | Modified | New entry point + HTML copy for offscreen | +3 |
 | **Total** | | | **~565** |
 
 ---

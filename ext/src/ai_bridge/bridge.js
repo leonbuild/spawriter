@@ -75,26 +75,26 @@ import browser from "webextension-polyfill";
   const icons = {
     connected: {
       path: {
-        "16": "/icons/icon-green-16.png",
-        "32": "/icons/icon-green-32.png",
-        "48": "/icons/icon-green-48.png",
-        "128": "/icons/icon-green-128.png",
+        "16": "/build/icons/icon-green-16.png",
+        "32": "/build/icons/icon-green-32.png",
+        "48": "/build/icons/icon-green-48.png",
+        "128": "/build/icons/icon-green-128.png",
       },
     },
     gray: {
       path: {
-        "16": "/icons/icon-gray-16.png",
-        "32": "/icons/icon-gray-32.png",
-        "48": "/icons/icon-gray-48.png",
-        "128": "/icons/icon-gray-128.png",
+        "16": "/build/icons/icon-gray-16.png",
+        "32": "/build/icons/icon-gray-32.png",
+        "48": "/build/icons/icon-gray-48.png",
+        "128": "/build/icons/icon-gray-128.png",
       },
     },
     idle: {
       path: {
-        "16": "/icons/icon-16.png",
-        "32": "/icons/icon-32.png",
-        "48": "/icons/icon-48.png",
-        "128": "/icons/icon-128.png",
+        "16": "/build/icons/icon-16.png",
+        "32": "/build/icons/icon-32.png",
+        "48": "/build/icons/icon-48.png",
+        "128": "/build/icons/icon-128.png",
       },
     },
   };

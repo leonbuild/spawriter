@@ -1,33 +1,26 @@
 {
   "name": "spawriter",
   "version": "1.0.0",
-  "description": "spawriter devtools extension with MCP support (Manifest V3)",
+  "private": true,
+  "description": "spawriter monorepo: Chrome extension + MCP server",
   "scripts": {
-    "prebuild": "node -e \"process.exit(0)\"",
     "build": "npm run bundle && npm run clean:artifacts",
-    "build:firefox": "npm run webpack-build && web-ext build --overwrite-dest --filename spawriter-firefox-{version}.zip",
-    "build:chrome": "npm run webpack-build && node scripts/build-chrome.js && web-ext build --source-dir dist-chrome --artifacts-dir web-ext-artifacts --overwrite-dest --filename spawriter-chrome-{version}.zip",
-    "bundle": "npm run build:chrome && npm run mcp:build && node scripts/package-release.js",
+    "build:ext": "npm --prefix ext run build:chrome",
+    "build:mcp": "npm --prefix mcp run build",
+    "bundle": "npm run build:ext && npm run build:mcp && node scripts/package-release.js",
     "clean:artifacts": "node scripts/clean-stale-artifacts.js",
     "mcp:build": "npm --prefix mcp run build",
     "mcp:serve": "npm run mcp:build && node mcp/dist/cli.js serve",
     "mcp:relay": "npm run mcp:build && node mcp/dist/cli.js relay",
-    "lint": "web-ext lint",
-    "start": "concurrently --kill-others-on-fail -s \"first\" --names \"EXT,WPK\" -c \"cyan,magenta\" \"npm:start:firefox\" \"webpack --watch\"",
-    "start:firefox": "web-ext run --keep-profile-changes --firefox-profile=spawriter-dev",
-    "start:firefoxdev": "npm run start:firefox -- --firefox=firefoxdeveloperedition",
-    "start:chrome": "concurrently --kill-others-on-fail -s \"first\" --names \"EXT,WPK\" -c \"cyan,magenta\" \"npm:start:chrome-profile\" \"webpack --watch\"",
-    "start:chrome-profile": "web-ext run --target chromium --chromium-profile \"$CHROME_PROFILE_PATH\"",
+    "ext:lint": "npm --prefix ext run lint",
+    "ext:build": "npm --prefix ext run webpack-build",
+    "ext:build:chrome": "npm --prefix ext run build:chrome",
     "start:hot": "powershell -ExecutionPolicy Bypass -File scripts/start-hot.ps1",
-    "self-sign": "npm run webpack-build && npm run lint && web-ext sign",
     "version:bump": "node scripts/bump-version.js",
-    "test": "npx tsx --test mcp/src/mcp.test.ts mcp/src/pw-executor.test.ts",
-    "webpack-build": "node --openssl-legacy-provider ./node_modules/webpack/bin/webpack.js --mode=production",
-    "deploy": "npm run deploy:firefox && npm run deploy:chrome",
-    "deploy:firefox": "npm run webpack-build && npm run lint && shipit firefox .",
-    "deploy:chrome": "npm run build:chrome && shipit chrome web-ext-artifacts/spawriter-chrome-$npm_package_version.zip",
-    "format": "prettier src/ --write",
-    "prepare": "husky install"
+    "test": "npx tsx --test mcp/src/mcp.test.ts mcp/src/pw-executor.test.ts mcp/src/lease.test.ts",
+    "deploy:firefox": "npm --prefix ext run webpack-build && npm --prefix ext run lint && shipit firefox ext/",
+    "deploy:chrome": "npm run ext:build:chrome && shipit chrome ext/web-ext-artifacts/spawriter-chrome-$npm_package_version.zip",
+    "deploy": "npm run deploy:firefox && npm run deploy:chrome"
   },
   "keywords": [
     "single-spa",
@@ -40,33 +33,6 @@
   "author": "LeonBuild",
   "license": "MIT",
   "devDependencies": {
-    "@babel/core": "^7.15.5",
-    "@babel/preset-env": "^7.15.6",
-    "@babel/preset-react": "^7.14.5",
-    "@wext/shipit": "^0.2.1",
-    "babel-loader": "^8.2.2",
-    "concurrently": "^6.3.0",
-    "copy-webpack-plugin": "^9.0.1",
-    "css-loader": "^6.3.0",
-    "husky": "^7.0.0",
-    "lodash-es": "^4.17.21",
-    "prettier": "2.4.1",
-    "pretty-quick": "^3.1.1",
-    "style-loader": "^3.3.0",
-    "web-ext": "^9.2.0",
-    "webpack": "^5.56.1",
-    "webpack-cli": "^4.8.0"
-  },
-  "dependencies": {
-    "@reach/tabs": "^0.16.1",
-    "fuse.js": "^6.4.6",
-    "kremling": "^2.1.0",
-    "react": "^17.0.2",
-    "react-dom": "^17.0.2",
-    "webextension-polyfill": "^0.12.0"
-  },
-  "browserslist": [
-    "last 5 chrome version",
-    "last 5 firefox version"
-  ]
+    "concurrently": "^6.3.0"
+  }
 }

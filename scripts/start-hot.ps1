@@ -64,9 +64,9 @@ Write-Host "Starting hot reload (extension + relay + MCP)..."
 $escapedProfilePath = $ChromeProfilePath.Replace('"', '\"')
 
 $commands = @(
-  "pnpm exec webpack --watch",
-  "node scripts/watch-build-chrome.js",
-  "pnpm exec web-ext run --source-dir dist-chrome --target chromium --chromium-profile \"$escapedProfilePath\"",
+  "pnpm --dir ext exec webpack --watch",
+  "node ext/scripts/watch-build-chrome.js",
+  "pnpm --dir ext exec web-ext run --source-dir dist-chrome --target chromium --chromium-profile ""$escapedProfilePath""",
   "pnpm --dir mcp exec tsx watch src/relay.ts",
   "pnpm --dir mcp exec tsx watch src/mcp.ts"
 )

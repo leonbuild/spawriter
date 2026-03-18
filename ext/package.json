@@ -1,0 +1,42 @@
+{
+  "name": "spawriter-ext",
+  "version": "1.0.0",
+  "private": true,
+  "description": "spawriter Chrome/Firefox extension",
+  "scripts": {
+    "webpack-build": "node --openssl-legacy-provider ./node_modules/webpack/bin/webpack.js --mode=production",
+    "build:firefox": "npm run webpack-build && web-ext build --overwrite-dest --filename spawriter-firefox-{version}.zip",
+    "build:chrome": "npm run webpack-build && node scripts/build-chrome.js && web-ext build --source-dir dist-chrome --artifacts-dir web-ext-artifacts --overwrite-dest --filename spawriter-chrome-{version}.zip",
+    "lint": "web-ext lint",
+    "start:firefox": "web-ext run --keep-profile-changes --firefox-profile=spawriter-dev",
+    "start:chrome-profile": "web-ext run --target chromium --chromium-profile \"$CHROME_PROFILE_PATH\"",
+    "format": "prettier src/ --write"
+  },
+  "devDependencies": {
+    "lodash-es": "^4.17.21",
+    "@babel/core": "^7.15.5",
+    "@babel/preset-env": "^7.15.6",
+    "@babel/preset-react": "^7.14.5",
+    "@wext/shipit": "^0.2.1",
+    "babel-loader": "^8.2.2",
+    "copy-webpack-plugin": "^9.0.1",
+    "css-loader": "^6.3.0",
+    "prettier": "2.4.1",
+    "style-loader": "^3.3.0",
+    "web-ext": "^9.2.0",
+    "webpack": "^5.56.1",
+    "webpack-cli": "^4.8.0"
+  },
+  "dependencies": {
+    "@reach/tabs": "^0.16.1",
+    "fuse.js": "^6.4.6",
+    "kremling": "^2.1.0",
+    "react": "^17.0.2",
+    "react-dom": "^17.0.2",
+    "webextension-polyfill": "^0.12.0"
+  },
+  "browserslist": [
+    "last 5 chrome version",
+    "last 5 firefox version"
+  ]
+}

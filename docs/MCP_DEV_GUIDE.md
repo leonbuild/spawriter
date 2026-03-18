@@ -109,13 +109,13 @@ spawriter/
 扩展侧保持现有 webpack 构建，但新增一个模块文件（或直接合入 background）：
 
 ```
-spawriter/src/
+spawriter/ext/src/
   background_script.js      # 现有：panel通信、clear cache、tabs.reload
   ai_bridge/
     bridge.js               # 新增：WS 连接 relay、chrome.debugger 转发 CDP
 ```
 
-> 注：你现在 `webpack.config.js` entry 已固定，如需打包新模块，建议 `bridge.js` 被 `background_script.js` import 引入即可，不必新增 entry。
+> 注：你现在 `ext/webpack.config.js` entry 已固定，如需打包新模块，建议 `bridge.js` 被 `background_script.js` import 引入即可，不必新增 entry。
 
 ---
 
@@ -128,9 +128,9 @@ spawriter/src/
 
 ### manifest 修改点
 
-在 `manifest.json` 与 `dist-chrome/manifest.json` 的生成流程里加入 `debugger` 权限。
+在 `ext/manifest.json` 与 `ext/dist-chrome/manifest.json` 的生成流程里加入 `debugger` 权限。
 
-> 你有 `scripts/build-chrome.js`，要确认最终 chrome 包的 manifest 也带上 `debugger`。
+> 你有 `ext/scripts/build-chrome.js`，要确认最终 chrome 包的 manifest 也带上 `debugger`。
 
 ---
 
@@ -291,8 +291,8 @@ spawriter/src/
 ### 阶段 2：扩展侧 AI Bridge（2 天）
 
 1. manifest 增加 `debugger` 权限（chrome）
-2. 在 `src/background_script.js` 里 import `./ai_bridge/bridge.js`
-3. 实现 `src/ai_bridge/bridge.js`
+2. 在 `ext/src/background_script.js` 里 import `./ai_bridge/bridge.js`
+3. 实现 `ext/src/ai_bridge/bridge.js`
    - WS 连接 relay：`ws://localhost:<port>/extension`
    - 处理 `ping`→`pong`
    - 实现 `forwardCDPCommand`：
@@ -371,7 +371,7 @@ spawriter/src/
 
 ## 与现有文档的衔接
 
-- Clear cache 相关研究：`doc/CLEAR_CACHE_FEATURE_RESEARCH.md`
-- MV3 生命周期问题：`doc/FIX_EXTENSION_CONTEXT_INVALIDATED.md`
+- Clear cache 相关研究：`docs/CLEAR_CACHE_FEATURE_RESEARCH.md`
+- MV3 生命周期问题：`docs/FIX_EXTENSION_CONTEXT_INVALIDATED.md`
 
 此 MCP 方案需要额外面对 MV3 service worker 被杀的问题；建议直接复用 playwriter 的重连/keep-alive 思路。

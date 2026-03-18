@@ -2,10 +2,10 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const rootDir = path.resolve(__dirname, '..');
-const buildDir = path.join(rootDir, 'build');
-const manifestPath = path.join(rootDir, 'manifest.chrome.json');
-const logoPath = path.join(rootDir, 'logo-white-bgblue.png');
+const extDir = path.resolve(__dirname, '..');
+const buildDir = path.join(extDir, 'build');
+const manifestPath = path.join(extDir, 'manifest.chrome.json');
+const logoPath = path.join(extDir, 'logo-white-bgblue.png');
 
 let pending = null;
 let isRunning = false;

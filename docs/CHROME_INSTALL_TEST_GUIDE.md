@@ -33,9 +33,9 @@ npm run build
   - `extension/spawriter-chrome-<version>.zip`
   - `extension/dist-chrome/`
   - `mcp/dist/`
-  - `skills/spawriter/`
-- 构建结束会自动清理根目录中间产物（`build`、`dist-chrome`、`web-ext-artifacts`），仅保留统一分发目录。
-- 如只需本地 unpacked 目录，可执行：`npm run webpack-build && node scripts/build-chrome.js`
+  - `mcp/skills/spawriter/`
+- 构建结束会自动清理 `ext/` 下中间产物（`ext/build`、`ext/dist-chrome`、`ext/web-ext-artifacts`），仅保留统一分发目录。
+- 如只需本地 unpacked 目录，可执行：`npm run ext:build:chrome`
 
 ---
 

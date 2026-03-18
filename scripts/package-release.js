@@ -12,7 +12,7 @@ const releaseDir = path.join(
 );
 
 const chromeZipName = `${rootPkg.name}-chrome-${rootPkg.version}.zip`;
-const chromeZipSource = path.join(rootDir, "web-ext-artifacts", chromeZipName);
+const chromeZipSource = path.join(rootDir, "ext", "web-ext-artifacts", chromeZipName);
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -114,17 +114,15 @@ function main() {
   rmSafe(releaseDir);
   ensureDir(releaseDir);
 
-  // Extension artifacts
   copyFileIfExists(
     chromeZipSource,
     path.join(releaseDir, "extension", chromeZipName)
   );
   copyDirIfExists(
-    path.join(rootDir, "dist-chrome"),
+    path.join(rootDir, "ext", "dist-chrome"),
     path.join(releaseDir, "extension", "dist-chrome")
   );
 
-  // MCP runtime artifacts
   copyDirIfExists(
     path.join(rootDir, "mcp", "dist"),
     path.join(releaseDir, "mcp", "dist")
@@ -142,19 +140,17 @@ function main() {
     path.join(releaseDir, "mcp", "bin.js")
   );
 
-  // Root CLI compatibility shim
   copyFileIfExists(
-    path.join(rootDir, "dist", "cli.js"),
+    path.join(rootDir, "mcp", "dist", "cli.js"),
     path.join(releaseDir, "dist", "cli.js")
   );
 
-  // Skill + Cursor rules + docs
   copyDirIfExists(
-    path.join(rootDir, "skills", "spawriter"),
+    path.join(rootDir, "mcp", "skills", "spawriter"),
     path.join(releaseDir, "skills", "spawriter")
   );
   copyDirIfExists(
-    path.join(rootDir, "cursor-rules"),
+    path.join(rootDir, "mcp", "cursor-rules"),
     path.join(releaseDir, "cursor-rules")
   );
   copyFileIfExists(

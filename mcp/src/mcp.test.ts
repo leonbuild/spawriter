@@ -4913,6 +4913,8 @@ describe('Integration: All tool names are unique and complete', () => {
     'console_logs', 'network_log', 'network_detail', 'playwright_execute', 'reset',
     'clear_cache_and_reload', 'ensure_fresh_render', 'navigate',
     'override_app', 'app_action', 'debugger', 'css_inspect', 'session_manager',
+    'list_tabs', 'switch_tab', 'connect_tab', 'release_tab',
+    'storage', 'performance', 'editor', 'network_intercept', 'emulation', 'page_content',
   ];
 
   it('should have no duplicate tool names', () => {
@@ -4920,8 +4922,8 @@ describe('Integration: All tool names are unique and complete', () => {
     assert.equal(unique.size, allTools.length);
   });
 
-  it('should have exactly 17 tools', () => {
-    assert.equal(allTools.length, 17);
+  it('should have exactly 27 tools', () => {
+    assert.equal(allTools.length, 27);
   });
 
   it('Phase 1 tools present', () => {

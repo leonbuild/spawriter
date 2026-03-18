@@ -556,7 +556,7 @@ Use for: complex interactions, form filling, multi-page, Playwright locators.`,
 
 ## 9. cursor-rules 更新
 
-Phase 1/2 完成后更新 `cursor-rules/spawriter.mdc`：
+Phase 1/2 完成后更新 `mcp/cursor-rules/spawriter.mdc`：
 
 ```markdown
 ### Inspection & State

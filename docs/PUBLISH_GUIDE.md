@@ -15,8 +15,8 @@
 | 文件 | 需要修改的内容 |
 |------|----------------|
 | `package.json` | `name`, `author`, `description`, `version` |
-| `manifest.json` | `name`, `short_name`, `author`, `homepage_url`, `description`, `version`, `gecko.id` |
-| `manifest.chrome.json` | `name`, `short_name`, `author`, `homepage_url`, `description`, `version` |
+| `ext/manifest.json` | `name`, `short_name`, `author`, `homepage_url`, `description`, `version`, `gecko.id` |
+| `ext/manifest.chrome.json` | `name`, `short_name`, `author`, `homepage_url`, `description`, `version` |
 | `.web-extension-id` | 删除此文件（Firefox 会生成新的） |
 
 #### 示例修改：
@@ -31,7 +31,7 @@
 }
 ```
 
-**manifest.json / manifest.chrome.json:**
+**ext/manifest.json / ext/manifest.chrome.json:**
 ```json
 {
   "name": "spawriter",
@@ -43,7 +43,7 @@
 }
 ```
 
-**manifest.json (Firefox gecko 配置):**
+**ext/manifest.json (Firefox gecko 配置):**
 ```json
 {
   "browser_specific_settings": {
@@ -66,7 +66,7 @@
 | 96x96 | Firefox 商店展示 |
 | 128x128 | Chrome 商店展示 |
 
-更新 `manifest.json` 和 `manifest.chrome.json` 中的 icons 配置：
+更新 `ext/manifest.json` 和 `ext/manifest.chrome.json` 中的 icons 配置：
 
 ```json
 {
@@ -282,8 +282,8 @@ npm run build:chrome
 
 在以下文件中同步更新版本号：
 - `package.json` 中的 `version`
-- `manifest.json` 中的 `version`
-- `manifest.chrome.json` 中的 `version`
+- `ext/manifest.json` 中的 `version`
+- `ext/manifest.chrome.json` 中的 `version`
 
 ```bash
 # 示例：从 3.1.1 更新到 3.2.0
@@ -386,8 +386,8 @@ Last updated: [Date]
 
 ### 发布前
 - [ ] 更新 `package.json` 中的版本号
-- [ ] 更新 `manifest.json` 中的版本号
-- [ ] 更新 `manifest.chrome.json` 中的版本号
+- [ ] 更新 `ext/manifest.json` 中的版本号
+- [ ] 更新 `ext/manifest.chrome.json` 中的版本号
 - [ ] 更新 README 中的 Changelog
 - [ ] 运行 `npm run lint` 检查是否有错误
 - [ ] 在本地测试扩展功能

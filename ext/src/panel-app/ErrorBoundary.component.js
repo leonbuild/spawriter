@@ -97,7 +97,7 @@ export default class ErrorBoundary extends React.Component {
           <p>
             Also, report this error{" "}
             <a
-              href={`https://github.com/gzl333/spawriter/issues/new?title=spawriter%20bug%20report&body=${encodeURIComponent(
+              href={`https://github.com/leonbuild/spawriter/issues/new?title=spawriter%20bug%20report&body=${encodeURIComponent(
                 this.state.caughtError.message
               )}%0A%0A%60%60%60%0A${encodeURIComponent(
                 this.state.caughtError.stack

@@ -7,8 +7,9 @@
  *
  * Files updated:
  *   - package.json
- *   - manifest.json
- *   - manifest.chrome.json
+ *   - ext/manifest.json
+ *   - ext/manifest.chrome.json
+ *   - ext/package.json
  *   - mcp/package.json
  */
 
@@ -19,8 +20,9 @@ const rootDir = path.resolve(__dirname, "..");
 
 const VERSION_FILES = [
   path.join(rootDir, "package.json"),
-  path.join(rootDir, "manifest.json"),
-  path.join(rootDir, "manifest.chrome.json"),
+  path.join(rootDir, "ext", "manifest.json"),
+  path.join(rootDir, "ext", "manifest.chrome.json"),
+  path.join(rootDir, "ext", "package.json"),
   path.join(rootDir, "mcp", "package.json"),
 ];
 

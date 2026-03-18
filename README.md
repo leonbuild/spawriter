@@ -86,16 +86,16 @@ The directory contains:
 - `extension/dist-chrome/` — Chrome unpacked extension
 - `extension/spawriter-chrome-<version>.zip` — Chrome zip
 - `mcp/dist/` — MCP server build artifacts
-- `skills/spawriter/` — Agent skill definitions
-- `cursor-rules/` — Cursor IDE rule templates
-- `doc/` — Installation and development guides
+- `mcp/skills/spawriter/` — Agent skill definitions
+- `mcp/cursor-rules/` — Cursor IDE rule templates
+- `docs/` — Installation and development guides
 
-After `npm run build`, intermediate directories (`build`, `dist-chrome`, `web-ext-artifacts`) are automatically cleaned up to avoid confusion.
+After `npm run build`, intermediate directories (`ext/build`, `ext/dist-chrome`, `ext/web-ext-artifacts`) are automatically cleaned up to avoid confusion.
 
 > **Build notes**
 >
 > - `release/` is a pure build artifact (in `.gitignore`) — safe to delete and fully rebuild with `npm run build`.
-> - To bump the version, use `npm run version:bump <patch|minor|major|x.y.z>`. This updates `package.json`, `manifest.json`, `manifest.chrome.json`, and `mcp/package.json` in sync.
+> - To bump the version, use `npm run version:bump <patch|minor|major|x.y.z>`. This updates `package.json`, `ext/manifest.json`, `ext/manifest.chrome.json`, `ext/package.json`, and `mcp/package.json` in sync.
 > - Build pipeline: `webpack → build-chrome → web-ext zip → mcp:build → package-release → clean:artifacts`.
 > - Old release directories are automatically cleaned by `clean:artifacts`; only the current version is kept.
 
@@ -122,9 +122,18 @@ This part enables AI agents to interact with your browser. You can use the Dashb
 
 ### Architecture
 
-- **Chrome extension** — includes the spawriter AI Bridge (default port `19989`)
-- **Relay** — CDP forwarding on port `19989` (independent of playwriter's `19988`; both extensions can coexist)
-- **MCP Server** — stdio-based tool server
+spawriter is a monorepo with two main packages:
+
+- **`ext/`** — Chrome extension with spawriter AI Bridge, DevTools panel, and CDP relay connection (persistent WebSocket via offscreen document)
+- **`mcp/`** — MCP server (stdio-based tool server) + CDP relay server (port `19989`)
+
+Communication flow: `AI Agent → MCP Server → CDP Relay → Chrome Extension → Chrome DevTools Protocol → Browser Tab`
+
+Key features:
+- **Zero-touch tab management** — agents can create, attach, navigate, and release browser tabs without any manual user interaction
+- **Multi-agent isolation** — Tab Lease System ensures exclusive tab ownership per agent
+- **Visual indicators** — connected tabs show a green "spawriter" tab group and 🟢 title prefix
+- **Persistent connection** — Chrome extension uses an offscreen document to maintain a persistent WebSocket to the relay, surviving Manifest V3 service worker restarts
 
 ### Quick start (from the dev repo)
 
@@ -185,7 +194,7 @@ Configure your AI client to point to `mcp/dist/cli.js serve`. Example:
 
 ### Multi-tab support
 
-The extension can attach to multiple Chrome tabs simultaneously (click the toolbar button on each tab). The MCP server provides tools for tab management:
+The extension can attach to multiple Chrome tabs simultaneously. Agents can programmatically create and attach tabs with `connect_tab`, or users can click the toolbar button. The MCP server provides tools for tab management:
 
 - `list_tabs` — list all attached tabs with session IDs, titles, URLs, and which tab is active
 - `switch_tab` — switch the CDP session to a different attached tab (clears console/network/intercept/debugger state; Playwright sessions are preserved)
@@ -296,7 +305,7 @@ playwright_execute { code: "const [download] = await Promise.all([page.waitForEv
 
 In Cursor IDE, `.cursor/rules/*.mdc` files inject MCP usage knowledge into the AI automatically.
 
-A pre-built rule template is included: `cursor-rules/spawriter.mdc`
+A pre-built rule template is included: `mcp/cursor-rules/spawriter.mdc`
 
 #### Installation
 
@@ -304,7 +313,7 @@ Copy the rule file into your workspace:
 
 ```bash
 mkdir -p /path/to/workspace/.cursor/rules
-cp cursor-rules/spawriter.mdc /path/to/workspace/.cursor/rules/
+cp mcp/cursor-rules/spawriter.mdc /path/to/workspace/.cursor/rules/
 ```
 
 #### Scope configuration
@@ -325,7 +334,7 @@ Edit the `globs:` line at the top of the `.mdc` file.
 |---|---|---|
 | Trigger | Auto-injected when editing matching files | Explicitly loaded by the agent system |
 | Best for | Day-to-day development in Cursor IDE | Distribution to other AI agent systems |
-| Location | Workspace `.cursor/rules/` | Project `skills/` |
+| Location | Workspace `.cursor/rules/` | Project `mcp/skills/` |
 
 Both can coexist. Use Rules for Cursor; use Skills for other agent systems.
 
@@ -335,9 +344,9 @@ Following the "CLI + MCP + Skill" pattern pioneered by [`remorses/playwriter`](h
 
 - Reference project: [`remorses/playwriter`](https://github.com/remorses/playwriter)
 - Recommended reading:
-  - `doc/MCP_DEV_GUIDE.md`
-  - `doc/CHROME_INSTALL_TEST_GUIDE.md`
-- Ready-to-copy skill: `skills/spawriter/SKILL.md`
+  - `docs/MCP_DEV_GUIDE.md`
+  - `docs/CHROME_INSTALL_TEST_GUIDE.md`
+- Ready-to-copy skill: `mcp/skills/spawriter/SKILL.md`
 - Best practice: always call `dashboard_state` first to confirm override & dashboard status before making changes.
 
 ### Troubleshooting
@@ -355,12 +364,47 @@ Following the "CLI + MCP + Skill" pattern pioneered by [`remorses/playwriter`](h
 
 ---
 
+## Project Structure
+
+```
+spawriter/
+├── ext/                    # Chrome Extension (Manifest V3)
+│   ├── src/                # Extension source (JS)
+│   ├── build/              # Webpack output
+│   ├── dist-chrome/        # Chrome build output
+│   ├── scripts/            # Extension-only build scripts
+│   ├── manifest.json       # Firefox manifest
+│   ├── manifest.chrome.json# Chrome manifest
+│   ├── webpack.config.js
+│   └── package.json        # Extension dependencies
+│
+├── mcp/                    # MCP Server (TypeScript)
+│   ├── src/                # Server source (relay, MCP, tools)
+│   ├── dist/               # Compiled output
+│   ├── skills/             # AI skill definitions
+│   ├── cursor-rules/       # Cursor IDE rule templates
+│   └── package.json        # MCP dependencies
+│
+├── scripts/                # Cross-project orchestration
+│   ├── bump-version.js     # Sync version across all packages
+│   ├── package-release.js  # Bundle ext + mcp for distribution
+│   ├── clean-stale-artifacts.js
+│   └── start-hot.*         # Hot-reload dev (ext + mcp)
+│
+├── docs/                   # Documentation
+├── package.json            # Root orchestration (minimal)
+└── README.md
+```
+
+---
+
 ## Documentation
 
-- `doc/CHROME_INSTALL_TEST_GUIDE.md`
-- `doc/MCP_DEV_GUIDE.md`
-- `doc/PUBLISH_GUIDE.md`
+- `docs/CHROME_INSTALL_TEST_GUIDE.md`
+- `docs/MCP_DEV_GUIDE.md`
+- `docs/PUBLISH_GUIDE.md`
 - `docs/MULTI_AGENT_TAB_LEASE_DESIGN.md`
+- `docs/TAB_LEASE_AUDIT_REPORT.md`
 
 ---
 
@@ -370,4 +414,4 @@ Contributions are welcome! Please open an issue or submit a pull request.
 
 ## License
 
-[MIT](LICENSE)
+MIT

@@ -19,6 +19,11 @@ module.exports = {
         { from: path.resolve(__dirname, "src/panel.html") },
         { from: path.resolve(__dirname, "src/main.html") },
         { from: path.resolve(__dirname, "src/offscreen.html") },
+        {
+          from: "*.png",
+          to: "icons/[name][ext]",
+          context: path.resolve(__dirname, "src/icons"),
+        },
       ],
     }),
   ],

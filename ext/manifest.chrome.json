@@ -4,7 +4,7 @@
   "short_name": "spawriter",
   "version": "1.0.0",
   "author": "LeonBuild",
-  "homepage_url": "https://github.com/gzl333/spawriter",
+  "homepage_url": "https://github.com/leonbuild/spawriter",
   "description": "spawriter devtools panel with MCP support (Manifest V3)",
   "action": {
     "default_icon": {
@@ -21,7 +21,7 @@
     "128": "./icons/icon-128.png"
   },
   "devtools_page": "./build/main.html",
-  "permissions": ["storage", "scripting", "browsingData", "tabs", "tabGroups", "debugger"],
+  "permissions": ["storage", "scripting", "browsingData", "tabs", "tabGroups", "debugger", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "content_scripts": [
     {

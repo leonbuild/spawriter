@@ -6,23 +6,20 @@
 const fs = require('fs');
 const path = require('path');
 
-const rootDir = path.resolve(__dirname, '..');
-const distDir = path.join(rootDir, 'dist-chrome');
+const extDir = path.resolve(__dirname, '..');
+const distDir = path.join(extDir, 'dist-chrome');
 
-// Files and directories to copy
 const filesToCopy = [
   'build',
 ];
 
-// Clean and create dist directory
 if (fs.existsSync(distDir)) {
   fs.rmSync(distDir, { recursive: true });
 }
 fs.mkdirSync(distDir);
 
-// Copy files
 filesToCopy.forEach(file => {
-  const src = path.join(rootDir, file);
+  const src = path.join(extDir, file);
   const dest = path.join(distDir, file);
   
   if (fs.existsSync(src)) {
@@ -37,8 +34,7 @@ filesToCopy.forEach(file => {
   }
 });
 
-// Copy icons (only PNGs)
-const iconsSrcDir = path.join(rootDir, 'src', 'icons');
+const iconsSrcDir = path.join(extDir, 'src', 'icons');
 const iconsDestDir = path.join(distDir, 'icons');
 if (fs.existsSync(iconsSrcDir)) {
   fs.mkdirSync(iconsDestDir, { recursive: true });
@@ -50,15 +46,13 @@ if (fs.existsSync(iconsSrcDir)) {
   console.log('Copied: icons/ (PNG files)');
 }
 
-// Copy Chrome-specific manifest
-const chromeManifest = path.join(rootDir, 'manifest.chrome.json');
+const chromeManifest = path.join(extDir, 'manifest.chrome.json');
 const destManifest = path.join(distDir, 'manifest.json');
 fs.copyFileSync(chromeManifest, destManifest);
 console.log('Copied: manifest.chrome.json -> manifest.json');
 
 console.log('\nChrome build prepared in dist-chrome/');
 
-// Helper function to copy directory recursively
 function copyDir(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
@@ -74,4 +68,3 @@ function copyDir(src, dest) {
     }
   }
 }
-

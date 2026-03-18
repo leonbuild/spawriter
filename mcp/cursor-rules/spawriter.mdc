@@ -107,11 +107,11 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 Before using any spawriter tool, you must have an active browser connection. If a tool call fails with a connection error or timeout:
 
-1. **Ask the user to connect** — say: "I need browser access to [reason]. Please make sure spawriter is connected to your Chrome tab (click the spawriter toolbar button to attach)."
-2. Call `reset` to re-establish the connection, then retry.
-3. If still failing, guide the user: check that the MCP server is running (`node dist/cli.js serve`), the extension is loaded, and the tab is a normal web page (not `chrome://` or `edge://`).
+1. **First try zero-touch connection** — `connect_tab { url: "your-target-url", create: true }` to auto-create and attach a tab.
+2. If that fails, call `reset` to re-establish the connection, then retry `connect_tab`.
+3. Only if that also fails, ask the user to ensure: Chrome is open, the extension is loaded, and the MCP relay is running (`node dist/cli.js serve`).
 
-**Proactively request connection** when you anticipate needing browser access — don't wait until a tool call fails. For example, if the user asks you to fix a UI bug, immediately check if the browser is reachable before diving into code.
+**Proactively use `connect_tab`** when you anticipate needing browser access — don't wait until a tool call fails or ask the user to manually attach tabs. For example, if the user asks you to fix a UI bug, immediately try `connect_tab { url: "their-url", create: true }` before diving into code.
 
 ---
 
@@ -133,6 +133,7 @@ Before using any spawriter tool, you must have an active browser connection. If 
 | **You're debugging an API issue** | `network_log` → find the request → `network_detail` for headers + body | See the actual request/response, not just the code that sends it |
 | **User asks to match a design or another site** | `navigate` to the reference, `screenshot`, analyze, then navigate back and compare | Visual side-by-side is far more reliable than verbal description |
 | **You're exploring an unfamiliar page/app** | `dashboard_state` + `screenshot { labels: true }` + `accessibility_snapshot` | Build a mental model of the page structure and available interactions |
+| **You need a browser tab but none is attached** | `connect_tab { url: "about:blank", create: true }` then `navigate` to your target URL | Zero-touch — agents should never ask users to manually attach tabs |
 | **After setting up or changing an override** | `dashboard_state` + `ensure_fresh_render` + `screenshot` | Confirm the override actually took effect |
 | **User says "it doesn't work" or "it looks wrong"** | `screenshot` immediately — see what they see | Don't ask the user to describe it; look at it yourself |
 
