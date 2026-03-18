@@ -451,7 +451,7 @@ async function requestConnectTab(params) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(params),
-            signal: AbortSignal.timeout(20000),
+            signal: AbortSignal.timeout(18000),
         });
         return await response.json();
     }
@@ -564,7 +564,7 @@ async function doEnsureSession() {
     if (targets.length > 0 && leasedCount === targets.length) {
         const holders = targets.map(t => {
             const l = t.lease;
-            return `  - ${t.url || '(no url)'} — leased by ${l.label || l.clientId}`;
+            return `  • ${t.url || '(no url)'} — leased by ${l.label || l.clientId}`;
         }).join('\n');
         throw new Error(`All ${targets.length} attached tab(s) are leased by other agents:\n${holders}\n\n` +
             `To get a tab for this agent:\n` +
@@ -1333,7 +1333,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             if (!url && tabId === undefined) {
                 return { content: [{ type: 'text', text: 'Error: Provide either url or tabId.' }], isError: true };
             }
-            const result = await requestConnectTab({ url, tabId, create });
+            let result = await requestConnectTab({ url, tabId, create });
+            if (!result.success && result.error === 'Extension not connected') {
+                log('Extension not connected, retrying connect_tab (waiting for extension service worker)...');
+                for (let retry = 0; retry < 6; retry++) {
+                    await sleep(2000);
+                    result = await requestConnectTab({ url, tabId, create });
+                    if (result.success || result.error !== 'Extension not connected')
+                        break;
+                    log(`connect_tab retry ${retry + 1}/6...`);
+                }
+            }
             if (!result.success) {
                 return { content: [{ type: 'text', text: `Failed to connect tab: ${result.error || 'Unknown error'}` }], isError: true };
             }

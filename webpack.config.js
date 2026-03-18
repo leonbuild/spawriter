@@ -9,6 +9,7 @@ module.exports = {
     contentScript: "./src/content_script.js",
     contentScriptMain: "./src/content_script_main.js",
     backgroundScript: "./src/background_script.js",
+    offscreen: "./src/offscreen.js",
     panel: "./src/panel.js",
     panelApp: "./src/panel-app.js",
   },
@@ -17,6 +18,7 @@ module.exports = {
       patterns: [
         { from: path.resolve(__dirname, "src/panel.html") },
         { from: path.resolve(__dirname, "src/main.html") },
+        { from: path.resolve(__dirname, "src/offscreen.html") },
       ],
     }),
   ],

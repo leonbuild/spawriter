@@ -3,17 +3,27 @@ import browser from "webextension-polyfill";
 (function () {
   "use strict";
 
-  const RELAY_PORT = "19989";
-  const RELAY_URL = `ws://localhost:${RELAY_PORT}/extension`;
-
-  let ws = null;
-  let connectionPromise = null;
   let attachedTabs = new Map();
   let tabStates = new Map();
   let debuggerEventListenerRegistered = false;
-  let consecutiveConnectionFailures = 0;
-  let lastConnectionWarningAt = 0;
-  let maintainLoopTimer = null;
+  let offscreenReady = false;
+
+  async function persistState() {
+    try {
+      await chrome.storage.session.set({
+        _attachedTabs: [...attachedTabs.entries()],
+        _tabStates: [...tabStates.entries()],
+      });
+    } catch (_) {}
+  }
+
+  async function restoreState() {
+    try {
+      const data = await chrome.storage.session.get(["_attachedTabs", "_tabStates"]);
+      if (data._attachedTabs) attachedTabs = new Map(data._attachedTabs);
+      if (data._tabStates) tabStates = new Map(data._tabStates);
+    } catch (_) {}
+  }
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -42,9 +52,7 @@ import browser from "webextension-polyfill";
   }
 
   function getConnectionState() {
-    if (ws?.readyState === WebSocket.OPEN) return "connected";
-    if (connectionPromise) return "connecting";
-    return "idle";
+    return offscreenReady ? "connected" : "idle";
   }
 
   function getTabState(tabId) {
@@ -57,6 +65,7 @@ import browser from "webextension-polyfill";
     } else {
       tabStates.set(tabId, state);
     }
+    persistState();
   }
 
   function getConnectedCount() {
@@ -192,11 +201,69 @@ import browser from "webextension-polyfill";
       updateIcons();
     });
 
-    browser.tabs.onUpdated.addListener(() => {
+    browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       updateIcons();
+      if (changeInfo.status === "complete" && attachedTabs.has(tabId)) {
+        markTabTitle(tabId, true);
+      }
     });
 
     debuggerEventListenerRegistered = true;
+  }
+
+  const TAB_TITLE_PREFIX = "🟢 ";
+
+  async function markTabTitle(tabId, attach) {
+    try {
+      const prefix = TAB_TITLE_PREFIX;
+      if (attach) {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (p) => {
+            if (window.__spawriterTitleObserver) return;
+            const ensure = () => {
+              if (!document.title.startsWith(p)) document.title = p + document.title;
+            };
+            ensure();
+            const titleEl = document.querySelector("title");
+            if (titleEl) {
+              const obs = new MutationObserver(ensure);
+              obs.observe(titleEl, { childList: true, characterData: true, subtree: true });
+              window.__spawriterTitleObserver = obs;
+            }
+            const origDesc = Object.getOwnPropertyDescriptor(Document.prototype, "title") ||
+                             Object.getOwnPropertyDescriptor(HTMLDocument.prototype, "title");
+            if (origDesc?.set) {
+              Object.defineProperty(document, "title", {
+                get: origDesc.get,
+                set(v) {
+                  origDesc.set.call(this, v.startsWith(p) ? v : p + v);
+                },
+                configurable: true,
+              });
+              window.__spawriterOrigTitleDesc = origDesc;
+            }
+          },
+          args: [prefix],
+        });
+      } else {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (p) => {
+            if (window.__spawriterTitleObserver) {
+              window.__spawriterTitleObserver.disconnect();
+              window.__spawriterTitleObserver = null;
+            }
+            if (window.__spawriterOrigTitleDesc) {
+              Object.defineProperty(document, "title", window.__spawriterOrigTitleDesc);
+              window.__spawriterOrigTitleDesc = null;
+            }
+            if (document.title.startsWith(p)) document.title = document.title.slice(p.length);
+          },
+          args: [prefix],
+        });
+      }
+    } catch (_) {}
   }
 
   function emitDetachedFromTarget(tabId, reason) {
@@ -204,6 +271,8 @@ import browser from "webextension-polyfill";
     if (!tabInfo) return;
 
     attachedTabs.delete(tabId);
+    persistState();
+    markTabTitle(tabId, false);
     sendMessage({
       method: "forwardCDPEvent",
       params: {
@@ -215,134 +284,101 @@ import browser from "webextension-polyfill";
     log(`Detached target for tab ${tabId}: ${reason}`);
   }
 
-  async function ensureConnection() {
-    if (ws?.readyState === WebSocket.OPEN) return;
-    if (connectionPromise) return connectionPromise;
+  // --- Offscreen-based WebSocket communication ---
 
-    connectionPromise = connect();
+  let offscreenCreating = null;
+
+  async function ensureOffscreen() {
+    if (offscreenCreating) return offscreenCreating;
+    offscreenCreating = _createOffscreen();
     try {
-      await connectionPromise;
+      await offscreenCreating;
     } finally {
-      connectionPromise = null;
+      offscreenCreating = null;
     }
   }
 
-  function reportConnectionFailure(err) {
-    consecutiveConnectionFailures += 1;
-    const now = Date.now();
-    const shouldWarn =
-      consecutiveConnectionFailures === 1 ||
-      now - lastConnectionWarningAt >= 60000;
-
-    if (shouldWarn) {
-      lastConnectionWarningAt = now;
-      warn(
-        `Relay unavailable (${err?.message || err}). Auto-retrying every 5s.`,
-        `failure_count=${consecutiveConnectionFailures}`
-      );
+  async function _createOffscreen() {
+    try {
+      const existingContexts = await chrome.runtime.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+      });
+      if (existingContexts.length > 0) {
+        log("Offscreen document already exists");
+        return;
+      }
+    } catch (e) {
+      warn("getContexts failed:", e.message);
     }
-  }
 
-  function reportConnectionRecovery() {
-    if (consecutiveConnectionFailures > 0) {
-      log(
-        `Relay connection recovered after ${consecutiveConnectionFailures} failed attempt(s)`
-      );
-    }
-    consecutiveConnectionFailures = 0;
-    lastConnectionWarningAt = 0;
-  }
-
-  async function connect() {
-    for (let attempt = 0; attempt < 30; attempt++) {
-      try {
-        const response = await fetch(`http://localhost:${RELAY_PORT}`, {
-          method: "HEAD",
-          signal: AbortSignal.timeout(2000),
-        });
-        if (response.ok) break;
-        if (attempt === 29)
-          throw new Error(`Relay server unhealthy status: ${response.status}`);
-        await sleep(1000);
-      } catch (e) {
-        if (attempt === 29) throw new Error("Relay server not available");
-        await sleep(1000);
+    try {
+      await chrome.offscreen.createDocument({
+        url: "build/offscreen.html",
+        reasons: ["WORKERS"],
+        justification: "Persistent WebSocket connection to spawriter CDP relay",
+      });
+      log("Offscreen document created successfully");
+    } catch (e) {
+      if (e.message?.includes("Only a single offscreen")) {
+        log("Offscreen document already exists (race)");
+      } else {
+        error("Failed to create offscreen document:", e.message);
+        throw e;
       }
     }
-
-    log("Connecting to relay:", RELAY_URL);
-    ws = new WebSocket(RELAY_URL);
-
-    await new Promise((resolve, reject) => {
-      let timeoutFired = false;
-      const timeout = setTimeout(() => {
-        timeoutFired = true;
-        reject(new Error("WebSocket connection timeout"));
-      }, 5000);
-
-      ws.onopen = () => {
-        if (timeoutFired) return;
-        clearTimeout(timeout);
-        log("WebSocket connected");
-        updateIcons();
-        resolve();
-      };
-
-      ws.onerror = () => {
-        if (!timeoutFired) {
-          clearTimeout(timeout);
-          reject(new Error("WebSocket connection failed"));
-        }
-      };
-
-      ws.onclose = (event) => {
-        if (!timeoutFired) {
-          clearTimeout(timeout);
-          log("WebSocket closed:", event.code, event.reason);
-        }
-        for (const tabId of attachedTabs.keys()) {
-          setTabState(tabId, "idle");
-        }
-        attachedTabs.clear();
-        updateIcons();
-        syncTabGroup();
-      };
-    });
-
-    ws.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
-
-        if (message.method === "ping") {
-          sendMessage({ method: "pong" });
-          return;
-        }
-
-        if (message.method === "forwardCDPCommand") {
-          // Fire-and-forget: allow concurrent CDP commands instead of
-          // serializing through await, which caused head-of-line blocking
-          // when slow commands (e.g. Accessibility.getFullAXTree) blocked
-          // faster ones (e.g. Runtime.evaluate).
-          handleCDPCommand(message).catch((e) => {
-            error("Unhandled error in CDP command:", e);
-            sendMessage({ id: message.id, error: e.message || String(e) });
-          });
-          return;
-        }
-
-        if (message.method === "connectActiveTab" || message.method === "connectTabByMatch") {
-          handleRelayMessage(message)
-            .then((result) => sendMessage({ id: message.id, ...result }))
-            .catch((e) => sendMessage({ id: message.id, success: false, error: e.message }));
-          return;
-        }
-
-        error("Unknown message from relay:", message);
-      } catch (e) {
-        error("Error handling message:", e);
-      }
-    };
   }
+
+  async function ensureRelayConnected() {
+    await ensureOffscreen();
+    if (offscreenReady) return;
+    for (let i = 0; i < 20; i++) {
+      try {
+        const resp = await chrome.runtime.sendMessage({ type: "ws-status" });
+        if (resp?.state === "open") {
+          offscreenReady = true;
+          return;
+        }
+      } catch (_) {}
+      await sleep(500);
+    }
+    warn("Relay WebSocket not open after waiting");
+  }
+
+  function sendMessage(message) {
+    try {
+      chrome.runtime.sendMessage({ type: "ws-send", payload: message }).catch(() => {
+        warn("Cannot send message, offscreen not available");
+      });
+    } catch (_) {
+      warn("Cannot send message, offscreen not available");
+    }
+  }
+
+  function handleRelayIncoming(message) {
+    if (message.method === "ping") {
+      sendMessage({ method: "pong" });
+      return;
+    }
+
+    if (message.method === "forwardCDPCommand") {
+      handleCDPCommand(message).catch((e) => {
+        error("Unhandled error in CDP command:", e);
+        sendMessage({ id: message.id, error: e.message || String(e) });
+      });
+      return;
+    }
+
+    if (message.method === "connectActiveTab" || message.method === "connectTabByMatch") {
+      handleRelayMessage(message)
+        .then((result) => sendMessage({ id: message.id, ...result }))
+        .catch((e) => sendMessage({ id: message.id, success: false, error: e.message }));
+      return;
+    }
+
+    error("Unknown message from relay:", message);
+  }
+
+  // --- CDP command handling ---
 
   const SLOW_CDP_METHODS = new Set([
     "Accessibility.getFullAXTree",
@@ -449,13 +485,7 @@ import browser from "webextension-polyfill";
     }
   }
 
-  function sendMessage(message) {
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(message));
-    } else {
-      warn("Cannot send message, WebSocket not connected");
-    }
-  }
+  // --- Tab management ---
 
   async function connectTab(tabId) {
     try {
@@ -463,9 +493,8 @@ import browser from "webextension-polyfill";
       setTabState(tabId, "connecting");
       updateIcons();
 
-      await ensureConnection();
+      await ensureRelayConnected();
       await attachTab(tabId);
-      startMaintainLoop();
 
       log(`Successfully connected to tab ${tabId}`);
     } catch (err) {
@@ -488,10 +517,6 @@ import browser from "webextension-polyfill";
     setTabState(tabId, "idle");
     updateIcons();
     syncTabGroup();
-
-    if (attachedTabs.size === 0 && ws?.readyState !== WebSocket.OPEN) {
-      stopMaintainLoop();
-    }
   }
 
   async function toggleTab(tabId) {
@@ -566,6 +591,7 @@ import browser from "webextension-polyfill";
       sessionId,
       attachedAt: Date.now(),
     });
+    persistState();
     setTabState(tabId, "connected");
 
     if (!skipAttachedEvent) {
@@ -580,6 +606,7 @@ import browser from "webextension-polyfill";
     }
 
     log(`Attached to tab ${tabId}, sessionId: ${sessionId}`);
+    markTabTitle(tabId, true);
     updateIcons();
     syncTabGroup();
     return { tabId, sessionId };
@@ -591,10 +618,12 @@ import browser from "webextension-polyfill";
       !chrome.tabs?.group ||
       !chrome.tabGroups?.update
     ) {
+      log("syncTabGroup: tab group API not available");
       return;
     }
     try {
       const connectedTabIds = [...attachedTabs.keys()];
+      log(`syncTabGroup: ${connectedTabIds.length} connected tabs:`, connectedTabIds);
       const existingGroups = await chrome.tabGroups.query({
         title: "spawriter",
       });
@@ -626,7 +655,7 @@ import browser from "webextension-polyfill";
         });
       }
     } catch (e) {
-      warn("syncTabGroup failed:", e.message);
+      warn("syncTabGroup failed:", e.message, e.stack);
     }
   }
 
@@ -669,33 +698,7 @@ import browser from "webextension-polyfill";
     log(`Cleared cache and reloaded tab ${tabId}`);
   }
 
-  function startMaintainLoop() {
-    stopMaintainLoop();
-    async function loop() {
-      const hasWork = attachedTabs.size > 0 || ws?.readyState === WebSocket.OPEN;
-      if (!hasWork) return;
-      try {
-        await ensureConnection();
-        reportConnectionRecovery();
-      } catch (err) {
-        reportConnectionFailure(err);
-      } finally {
-        updateIcons();
-        const shouldContinue = attachedTabs.size > 0 || ws?.readyState === WebSocket.OPEN;
-        if (shouldContinue) {
-          maintainLoopTimer = setTimeout(loop, 5000);
-        }
-      }
-    }
-    loop();
-  }
-
-  function stopMaintainLoop() {
-    if (maintainLoopTimer) {
-      clearTimeout(maintainLoopTimer);
-      maintainLoopTimer = null;
-    }
-  }
+  // --- Relay message handlers (commands from relay via offscreen) ---
 
   async function handleRelayMessage(message) {
     if (message.method === "connectActiveTab") {
@@ -745,7 +748,7 @@ import browser from "webextension-polyfill";
         if (create) {
           const fullUrl = url.startsWith("http") ? url : `https://${url}`;
           const newTab = await browser.tabs.create({ url: fullUrl, active: false });
-          await sleep(1500);
+          await sleep(1000);
           await connectTab(newTab.id);
           return { success: true, tabId: newTab.id, created: true };
         }
@@ -775,13 +778,36 @@ import browser from "webextension-polyfill";
     return { success: false, error: "Unknown command" };
   }
 
+  // --- Init ---
+
   async function init() {
     log("spawriter bridge initializing...");
+    await restoreState();
     ensureDebuggerEventListener();
     updateIcons();
 
     browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!message) return undefined;
+
+      if (message.type === "ws-message") {
+        handleRelayIncoming(message.payload);
+        return;
+      }
+
+      if (message.type === "ws-state-change") {
+        offscreenReady = message.state === "open";
+        log("Relay WebSocket state:", message.state);
+        if (message.state === "closed") {
+          for (const tabId of attachedTabs.keys()) {
+            setTabState(tabId, "idle");
+          }
+          attachedTabs.clear();
+          persistState();
+          updateIcons();
+          syncTabGroup();
+        }
+        return;
+      }
 
       if (message.type === "spawriter-toggle") {
         const tabId = message.tabId;
@@ -800,7 +826,7 @@ import browser from "webextension-polyfill";
       if (message.type === "spawriter-status") {
         sendResponse({
           connectedCount: getConnectedCount(),
-          wsConnected: getConnectionState() === "connected",
+          wsConnected: offscreenReady,
           attachedTabIds: [...attachedTabs.keys()],
         });
         return true;
@@ -819,7 +845,11 @@ import browser from "webextension-polyfill";
       return undefined;
     });
 
-    log("spawriter bridge initialized (idle, click toolbar icon on any tab to attach)");
+    ensureOffscreen().catch((e) => {
+      error("Offscreen setup failed:", e.message);
+    });
+
+    log("spawriter bridge initialized (offscreen relay connection active)");
   }
 
   if (typeof browser !== "undefined") {
@@ -837,7 +867,6 @@ import browser from "webextension-polyfill";
         getActiveTab,
         ensureActiveTabAttached,
         clearCacheAndReload,
-        ensureConnection,
         detachAllTabs,
       };
     }

@@ -156,7 +156,7 @@ app.post('/connect-tab', async (c) => {
     const timeoutId = setTimeout(() => {
       pendingExtensionCmdRequests.delete(relayId);
       resolve(c.json({ success: false, error: 'Timeout waiting for extension' }, 504));
-    }, 20000);
+    }, 15000);
 
     const mockWs = {
       send(data: string) {
@@ -339,8 +339,10 @@ function sendCdpResponse(clientId: string, payload: { id: number; sessionId?: st
   sendToCDPClient(clientId, payload);
 }
 
-function sendCdpError(clientId: string, payload: { id: number; sessionId?: string; error: string }): void {
-  sendToCDPClient(clientId, { id: payload.id, sessionId: payload.sessionId, error: { message: payload.error } });
+function sendCdpError(clientId: string, payload: { id: number; sessionId?: string; error: string; code?: number }): void {
+  const errorObj: { message: string; code?: number } = { message: payload.error };
+  if (payload.code !== undefined) errorObj.code = payload.code;
+  sendToCDPClient(clientId, { id: payload.id, sessionId: payload.sessionId, error: errorObj });
 }
 
 const RELAY_REQUEST_TIMEOUT_MS = 90000;
@@ -670,8 +672,7 @@ function handleExtensionMessage(data: Buffer) {
   try {
     const message = JSON.parse(data.toString()) as ExtensionMessage;
 
-    if (message.method === 'pong') {
-      log('Received pong from extension');
+    if (message.method === 'pong' || message.method === 'keepalive') {
       return;
     }
 
@@ -751,7 +752,8 @@ function handleExtensionMessage(data: Buffer) {
         clearTimeout(cmdPending.timeoutId);
         pendingExtensionCmdRequests.delete(response.id);
         try {
-          cmdPending.ws.send(JSON.stringify(response.error ? { success: false, error: response.error } : { success: true, ...(response.result as object) }));
+          const { id: _id, ...rest } = message as unknown as Record<string, unknown>;
+          cmdPending.ws.send(JSON.stringify(rest));
         } catch {
           // cmd ws may have closed
         }
@@ -789,6 +791,7 @@ function checkLeaseEnforcement(clientId: string, sessionId: string | undefined, 
       id,
       sessionId,
       error: `Tab is leased by ${holderDesc}. Acquire a different tab or wait for release.`,
+      code: LEASE_ERROR_CODE,
     });
     return false;
   }
@@ -1021,8 +1024,11 @@ export async function startRelayServer(): Promise<void> {
 
       ws.on('close', () => {
         log(`CDP WebSocket disconnected: ${clientId}`);
-        cdpClients.delete(clientId);
-        releaseClientLeases(clientId, `client ${clientId} disconnected`);
+        const current = cdpClients.get(clientId);
+        if (current?.ws === ws) {
+          cdpClients.delete(clientId);
+          releaseClientLeases(clientId, `client ${clientId} disconnected`);
+        }
         for (const [requestId, pending] of pendingRequests.entries()) {
           if (pending.clientId === clientId) {
             clearTimeout(pending.timeoutId);

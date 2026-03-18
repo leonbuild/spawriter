@@ -21,7 +21,8 @@
     "128": "./icons/icon-128.png"
   },
   "devtools_page": "./build/main.html",
-  "permissions": ["storage", "scripting", "browsingData", "tabs", "debugger"],
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "scripting", "browsingData", "tabs", "tabGroups", "debugger", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "content_scripts": [
     {
@@ -38,7 +39,7 @@
     }
   ],
   "background": {
-    "scripts": ["./build/backgroundScript.js"]
+    "service_worker": "./build/backgroundScript.js"
   },
   "browser_specific_settings": {
     "gecko": {

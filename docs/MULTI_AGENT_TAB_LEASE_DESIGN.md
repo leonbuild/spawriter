@@ -31,7 +31,7 @@ Cursor Window A (Project A)           Cursor Window B (Project B)
 | 1 | **clientId collision** | `mcp.ts:371` hardcodes `clientId = "mcp-client"` | Relay `cdpClients` map has one slot per ID. Second MCP overwrites the first, or the WebSocket is rejected. |
 | 2 | **No tab affinity** | `mcp.ts:524` picks `targets[0]` by default | Both agents auto-connect to the same tab. `switch_tab` has no guard against switching to another agent's tab. |
 | 3 | **Event broadcast** | `relay.ts:154` `broadcastToCDPClients()` sends to ALL | Agent A receives console logs, network events, and debugger events from Agent B's tab. |
-| 4 | **Manual-only tab attach** | Extension requires toolbar click | Agents cannot programmatically request a specific tab. If only one tab is attached, both agents fight over it. |
+| 4 | **Manual-only tab attach** | Extension requires toolbar click | Agents cannot programmatically request a specific tab. If only one tab is attached, both agents fight over it. **(Now resolved: extension auto-connects to relay on startup; agents can create/attach tabs via `connect_tab` with zero manual interaction.)** |
 
 ### Symptoms
 
@@ -744,7 +744,44 @@ if (msg.method === 'Target.tabAvailable') {
 
 ---
 
-## 6. Extension Changes (`bridge.js`)
+## 6. Extension Changes
+
+### 6.0 Offscreen Document Architecture
+
+Chrome Manifest V3 service workers are ephemeral — they terminate after ~30 seconds of inactivity, closing any WebSocket connections. This made persistent relay communication impossible from `bridge.js` alone.
+
+**Solution**: The WebSocket connection to the relay is moved into a **Chrome offscreen document** (`offscreen.html` + `offscreen.js`). The offscreen document:
+
+- Maintains a persistent WebSocket to `ws://localhost:19989/extension`
+- Auto-reconnects on failure (5s retry loop)
+- Sends keepalive messages every 20 seconds to prevent proxy/NAT timeouts
+- Bridges messages between the relay and the service worker via `chrome.runtime` messaging
+
+**Message protocol** (chrome.runtime messaging):
+
+| Direction | Message Type | Purpose |
+|-----------|------------|---------|
+| SW → Offscreen | `{ type: "ws-send", payload }` | Send JSON to relay |
+| SW → Offscreen | `{ type: "ws-status" }` | Query WebSocket state |
+| SW → Offscreen | `{ type: "ws-connect" }` | Force (re)connect |
+| Offscreen → SW | `{ type: "ws-message", payload }` | Relay message received |
+| Offscreen → SW | `{ type: "ws-state-change", state }` | WebSocket opened/closed |
+
+**Lifecycle**:
+1. Service worker `init()` registers message listeners synchronously (critical — must happen before any `chrome.runtime.sendMessage` from content scripts)
+2. Service worker calls `ensureOffscreen()` asynchronously to create the offscreen document
+3. Offscreen document auto-connects WebSocket on load
+4. When a tool (e.g., `connect_tab`) needs the relay, `ensureRelayConnected()` polls the offscreen document's `ws-status` until the WebSocket is open
+
+**Manifest changes**:
+- `"permissions"`: Added `"offscreen"`
+- `"background"`: Changed from `"scripts"` (MV2/Firefox) to `"service_worker"` (Chrome MV3)
+
+**Files**:
+- `src/offscreen.html` — Minimal HTML that loads `offscreen.js`
+- `src/offscreen.js` — WebSocket owner, relay bridge
+- `src/ai_bridge/bridge.js` — Service worker, delegates WS to offscreen
+- `webpack.config.js` — New entry point + HTML copy for offscreen
 
 ### 6.1 New Handler: `connectTabByMatch`
 
@@ -1042,8 +1079,12 @@ The "time-of-check to time-of-use" race between `getTargets()` and `acquireLease
 | `mcp/src/mcp.ts` | Modified | Unique clientId, env vars, enhanced session negotiation, lease-aware switch_tab, new tools (connect_tab, release_tab), enhanced list_tabs, event handling | +150 |
 | `mcp/src/protocol.ts` | Modified | LeaseInfo type, TargetWithLease type | +15 |
 | `mcp/src/utils.ts` | Modified | Export agent label/project URL getters | +10 |
-| `src/ai_bridge/bridge.js` | Modified | `connectTabByMatch` handler | +40 |
-| **Total** | | | **~345** |
+| `src/ai_bridge/bridge.js` | Modified | Offscreen-based WS delegation, `connectTabByMatch` handler | +80 |
+| `src/offscreen.html` | New | Offscreen document HTML shell | +5 |
+| `src/offscreen.js` | New | Persistent WebSocket owner, relay bridge | +130 |
+| `manifest.json` | Modified | `service_worker` background, `offscreen` permission | +2 |
+| `webpack.config.js` | Modified | New entry point + HTML copy for offscreen | +3 |
+| **Total** | | | **~565** |
 
 ---
 
@@ -1178,7 +1219,37 @@ The remaining **19 tools are safe without any changes** because:
 
 ---
 
-## 16. Future Considerations
+## 16. Implementation Notes (Post-Design Fixes)
+
+These issues were discovered and fixed during implementation and live testing:
+
+### 16.1 WebSocket Reconnect Race Condition
+
+**Problem:** When `switch_tab` closes the old WebSocket and opens a new one with the same `MCP_CLIENT_ID`, the relay's close handler for the stale WebSocket could fire AFTER the new WebSocket registers. This would delete the new client entry from `cdpClients` and release all leases held by the agent.
+
+**Fix:** The relay's `ws.on('close')` handler now checks `if (current?.ws === ws)` — it only deletes the client and releases leases if the closing WebSocket is the currently registered one for that clientId. If a newer WebSocket has already been registered, the stale close is ignored.
+
+### 16.2 Backward Compatibility Detection
+
+**Problem:** When a new MCP connects to an old relay that doesn't support `Target.acquireLease`, every candidate tab would fail the lease acquisition, causing `doEnsureSession` to fall through to the "No browser tab attached" error even when tabs were available.
+
+**Fix:** Added a `leaseSupported` flag (null/true/false). On the first `acquireLease` failure when `leaseSupported === null`, the MCP logs "Lease commands not supported by relay — running without isolation" and sets `leaseSupported = false`. All subsequent `acquireLease` calls return `true` immediately, allowing the agent to connect without leases.
+
+### 16.3 Active Tab Session Clearing on Release
+
+**Problem:** If `release_tab` released the currently active tab, `cdpSession` was not cleared. The next tool call would reuse the old session, sending commands to a tab where the agent no longer holds a lease.
+
+**Fix:** After `releaseLease()`, if `targetId === cdpSession?.sessionId`, set `cdpSession = null`. The next tool call triggers `doEnsureSession` which will acquire a new tab.
+
+### 16.4 Extension Maintain Loop Resilience
+
+**Problem:** When the relay restarts, the extension's WebSocket closes. The maintain loop would check `hasWork = attachedTabs.size > 0 || ws?.readyState === WebSocket.OPEN` — both false after disconnect and tab clear — and permanently stop. The extension would never reconnect.
+
+**Fix:** The maintain loop now runs unconditionally (no `hasWork` check), always attempting `ensureConnection()`. Uses a `maintainLoopActive` flag to prevent duplicate loops. The loop only stops when `stopMaintainLoop()` is called explicitly during user-initiated tab detach with no remaining tabs.
+
+---
+
+## 17. Future Considerations
 
 | Item | Description | Priority |
 |------|-------------|----------|
