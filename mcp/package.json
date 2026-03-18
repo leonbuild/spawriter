@@ -8,7 +8,7 @@
     "spawriter": "./bin.js"
   },
   "scripts": {
-    "build": "rm -rf dist && tsc",
+    "build": "node -e \"const fs=require('fs');if(fs.existsSync('dist'))fs.rmSync('dist',{recursive:true,force:true})\" && tsc",
     "watch": "tsc -w",
     "typecheck": "tsc --noEmit",
     "start:relay": "tsx src/relay.ts",
@@ -26,12 +26,9 @@
     "@hono/node-server": "^1.19.6",
     "@hono/node-ws": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.21.1",
-    "chalk": "^5.6.2",
-    "devtools-protocol": "^0.0.1543509",
     "hono": "^4.10.6",
     "playwright-core": "^1.56.1",
-    "ws": "^8.18.3",
-    "zod": "^3.25.76"
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

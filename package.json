@@ -17,7 +17,7 @@
     "ext:build:chrome": "npm --prefix ext run build:chrome",
     "start:hot": "powershell -ExecutionPolicy Bypass -File scripts/start-hot.ps1",
     "version:bump": "node scripts/bump-version.js",
-    "test": "npx tsx --test mcp/src/mcp.test.ts mcp/src/pw-executor.test.ts mcp/src/lease.test.ts",
+    "test": "npx tsx --test mcp/src/mcp.test.ts mcp/src/pw-executor.test.ts mcp/src/lease.test.ts mcp/src/utils.test.ts mcp/src/cli.test.ts mcp/src/relay.test.ts",
     "deploy:firefox": "npm --prefix ext run webpack-build && npm --prefix ext run lint && shipit firefox ext/",
     "deploy:chrome": "npm run ext:build:chrome && shipit chrome ext/web-ext-artifacts/spawriter-chrome-$npm_package_version.zip",
     "deploy": "npm run deploy:firefox && npm run deploy:chrome"

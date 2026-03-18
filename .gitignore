@@ -8,6 +8,9 @@ ext/build
 ext/dist-chrome/
 ext/web-ext-artifacts
 
+# Generated icons (built from SVG by convert-icons.js)
+ext/src/icons/*.png
+
 # prefer package-lock.json
 yarn.lock
 

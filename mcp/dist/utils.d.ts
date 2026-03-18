@@ -6,7 +6,6 @@ export declare function getRelayPort(): number;
 export declare function getRelayToken(): string | undefined;
 export declare function getAllowedExtensionIds(): string[];
 export declare function getCdpUrl(port: number, clientId?: string): string;
-export declare function getExtensionUrl(port: number): string;
 export declare function isLocalhost(address: string): boolean;
 export declare function log(...args: unknown[]): void;
 export declare function error(...args: unknown[]): void;

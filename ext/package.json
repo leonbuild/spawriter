@@ -4,7 +4,8 @@
   "private": true,
   "description": "spawriter Chrome/Firefox extension",
   "scripts": {
-    "webpack-build": "node --openssl-legacy-provider ./node_modules/webpack/bin/webpack.js --mode=production",
+    "convert-icons": "node scripts/convert-icons.js",
+    "webpack-build": "npm run convert-icons && node --openssl-legacy-provider ./node_modules/webpack/bin/webpack.js --mode=production",
     "build:firefox": "npm run webpack-build && web-ext build --overwrite-dest --filename spawriter-firefox-{version}.zip",
     "build:chrome": "npm run webpack-build && node scripts/build-chrome.js && web-ext build --source-dir dist-chrome --artifacts-dir web-ext-artifacts --overwrite-dest --filename spawriter-chrome-{version}.zip",
     "lint": "web-ext lint",
@@ -13,7 +14,6 @@
     "format": "prettier src/ --write"
   },
   "devDependencies": {
-    "lodash-es": "^4.17.21",
     "@babel/core": "^7.15.5",
     "@babel/preset-env": "^7.15.6",
     "@babel/preset-react": "^7.14.5",
@@ -21,7 +21,9 @@
     "babel-loader": "^8.2.2",
     "copy-webpack-plugin": "^9.0.1",
     "css-loader": "^6.3.0",
+    "lodash-es": "^4.17.21",
     "prettier": "2.4.1",
+    "sharp": "^0.34.5",
     "style-loader": "^3.3.0",
     "web-ext": "^9.2.0",
     "webpack": "^5.56.1",

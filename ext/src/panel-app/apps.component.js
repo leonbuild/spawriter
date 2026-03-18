@@ -604,7 +604,7 @@ function overlayApp(app) {
     app.devtools.overlays
   ) {
     evalDevtoolsCmd(`overlay('${app.name}')`).catch((err) => {
-      console.error(`Error overlaying applicaton: ${app.name}`, err);
+      console.error(`Error overlaying application: ${app.name}`, err);
     });
   }
 }
@@ -612,7 +612,7 @@ function overlayApp(app) {
 function deOverlayApp(app) {
   if (app.devtools && app.devtools.overlays) {
     evalDevtoolsCmd(`removeOverlay('${app.name}')`).catch((err) => {
-      console.error(`Error removing overlay on applicaton: ${app.name}`, err);
+      console.error(`Error removing overlay on application: ${app.name}`, err);
     });
   }
 }

@@ -35,10 +35,6 @@ export function getCdpUrl(port: number, clientId?: string): string {
   return `ws://127.0.0.1:${port}/cdp/${id}`;
 }
 
-export function getExtensionUrl(port: number): string {
-  return `ws://127.0.0.1:${port}/extension`;
-}
-
 export function isLocalhost(address: string): boolean {
   return (
     address === "127.0.0.1" ||

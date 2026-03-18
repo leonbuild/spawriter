@@ -1,5 +1,3 @@
-export const VERSION = 1;
-
 export interface ForwardCDPCommand {
   id: number;
   method: string;
@@ -39,11 +37,6 @@ export interface ExtensionLogMessage {
 export interface ExtensionPongMessage {
   id?: undefined;
   method: string;
-}
-
-export interface ServerPingMessage {
-  method: string;
-  id?: undefined;
 }
 
 export type ExtensionMessage =

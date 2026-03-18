@@ -3,7 +3,7 @@ import { evalDevtoolsCmd } from "../inspected-window.helper";
 import Button from "./button";
 
 export default function AppStatusOverride(props) {
-  const [state, dispatch] = useReducer(reducer, inititalState);
+  const [state, dispatch] = useReducer(reducer, initialState);
 
   useEffect(() => {
     if (state.running) {
@@ -41,7 +41,7 @@ const typeToCommand = {
   reset: "revertForceMountUnmount",
 };
 
-const inititalState = { running: false, runType: null };
+const initialState = { running: false, runType: null };
 function reducer(state, action) {
   switch (action.type) {
     case "on":

@@ -5,8 +5,6 @@ const { spawn } = require('child_process');
 const extDir = path.resolve(__dirname, '..');
 const buildDir = path.join(extDir, 'build');
 const manifestPath = path.join(extDir, 'manifest.chrome.json');
-const logoPath = path.join(extDir, 'logo-white-bgblue.png');
-
 let pending = null;
 let isRunning = false;
 
@@ -53,6 +51,5 @@ function scheduleBuild() {
 runBuild();
 watchPath(buildDir, { recursive: true });
 watchPath(manifestPath);
-watchPath(logoPath);
 
 console.log('[watch-build-chrome] Watching build output for Chrome dist updates...');

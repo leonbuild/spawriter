@@ -61,7 +61,7 @@ async function createPanel() {
 
   const panel = await browser.devtools.panels.create(
     "spawriter",
-    "/logo-white-bgblue.png",
+    "/build/icons/icon-32.png",
     "/build/panel.html"
   );
 

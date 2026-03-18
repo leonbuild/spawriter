@@ -39,11 +39,11 @@ const iconsDestDir = path.join(distDir, 'icons');
 if (fs.existsSync(iconsSrcDir)) {
   fs.mkdirSync(iconsDestDir, { recursive: true });
   for (const f of fs.readdirSync(iconsSrcDir)) {
-    if (f.endsWith('.png')) {
+    if (f.endsWith('.png') || f.endsWith('.svg')) {
       fs.copyFileSync(path.join(iconsSrcDir, f), path.join(iconsDestDir, f));
     }
   }
-  console.log('Copied: icons/ (PNG files)');
+  console.log('Copied: icons/ (PNG + SVG files)');
 }
 
 const chromeManifest = path.join(extDir, 'manifest.chrome.json');
