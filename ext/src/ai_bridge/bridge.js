@@ -724,25 +724,43 @@ import browser from "webextension-polyfill";
         (t) => t.attached && t.type === "page" && t.tabId && !isRestrictedUrl(t.url)
       );
 
-      if (liveAttached.length === 0) {
+      if (liveAttached.length === 0 && attachedTabs.size === 0) {
         log("resyncAttachedTabs: no live debugger sessions found");
         return;
       }
 
-      log(`resyncAttachedTabs: found ${liveAttached.length} live debugger sessions`);
+      log(`resyncAttachedTabs: ${liveAttached.length} live debugger sessions, ${attachedTabs.size} in attachedTabs`);
+
+      const liveTabIds = new Set(liveAttached.map((t) => t.tabId));
+
+      // Remove stale entries for tabs no longer attached
+      for (const [tabId] of [...attachedTabs.entries()]) {
+        if (!liveTabIds.has(tabId)) {
+          log(`resyncAttachedTabs: removing stale entry for tab ${tabId}`);
+          emitDetachedFromTarget(tabId, "debugger-gone");
+        }
+      }
 
       for (const target of liveAttached) {
         const tabId = target.tabId;
-        if (attachedTabs.has(tabId)) continue;
+        let existing = attachedTabs.get(tabId);
 
-        const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
-        let mainFrameId = sessionId;
+        if (!existing) {
+          const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
+          existing = { sessionId, attachedAt: Date.now() };
+          attachedTabs.set(tabId, existing);
+          setTabState(tabId, "connected");
+          log(`resyncAttachedTabs: new entry for tab ${tabId} with sessionId ${sessionId}`);
+        }
+
+        // Re-announce to relay (may be a new relay after reconnect)
+        let mainFrameId = existing.sessionId;
         try {
           const frameTree = await chrome.debugger.sendCommand(
             { tabId },
             "Page.getFrameTree"
           );
-          mainFrameId = frameTree?.frameTree?.frame?.id || sessionId;
+          mainFrameId = frameTree?.frameTree?.frame?.id || existing.sessionId;
         } catch (e) {
           warn(`resyncAttachedTabs: failed to get frame tree for tab ${tabId}:`, e?.message);
         }
@@ -752,29 +770,23 @@ import browser from "webextension-polyfill";
           tab = await browser.tabs.get(tabId);
         } catch (_) {}
 
-        attachedTabs.set(tabId, {
-          sessionId,
-          attachedAt: Date.now(),
-        });
-        setTabState(tabId, "connected");
-
-        const targetInfo = {
-          targetId: mainFrameId,
-          type: "page",
-          tabId,
-          title: tab?.title || target.title || "",
-          url: tab?.url || target.url || "",
-        };
         sendMessage({
           method: "forwardCDPEvent",
           params: {
             method: "Target.attachedToTarget",
-            sessionId,
-            params: { sessionId, targetInfo },
+            sessionId: existing.sessionId,
+            params: {
+              sessionId: existing.sessionId,
+              targetInfo: {
+                targetId: mainFrameId,
+                type: "page",
+                tabId,
+                title: tab?.title || target.title || "",
+                url: tab?.url || target.url || "",
+              },
+            },
           },
         });
-
-        log(`resyncAttachedTabs: re-registered tab ${tabId} with sessionId ${sessionId}`);
       }
 
       persistState();
@@ -909,13 +921,16 @@ import browser from "webextension-polyfill";
           for (const tabId of attachedTabs.keys()) {
             setTabState(tabId, "idle");
           }
-          attachedTabs.clear();
-          persistState();
           updateIcons();
           syncTabGroup();
         }
         if (message.state === "open") {
+          for (const [tabId, info] of attachedTabs.entries()) {
+            setTabState(tabId, "connected");
+          }
           resyncAttachedTabs();
+          updateIcons();
+          syncTabGroup();
         }
         return;
       }
