@@ -540,9 +540,30 @@ function handleExtensionMessage(data) {
             const { sessionId, method, params } = message.params;
             if (method === 'Target.attachedToTarget' && sessionId) {
                 const targetInfo = params.targetInfo;
+                const incomingTabId = targetInfo?.tabId;
+                if (incomingTabId !== undefined) {
+                    for (const [existingSessionId, existing] of attachedTargets) {
+                        if (existing.tabId === incomingTabId && existingSessionId !== sessionId) {
+                            log(`Replacing stale target for tabId ${incomingTabId}: ${existingSessionId} → ${sessionId}`);
+                            attachedTargets.delete(existingSessionId);
+                            const staleLease = tabLeases.get(existingSessionId);
+                            if (staleLease) {
+                                tabLeases.delete(existingSessionId);
+                                sendToCDPClient(staleLease.clientId, {
+                                    method: 'Target.leaseLost',
+                                    params: { sessionId: existingSessionId, reason: 'target-replaced' },
+                                });
+                            }
+                            broadcastToCDPClients({
+                                method: 'Target.detachedFromTarget',
+                                params: { sessionId: existingSessionId, reason: 'target-replaced' },
+                            });
+                        }
+                    }
+                }
                 attachedTargets.set(sessionId, {
                     sessionId,
-                    tabId: targetInfo?.tabId,
+                    tabId: incomingTabId,
                     targetInfo,
                 });
                 if ((targetInfo?.type ?? 'page') === 'page') {
@@ -793,6 +814,12 @@ export async function startRelayServer() {
                     });
                 }
                 tabLeases.clear();
+                for (const target of attachedTargets.values()) {
+                    broadcastToCDPClients({
+                        method: 'Target.detachedFromTarget',
+                        params: { sessionId: target.sessionId, reason: 'extension-disconnected' },
+                    });
+                }
                 attachedTargets.clear();
                 activeDownloadBehavior = null;
                 for (const pending of pendingRequests.values()) {

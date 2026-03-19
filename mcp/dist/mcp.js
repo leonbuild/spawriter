@@ -448,10 +448,11 @@ async function acquireLease(session, targetSessionId) {
 }
 async function releaseLease(session, targetSessionId) {
     try {
-        await sendCdpCommand(session, 'Target.releaseLease', { sessionId: targetSessionId });
+        const result = await sendCdpCommand(session, 'Target.releaseLease', { sessionId: targetSessionId });
+        log(`releaseLease result for ${targetSessionId}:`, JSON.stringify(result));
     }
-    catch {
-        // Best effort
+    catch (e) {
+        error(`releaseLease failed for ${targetSessionId}:`, e);
     }
 }
 async function releaseAllMyLeases(session, agentId) {
@@ -742,14 +743,32 @@ function handleDebuggerEvent(method, params) {
         }
     }
 }
+function invalidateSessionByTargetId(targetSessionId) {
+    if (cdpSession?.sessionId === targetSessionId) {
+        log(`Invalidating global cdpSession (sessionId: ${targetSessionId})`);
+        cdpSession = null;
+    }
+    for (const [agentId, agent] of agentSessions) {
+        if (agent.cdpSession?.sessionId === targetSessionId) {
+            log(`Invalidating agent session ${agentId} (sessionId: ${targetSessionId})`);
+            agent.cdpSession = null;
+        }
+    }
+}
 function handleLeaseEvent(method, params) {
     if (method === 'Target.leaseLost') {
         const lostSessionId = params.sessionId;
         const reason = params.reason;
         log(`Lease lost for tab ${lostSessionId}: ${reason}`);
-        if (cdpSession?.sessionId === lostSessionId) {
-            cdpSession = null;
-        }
+        if (lostSessionId)
+            invalidateSessionByTargetId(lostSessionId);
+    }
+    if (method === 'Target.detachedFromTarget') {
+        const detachedSessionId = params.sessionId;
+        const reason = params.reason;
+        log(`Target detached: ${detachedSessionId} (${reason})`);
+        if (detachedSessionId)
+            invalidateSessionByTargetId(detachedSessionId);
     }
     if (method === 'Target.tabAvailable') {
         const info = params.targetInfo;
@@ -1325,6 +1344,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             await ensureRelayServer();
             const targets = await getTargets();
             const listSessionId = args.session_id;
+            if (listSessionId)
+                activeAgentId = listSessionId;
             const effectiveClientId = getEffectiveClientId(listSessionId);
             if (targets.length === 0) {
                 return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab, or use connect_tab to attach one.' }] };
@@ -1384,8 +1405,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
             const currentSession = resolveActiveSession(switchSessionId);
             if (currentSession?.sessionId === targetId && currentSession.ws.readyState === WebSocket.OPEN) {
+                activeAgentId = switchSessionId || null;
                 return { content: [{ type: 'text', text: `Already connected to this tab: ${target.title || target.url || '(no title)'}` }] };
             }
+            activeAgentId = switchSessionId || null;
             if (currentSession) {
                 currentSession.ws.close();
             }
@@ -1465,6 +1488,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const targets = await getTargets();
             const newTarget = targets.find(t => t.tabId === result.tabId);
             const created = result.created ? ' (newly created)' : '';
+            activeAgentId = connectSessionId || null;
             // Auto-acquire lease for the agent on the new tab
             if (connectSessionId && newTarget) {
                 try {
@@ -1489,6 +1513,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (name === 'release_tab') {
             const releaseSessionId = args.session_id;
+            if (releaseSessionId)
+                activeAgentId = releaseSessionId;
             const activeSession = resolveActiveSession(releaseSessionId);
             const targetId = args.targetId || activeSession?.sessionId;
             if (!targetId) {

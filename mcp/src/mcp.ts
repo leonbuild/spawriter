@@ -585,9 +585,10 @@ async function acquireLease(session: CdpSession, targetSessionId: string): Promi
 
 async function releaseLease(session: CdpSession, targetSessionId: string): Promise<void> {
   try {
-    await sendCdpCommand(session, 'Target.releaseLease', { sessionId: targetSessionId });
-  } catch {
-    // Best effort
+    const result = await sendCdpCommand(session, 'Target.releaseLease', { sessionId: targetSessionId });
+    log(`releaseLease result for ${targetSessionId}:`, JSON.stringify(result));
+  } catch (e) {
+    error(`releaseLease failed for ${targetSessionId}:`, e);
   }
 }
 
@@ -918,14 +919,31 @@ function handleDebuggerEvent(method: string, params: Record<string, unknown>) {
   }
 }
 
+function invalidateSessionByTargetId(targetSessionId: string) {
+  if (cdpSession?.sessionId === targetSessionId) {
+    log(`Invalidating global cdpSession (sessionId: ${targetSessionId})`);
+    cdpSession = null;
+  }
+  for (const [agentId, agent] of agentSessions) {
+    if (agent.cdpSession?.sessionId === targetSessionId) {
+      log(`Invalidating agent session ${agentId} (sessionId: ${targetSessionId})`);
+      agent.cdpSession = null;
+    }
+  }
+}
+
 function handleLeaseEvent(method: string, params: Record<string, unknown>) {
   if (method === 'Target.leaseLost') {
     const lostSessionId = params.sessionId as string | undefined;
     const reason = params.reason as string | undefined;
     log(`Lease lost for tab ${lostSessionId}: ${reason}`);
-    if (cdpSession?.sessionId === lostSessionId) {
-      cdpSession = null;
-    }
+    if (lostSessionId) invalidateSessionByTargetId(lostSessionId);
+  }
+  if (method === 'Target.detachedFromTarget') {
+    const detachedSessionId = params.sessionId as string | undefined;
+    const reason = params.reason as string | undefined;
+    log(`Target detached: ${detachedSessionId} (${reason})`);
+    if (detachedSessionId) invalidateSessionByTargetId(detachedSessionId);
   }
   if (method === 'Target.tabAvailable') {
     const info = params.targetInfo as { url?: string } | undefined;
@@ -1529,6 +1547,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     await ensureRelayServer();
     const targets = await getTargets();
     const listSessionId = args.session_id as string | undefined;
+    if (listSessionId) activeAgentId = listSessionId;
     const effectiveClientId = getEffectiveClientId(listSessionId);
     if (targets.length === 0) {
       return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab, or use connect_tab to attach one.' }] };
@@ -1593,8 +1612,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     const currentSession = resolveActiveSession(switchSessionId);
     if (currentSession?.sessionId === targetId && currentSession.ws.readyState === WebSocket.OPEN) {
+      activeAgentId = switchSessionId || null;
       return { content: [{ type: 'text', text: `Already connected to this tab: ${target.title || target.url || '(no title)'}` }] };
     }
+
+    activeAgentId = switchSessionId || null;
 
     if (currentSession) {
       currentSession.ws.close();
@@ -1682,6 +1704,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const newTarget = targets.find(t => t.tabId === result.tabId);
     const created = result.created ? ' (newly created)' : '';
 
+    activeAgentId = connectSessionId || null;
+
     // Auto-acquire lease for the agent on the new tab
     if (connectSessionId && newTarget) {
       try {
@@ -1708,6 +1732,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === 'release_tab') {
     const releaseSessionId = args.session_id as string | undefined;
+    if (releaseSessionId) activeAgentId = releaseSessionId;
     const activeSession = resolveActiveSession(releaseSessionId);
     const targetId = (args.targetId as string | undefined) || activeSession?.sessionId;
     if (!targetId) {

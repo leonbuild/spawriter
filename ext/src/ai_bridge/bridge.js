@@ -434,6 +434,11 @@ import browser from "webextension-polyfill";
           break;
         }
       }
+      if (!targetTabId) {
+        warn(`handleCDPCommand: sessionId ${sessionId} not found in attachedTabs (${attachedTabs.size} tabs known)`);
+        sendMessage({ id, error: `Session ${sessionId} not found. Tab may have been detached or extension restarted.` });
+        return;
+      }
     }
 
     if (!targetTabId && attachedTabs.size > 0) {
@@ -481,6 +486,20 @@ import browser from "webextension-polyfill";
       );
       sendMessage({ id, result });
     } catch (err) {
+      if (err.message && err.message.includes("not attached")) {
+        warn(`handleCDPCommand: debugger detached for tab ${targetTabId}, attempting re-attach`);
+        try {
+          try { await chrome.debugger.detach({ tabId: targetTabId }); } catch (_) {}
+          emitDetachedFromTarget(targetTabId, "debugger-lost");
+          await attachTab(targetTabId);
+          const result = await sendCommandWithTimeout(targetTabId, method, cdpParams, CDP_COMMAND_TIMEOUT_MS);
+          sendMessage({ id, result });
+          return;
+        } catch (retryErr) {
+          sendMessage({ id, error: `Re-attach failed: ${retryErr.message}` });
+          return;
+        }
+      }
       sendMessage({ id, error: err.message });
     }
   }
@@ -678,11 +697,92 @@ import browser from "webextension-polyfill";
     const activeTab = await getActiveTab();
     if (!activeTab?.id) throw new Error("No active tab found");
 
-    if (!attachedTabs.has(activeTab.id)) {
+    const needsAttach = !attachedTabs.has(activeTab.id) || !(await isDebuggerAttached(activeTab.id));
+    if (needsAttach) {
+      if (attachedTabs.has(activeTab.id)) {
+        emitDetachedFromTarget(activeTab.id, "stale-entry");
+      }
       await connectTab(activeTab.id);
     }
 
     return activeTab.id;
+  }
+
+  async function isDebuggerAttached(tabId) {
+    try {
+      const targets = await chrome.debugger.getTargets();
+      return targets.some((t) => t.tabId === tabId && t.attached);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function resyncAttachedTabs() {
+    try {
+      const targets = await chrome.debugger.getTargets();
+      const liveAttached = targets.filter(
+        (t) => t.attached && t.type === "page" && t.tabId && !isRestrictedUrl(t.url)
+      );
+
+      if (liveAttached.length === 0) {
+        log("resyncAttachedTabs: no live debugger sessions found");
+        return;
+      }
+
+      log(`resyncAttachedTabs: found ${liveAttached.length} live debugger sessions`);
+
+      for (const target of liveAttached) {
+        const tabId = target.tabId;
+        if (attachedTabs.has(tabId)) continue;
+
+        const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
+        let mainFrameId = sessionId;
+        try {
+          const frameTree = await chrome.debugger.sendCommand(
+            { tabId },
+            "Page.getFrameTree"
+          );
+          mainFrameId = frameTree?.frameTree?.frame?.id || sessionId;
+        } catch (e) {
+          warn(`resyncAttachedTabs: failed to get frame tree for tab ${tabId}:`, e?.message);
+        }
+
+        let tab;
+        try {
+          tab = await browser.tabs.get(tabId);
+        } catch (_) {}
+
+        attachedTabs.set(tabId, {
+          sessionId,
+          attachedAt: Date.now(),
+        });
+        setTabState(tabId, "connected");
+
+        const targetInfo = {
+          targetId: mainFrameId,
+          type: "page",
+          tabId,
+          title: tab?.title || target.title || "",
+          url: tab?.url || target.url || "",
+        };
+        sendMessage({
+          method: "forwardCDPEvent",
+          params: {
+            method: "Target.attachedToTarget",
+            sessionId,
+            params: { sessionId, targetInfo },
+          },
+        });
+
+        log(`resyncAttachedTabs: re-registered tab ${tabId} with sessionId ${sessionId}`);
+      }
+
+      persistState();
+      updateIcons();
+      syncTabGroup();
+    } catch (e) {
+      error("resyncAttachedTabs: failed:", e?.message || e);
+    }
   }
 
   async function clearCacheAndReload(tabId) {
@@ -715,7 +815,11 @@ import browser from "webextension-polyfill";
           if (isRestrictedUrl(tab?.url)) {
             return { success: false, error: `Cannot attach restricted URL: ${tab.url}` };
           }
-          if (!attachedTabs.has(tabId)) {
+          const needsAttach = !attachedTabs.has(tabId) || !(await isDebuggerAttached(tabId));
+          if (needsAttach) {
+            if (attachedTabs.has(tabId)) {
+              emitDetachedFromTarget(tabId, "stale-entry");
+            }
             await connectTab(tabId);
           }
           return { success: true, tabId };
@@ -739,7 +843,11 @@ import browser from "webextension-polyfill";
         }
 
         if (match) {
-          if (!attachedTabs.has(match.id)) {
+          const needsAttach = !attachedTabs.has(match.id) || !(await isDebuggerAttached(match.id));
+          if (needsAttach) {
+            if (attachedTabs.has(match.id)) {
+              emitDetachedFromTarget(match.id, "stale-entry");
+            }
             await connectTab(match.id);
           }
           return { success: true, tabId: match.id };
@@ -806,6 +914,9 @@ import browser from "webextension-polyfill";
           updateIcons();
           syncTabGroup();
         }
+        if (message.state === "open") {
+          resyncAttachedTabs();
+        }
         return;
       }
 
@@ -845,9 +956,19 @@ import browser from "webextension-polyfill";
       return undefined;
     });
 
-    ensureOffscreen().catch((e) => {
-      error("Offscreen setup failed:", e.message);
-    });
+    ensureOffscreen()
+      .then(async () => {
+        try {
+          const resp = await chrome.runtime.sendMessage({ type: "ws-status" });
+          if (resp?.state === "open") {
+            offscreenReady = true;
+            resyncAttachedTabs();
+          }
+        } catch (_) {}
+      })
+      .catch((e) => {
+        error("Offscreen setup failed:", e.message);
+      });
 
     log("spawriter bridge initialized (offscreen relay connection active)");
   }
