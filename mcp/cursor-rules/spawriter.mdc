@@ -89,10 +89,10 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 | Tool | Description | Key Args |
 |------|-------------|----------|
-| `list_tabs` | List all attached Chrome tabs with lease ownership status (MINE, LEASED by X, AVAILABLE), session IDs, titles, URLs | — |
-| `switch_tab` | Switch CDP session to a different attached Chrome tab (lease-aware: rejects if leased by another agent) | `targetId` (session ID from `list_tabs`) |
-| `connect_tab` | Programmatically attach a Chrome tab by URL match, tab ID, or create a new tab | `url?`, `tabId?`, `create?` (boolean) |
-| `release_tab` | Release your lease on a tab, making it available to other agents | `targetId?` |
+| `list_tabs` | List all attached Chrome tabs with lease ownership status (MINE, LEASED by X, AVAILABLE), session IDs, titles, URLs | `session_id?` |
+| `switch_tab` | Switch CDP session to a different attached Chrome tab (lease-aware: rejects if leased by another agent) | `targetId`, `session_id?` |
+| `connect_tab` | Programmatically attach a Chrome tab by URL match, tab ID, or create a new tab | `url?`, `tabId?`, `create?`, `session_id?` |
+| `release_tab` | Release your lease on a tab, making it available to other agents | `targetId?`, `session_id?` |
 
 ### Session & Connection
 
@@ -103,11 +103,20 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 ---
 
+## Session Identification for Tab Isolation
+
+When multiple Cursor chat sessions share the same MCP server process, each session must identify itself to prevent cross-session tab access. On your **first spawriter tool call** in a conversation, determine your `session_id`:
+
+1. If your system prompt contains an agent transcript path like `.../agent-transcripts/{UUID}/{UUID}.jsonl`, use that UUID as your `session_id`
+2. Otherwise, generate a short stable identifier from the conversation context (e.g., task name, first 8 chars of a hash, or any session-specific value)
+
+Then pass `session_id` on **every** `connect_tab`, `list_tabs`, `switch_tab`, and `release_tab` call. This ensures your tab leases are isolated from other chat sessions.
+
 ## Connection Awareness
 
 Before using any spawriter tool, you must have an active browser connection. If a tool call fails with a connection error or timeout:
 
-1. **First try zero-touch connection** — `connect_tab { url: "your-target-url", create: true }` to auto-create and attach a tab.
+1. **First try zero-touch connection** — `connect_tab { url: "your-target-url", create: true, session_id: "your-id" }` to auto-create and attach a tab.
 2. If that fails, call `reset` to re-establish the connection, then retry `connect_tab`.
 3. Only if that also fails, ask the user to ensure: Chrome is open, the extension is loaded, and the MCP relay is running (`node dist/cli.js serve`).
 
@@ -406,12 +415,12 @@ Two MCP tools are available for working with multiple attached tabs:
 ### Multi-tab workflow: compare two pages
 
 ```
-list_tabs                                      → see all attached tabs
-switch_tab { targetId: "spawriter-tab-123-..." } → switch to reference tab
-screenshot                                     → capture reference
-accessibility_snapshot                         → capture reference structure
-switch_tab { targetId: "spawriter-tab-456-..." } → switch to working tab
-screenshot                                     → capture your page
+list_tabs { session_id: "my-session" }                                      → see all attached tabs
+switch_tab { targetId: "spawriter-tab-123-...", session_id: "my-session" }  → switch to reference tab
+screenshot                                                                  → capture reference
+accessibility_snapshot                                                      → capture reference structure
+switch_tab { targetId: "spawriter-tab-456-...", session_id: "my-session" }  → switch to working tab
+screenshot                                                                  → capture your page
 ```
 
 ### Single-tab comparison alternative
@@ -549,6 +558,37 @@ When multiple AI agents share the same spawriter relay server, the Tab Lease Sys
 - CDP events are routed only to the lease holder, preventing cross-agent event pollution
 - Leases are automatically released when an agent disconnects or a tab is closed
 
+### Per-session isolation with `session_id`
+
+IDE hosts like Cursor share a single MCP server process across multiple chat sessions in the same workspace. Without additional identification, all sessions share the same client ID and can freely access each other's tabs.
+
+To isolate tabs per chat session, pass `session_id` on tab management tools. Each unique `session_id` gets its own CDP connection with a distinct client identity, so the relay's lease system correctly scopes ownership.
+
+**Usage:** Pass a stable, unique `session_id` string on `connect_tab`, `list_tabs`, `switch_tab`, and `release_tab`:
+
+```
+connect_tab { url: "localhost:8080", create: true, session_id: "finetune-debug" }
+list_tabs { session_id: "finetune-debug" }
+switch_tab { targetId: "spawriter-tab-...", session_id: "finetune-debug" }
+release_tab { session_id: "finetune-debug" }
+```
+
+- Use a descriptive, stable ID per session (e.g., transcript UUID, task name, session purpose)
+- Different `session_id` values create separate lease scopes — session A cannot access session B's tabs
+- Omitting `session_id` uses the default (shared) scope for backward compatibility
+
+### Session stickiness
+
+After calling `connect_tab` or `switch_tab` with a `session_id`, all subsequent tool calls (like `screenshot`, `navigate`, `execute`) automatically route to that session's CDP connection — you do NOT need to pass `session_id` on every tool call. Only tab management tools (`connect_tab`, `switch_tab`, `list_tabs`, `release_tab`) accept `session_id`.
+
+This "stickiness" works because Cursor's stdio MCP transport is sequential: only one chat session can make a tool call at a time. The most recent `session_id` from `connect_tab`/`switch_tab` becomes the active session until another `session_id` appears.
+
+### Known limitations
+
+- **Console logs, network logs, and debugger state are shared** across sessions (not per-session scoped). In practice this rarely causes issues because stdio is sequential, but be aware that `console_logs` may show entries from another session's tab if sessions interleave.
+- **`reset` is global** — any session calling `reset` releases ALL sessions' leases and clears ALL connections. Use it sparingly in multi-session setups.
+- **Rapid session interleaving** — if two chat sessions alternate tool calls very quickly, the stickiness mechanism ensures correct routing, but shared state (logs, debugger) may mix.
+
 ### Environment variables for multi-agent setup
 
 Configure these in your MCP client config to improve automatic tab selection:
@@ -579,7 +619,7 @@ Example MCP config with environment variables:
 
 When an agent needs a browser tab, `doEnsureSession` follows this priority:
 
-1. **Reconnect** to a tab already leased by this agent
+1. **Reconnect** to a tab already leased by this session (matching `session_id`-scoped client ID)
 2. **Find an unleased tab** (prioritizing `SSPA_PROJECT_URL` match)
 3. **Auto-attach** a Chrome tab matching `SSPA_PROJECT_URL` via the extension
 4. **Fallback** — ask the extension to attach the active tab (only when no tabs exist)
@@ -589,25 +629,27 @@ When an agent needs a browser tab, `doEnsureSession` follows this priority:
 
 | Tool | Usage |
 |------|-------|
-| `list_tabs` | Shows lease status: `MINE`, `LEASED by <label>`, `AVAILABLE` + summary counts |
-| `switch_tab` | Lease-aware switching: rejects if target is leased by another agent, acquires lease on new tab |
-| `connect_tab` | Attach a tab by URL, tab ID, or create new: `connect_tab { url: "localhost:8080" }` or `connect_tab { url: "example.com", create: true }` |
-| `release_tab` | Release a lease: `release_tab` (active tab) or `release_tab { targetId: "session-id" }` |
-| `reset` | Releases all leases before resetting connections |
+| `list_tabs` | Shows lease status: `MINE`, `LEASED by <label>`, `AVAILABLE` + summary counts. Pass `session_id` to scope. |
+| `switch_tab` | Lease-aware switching: rejects if target is leased by another session. Pass `session_id` to scope. |
+| `connect_tab` | Attach a tab by URL, tab ID, or create new. Pass `session_id` for per-session scoping. |
+| `release_tab` | Release a lease. Pass `session_id` to release from the correct scope. |
+| `reset` | Releases all leases (all sessions) before resetting connections |
 
 ### Multi-agent workflow
 
 ```
-# Agent 1 (configured with SSPA_PROJECT_URL=localhost:8080)
-# Automatically acquires lease on tab matching localhost:8080
-list_tabs → shows "Tab A (MINE), Tab B (LEASED by agent-2), Tab C (AVAILABLE)"
+# Chat session 1 (e.g., "finetune-debug")
+connect_tab { url: "localhost:8080", session_id: "finetune-debug" }
+list_tabs { session_id: "finetune-debug" }
+→ shows "Tab A (MINE), Tab B (LEASED by cert-work), Tab C (AVAILABLE)"
 
-# Agent 2 (configured with SSPA_PROJECT_URL=localhost:9090)
-# Automatically acquires lease on tab matching localhost:9090
-list_tabs → shows "Tab A (LEASED by agent-1), Tab B (MINE), Tab C (AVAILABLE)"
+# Chat session 2 (e.g., "cert-work")
+connect_tab { url: "localhost:9090", session_id: "cert-work" }
+list_tabs { session_id: "cert-work" }
+→ shows "Tab A (LEASED by finetune-debug), Tab B (MINE), Tab C (AVAILABLE)"
 
-# If an agent needs an additional tab:
-connect_tab { url: "example.com", create: true }
+# If a session needs an additional tab:
+connect_tab { url: "example.com", create: true, session_id: "finetune-debug" }
 ```
 
 ### What happens when...
@@ -616,14 +658,16 @@ connect_tab { url: "example.com", create: true }
 |-------|----------|
 | Agent crashes or disconnects | All its leases are automatically released |
 | Tab is closed by user | Lease is removed, agent gets `Target.leaseLost` event |
-| Agent calls `reset` | All its leases are released first |
+| Agent calls `reset` | All agent session leases are released first |
 | Two agents race for same tab | First one wins; second gets rejection and tries the next available tab |
 | No tabs available | Agent reports which tabs are leased by whom and suggests `connect_tab` |
 | Old relay (no lease support) | Agent falls back to classic mode without isolation |
+| Same MCP process, different `session_id` | Each gets its own CDP connection and lease scope |
 
 ### Backward compatibility
 
 - Single-agent setups work exactly as before — no configuration needed
+- Calls without `session_id` use the shared default scope
 - Leases are transparent: if only one agent is connected, it simply acquires a lease automatically
 - Old MCP clients connecting to a new relay continue to work (unleased tabs accept commands from anyone)
 

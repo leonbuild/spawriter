@@ -25,11 +25,20 @@ Or:
 node dist/cli.js serve
 ```
 
+## Session identification for tab isolation
+
+When multiple Cursor chat sessions share the same MCP server process, each session must identify itself to prevent cross-session tab access. On your **first spawriter tool call** in a conversation, determine your `session_id`:
+
+1. If your system prompt contains an agent transcript path like `.../agent-transcripts/{UUID}/{UUID}.jsonl`, use that UUID
+2. Otherwise, generate a short identifier from the conversation context (e.g., the task description, first 8 chars of a hash, or any stable session-specific value)
+
+Then pass `session_id` on **every** `connect_tab`, `list_tabs`, `switch_tab`, and `release_tab` call.
+
 ## Connection awareness
 
 Before using any spawriter tool, ensure the browser is connected. If a tool call fails:
 
-1. First try `connect_tab { url: "about:blank", create: true }` to auto-create a browser tab
+1. First try `connect_tab { url: "about:blank", create: true, session_id: "your-id" }` to auto-create a browser tab
 2. If that fails, call `reset` and retry
 3. Only if that also fails, check that Chrome is open, extension is loaded, and MCP relay is running
 
@@ -83,15 +92,15 @@ After modifying UI code, **always** run this sequence automatically:
 
 spawriter can work with **multiple attached Chrome tabs** using `list_tabs` and `switch_tab`. The user attaches tabs via the toolbar button; the agent switches between them.
 
-- `list_tabs` — shows all attached tabs (session ID, tab ID, title, URL, active indicator)
-- `switch_tab { targetId: "..." }` — switches to a different tab, clears console/network/intercept/debugger state (Playwright sessions preserved)
+- `list_tabs { session_id: "..." }` — shows all attached tabs (session ID, tab ID, title, URL, active indicator, lease status)
+- `switch_tab { targetId: "...", session_id: "..." }` — switches to a different tab, clears console/network/intercept/debugger state (Playwright sessions preserved)
 - `session_manager` manages Playwright executor VM sessions (isolated JS sandboxes), not Chrome tabs
 
 **Multi-tab comparison workflow:**
 ```
-list_tabs → see attached tabs
-switch_tab { targetId: "session-ref" } → switch to reference tab → screenshot
-switch_tab { targetId: "session-work" } → switch back → screenshot → compare
+list_tabs { session_id: "my-session" } → see attached tabs
+switch_tab { targetId: "session-ref", session_id: "my-session" } → switch to reference tab → screenshot
+switch_tab { targetId: "session-work", session_id: "my-session" } → switch back → screenshot → compare
 ```
 
 **Single-tab alternative:** use `navigate` to switch URLs within one tab, saving data in `playwright_execute` state.
@@ -128,22 +137,49 @@ When multiple AI agents share the same relay server, spawriter's Tab Lease Syste
 - CDP events are routed only to the lease holder — no cross-agent pollution
 - Leases auto-release on disconnect or tab close
 
+### Per-session isolation with `session_id`
+
+IDE hosts like Cursor may share a single MCP server process across multiple chat sessions. Without additional identification, all sessions appear as the same "agent" and can access each other's tabs.
+
+To isolate tabs per chat session, pass `session_id` on tab management tools. Each unique `session_id` gets its own CDP connection with a distinct client identity, so the relay's lease system correctly scopes ownership.
+
+**How to use:** Pass a stable, unique `session_id` string on `connect_tab`, `list_tabs`, `switch_tab`, and `release_tab`:
+
+```
+connect_tab { url: "localhost:8080", create: true, session_id: "finetune-debug" }
+list_tabs { session_id: "finetune-debug" }
+switch_tab { targetId: "spawriter-tab-...", session_id: "finetune-debug" }
+release_tab { session_id: "finetune-debug" }
+```
+
+- Use a descriptive, stable ID per session (e.g., transcript UUID, task name, session purpose)
+- Different `session_id` values create separate lease scopes — session A cannot access session B's tabs
+- Omitting `session_id` uses the default (shared) scope for backward compatibility
+
+### Session stickiness
+
+After calling `connect_tab` or `switch_tab` with a `session_id`, all subsequent tool calls (`screenshot`, `navigate`, `execute`, etc.) automatically route to that session's CDP connection. You do NOT need to pass `session_id` on every tool call — only on tab management tools.
+
+### Known limitations
+
+- Console logs, network logs, and debugger state are shared across sessions (not per-session scoped)
+- `reset` is global — releases ALL sessions' leases and connections
+- These are low-risk in practice because Cursor's stdio MCP transport is sequential
+
 **Environment variables** (set in MCP client config):
 - `SSPA_AGENT_LABEL` — human-readable name shown in `list_tabs` (e.g., `"frontend-agent"`)
 - `SSPA_PROJECT_URL` — URL substring for automatic tab matching (e.g., `"localhost:8080"`)
 
-**New tools for multi-agent:**
-- `connect_tab { url: "..." }` — attach a tab by URL match, or `connect_tab { url: "...", create: true }` to create one
-- `release_tab` — release lease on current tab; `release_tab { targetId: "..." }` for specific tab
-
-**Enhanced tools:**
-- `list_tabs` — now shows `MINE`, `LEASED by <label>`, `AVAILABLE` markers with summary counts
-- `switch_tab` — lease-aware: rejects switching to tabs leased by others
-- `reset` — releases all leases before resetting connections
+**Tab management tools:**
+- `connect_tab { url: "...", session_id: "..." }` — attach a tab by URL match, or add `create: true` to create one
+- `release_tab { session_id: "..." }` — release lease on current tab; add `targetId` for specific tab
+- `list_tabs { session_id: "..." }` — shows `MINE`, `LEASED by <label>`, `AVAILABLE` markers
+- `switch_tab { targetId: "...", session_id: "..." }` — lease-aware tab switching
+- `reset` — releases all leases (all sessions) before resetting connections
 
 **Session negotiation is automatic:** the agent reconnects to its own leased tab, finds unleased tabs matching `SSPA_PROJECT_URL`, auto-attaches by URL, or reports all-leased status with guidance.
 
-**Backward compatible:** single-agent setups work unchanged; old relays are detected and fall back gracefully.
+**Backward compatible:** single-agent setups and calls without `session_id` work unchanged.
 
 ## Safety rules
 
