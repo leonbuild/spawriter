@@ -10,7 +10,7 @@ alwaysApply: false
 
 You have access to **spawriter** MCP tools that control the user's real Chrome tab via CDP (Chrome DevTools Protocol). This is NOT a headless browser — all actions affect the user's visible browser.
 
-**You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it.
+**You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it. Especially when you are given an URL. 
 
 ## Available Tools (27)
 
@@ -705,3 +705,4 @@ connect_tab { url: "example.com", create: true, session_id: "finetune-debug" }
 | Cookie read fails in `playwright_execute` | Use `Network.getCookies` via CDP session, **not** `Storage.getCookies`. In extension relay mode, `Storage.getCookies` is a root-session command and will fail. Example: `const cdp = await page.context().newCDPSession(page); const { cookies } = await cdp.send('Network.getCookies', { urls: [page.url()] });` |
 | All tabs leased by other agents | Use `connect_tab { url: "your-url" }` to attach a new tab, or ask another agent to `release_tab` |
 | Tab lease rejected | Another agent holds the lease; use `list_tabs` to see ownership, then pick an AVAILABLE tab or use `connect_tab` |
+`
