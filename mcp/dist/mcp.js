@@ -977,8 +977,26 @@ Can retrieve: request headers, request body (POST data), response headers, respo
         name: 'playwright_execute',
         description: `Execute code in a Node.js VM sandbox with full Playwright API access.
 Available variables: page (Playwright Page), context (BrowserContext), state (persistent object across calls).
-Use for: complex interactions, form filling, multi-step flows, Playwright locators, multi-page scenarios.
-For simple/fast JS in page context, use the 'execute' tool instead.`,
+Use for: any browser interaction that needs real input events or Playwright's auto-waiting.
+
+Supported page/locator actions (all trigger real browser input events via CDP):
+- Mouse: click, dblclick, hover, dragTo, dispatchEvent
+- Forms: fill, clear, check, uncheck, setChecked, selectOption, setInputFiles
+- Keyboard: press, pressSequentially, type (via page.keyboard)
+- Touch: tap (requires hasTouch context)
+- Focus: focus, blur
+- Scroll: scrollIntoViewIfNeeded, mouse.wheel
+- Wait: waitForSelector, waitForLoadState, waitForURL, waitForEvent, waitForFunction
+- Query: textContent, innerText, innerHTML, inputValue, getAttribute, isVisible, isChecked, isDisabled, boundingBox, count
+- Navigation: goto, goBack, goForward, reload
+- Locators: getByRole, getByText, getByLabel, getByPlaceholder, getByTestId, getByAltText, getByTitle, locator, frameLocator
+
+Low-level mouse (page.mouse): move, down, up, click, dblclick, wheel
+Low-level keyboard (page.keyboard): down, up, press, type, insertText
+
+Examples: page.hover('.menu'), page.getByRole('button').click(), page.keyboard.press('Enter'), page.mouse.wheel(0, 500)
+
+For simple/fast JS in page context (DOM reads, API calls), use the 'execute' tool instead.`,
         inputSchema: {
             type: 'object',
             properties: {

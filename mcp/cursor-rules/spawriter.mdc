@@ -22,7 +22,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 | `screenshot` | Capture page screenshot, optionally with numbered labels on interactive elements | `labels?` (boolean) |
 | `accessibility_snapshot` | Get condensed accessibility tree with search and diff support | `search?`, `diff?` |
 | `execute` | Run JS in page context (fast, lightweight, direct CDP) | `code` |
-| `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API (page, context, state) | `code`, `timeout?` |
+| `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API — supports click, hover, fill, drag, keyboard, scroll, tap, wait, and all locator strategies. All actions trigger real browser input events (CSS :hover/:focus work correctly) | `code`, `timeout?` |
 | `console_logs` | Get captured browser console logs with filtering | `count?`, `level?`, `search?`, `clear?` |
 | `network_log` | Get captured network requests with filtering | `count?`, `url_filter?`, `status_filter?`, `clear?` |
 | `network_detail` | Get full details of a specific request: headers, request/response body | `requestId`, `include?`, `max_body_size?` |
@@ -215,21 +215,148 @@ dashboard_state  →  confirm overrideUrl shows your localhost URL
 screenshot       →  confirm the UI reflects your local code
 ```
 
-### 4. Complex interactions with Playwright
+### 4. Browser interactions with Playwright
+
+`playwright_execute` gives you the **full Playwright API** — every action triggers real browser input events via CDP (not synthetic JS events). This means CSS `:hover`, `:focus`, `:active` pseudo-classes all work correctly.
+
+Use `playwright_execute` for: any interaction that needs real input events, auto-waiting, or Playwright locators.
+Use `execute` for: quick JS evaluation in page context, reading DOM values, calling page APIs (no real input events).
+
+#### Mouse actions
 
 ```
-playwright_execute { code: "await page.click('button[type=submit]')" }
-playwright_execute { code: "state.formData = await page.inputValue('#email')" }
-playwright_execute { code: "await page.fill('#name', 'Test User')" }
+playwright_execute { code: "await page.getByRole('button').click()" }
+playwright_execute { code: "await page.getByText('Item').dblclick()" }
+playwright_execute { code: "await page.getByText('Item').click({ button: 'right' })" }
+playwright_execute { code: "await page.getByText('Item').click({ modifiers: ['Shift'] })" }
+playwright_execute { code: "await page.getByText('Item').hover()" }
+playwright_execute { code: "await page.getByText('Item').click({ position: { x: 0, y: 0 } })" }
+playwright_execute { code: "await page.locator('#source').dragTo(page.locator('#target'))" }
 ```
 
-Use `playwright_execute` for: Playwright locators, form filling, multi-step flows, assertions, file downloads.
-Use `execute` for: quick JS evaluation in page context, reading DOM values, calling page APIs.
+#### Hover + verify tooltip/dropdown/menu
 
-**File downloads** — the relay maps `Browser.setDownloadBehavior` to per-page `Page.setDownloadBehavior` and synthesizes `Browser.download*` events, so Playwright downloads work in extension mode:
+```
+playwright_execute { code: "await page.hover('.menu-trigger'); await page.waitForSelector('.dropdown-menu', { state: 'visible' })" }
+playwright_execute { code: "await page.getByRole('link').hover(); await page.waitForSelector('.tooltip', { state: 'visible' })" }
+```
+
+#### Form interactions
+
+```
+playwright_execute { code: "await page.getByRole('textbox').fill('Hello')" }
+playwright_execute { code: "await page.getByRole('textbox').clear()" }
+playwright_execute { code: "await page.getByLabel('I agree').check()" }
+playwright_execute { code: "await page.getByLabel('I agree').uncheck()" }
+playwright_execute { code: "await page.getByLabel('Color').selectOption('blue')" }
+playwright_execute { code: "await page.getByLabel('Color').selectOption({ label: 'Blue' })" }
+playwright_execute { code: "await page.getByLabel('Upload').setInputFiles('/path/to/file.pdf')" }
+playwright_execute { code: "state.formData = await page.getByRole('textbox').inputValue()" }
+```
+
+#### Keyboard actions
+
+```
+playwright_execute { code: "await page.getByText('Submit').press('Enter')" }
+playwright_execute { code: "await page.getByRole('textbox').press('Control+ArrowRight')" }
+playwright_execute { code: "await page.keyboard.type('Hello World!')" }
+playwright_execute { code: "await page.keyboard.press('ControlOrMeta+A')" }
+playwright_execute { code: "await page.locator('#area').pressSequentially('Hello', { delay: 100 })" }
+```
+
+#### Low-level mouse control
+
+```
+playwright_execute { code: "await page.mouse.move(100, 200)" }
+playwright_execute { code: "await page.mouse.down()" }
+playwright_execute { code: "await page.mouse.move(200, 300)" }
+playwright_execute { code: "await page.mouse.up()" }
+playwright_execute { code: "await page.mouse.wheel(0, 500)" }
+```
+
+#### Manual drag-and-drop via mouse
+
+```
+playwright_execute { code: "await page.locator('#drag-source').hover(); await page.mouse.down(); await page.locator('#drop-target').hover(); await page.mouse.up();" }
+```
+
+#### Touch (tap)
+
+Requires `hasTouch` browser context. Use for mobile-emulated interactions:
+
+```
+playwright_execute { code: "await page.tap('.mobile-menu-btn')" }
+playwright_execute { code: "await page.touchscreen.tap(200, 300)" }
+```
+
+#### Dispatch synthetic events
+
+For custom events or events not covered by built-in actions:
+
+```
+playwright_execute { code: "await page.locator('#btn').dispatchEvent('click')" }
+playwright_execute { code: "const dt = await page.evaluateHandle(() => new DataTransfer()); await page.locator('#src').dispatchEvent('dragstart', { dataTransfer: dt })" }
+```
+
+#### Focus & scroll
+
+```
+playwright_execute { code: "await page.getByLabel('Password').focus()" }
+playwright_execute { code: "await page.getByRole('button').blur()" }
+playwright_execute { code: "await page.getByText('Footer').scrollIntoViewIfNeeded()" }
+playwright_execute { code: "await page.getByTestId('container').hover(); await page.mouse.wheel(0, 300)" }
+```
+
+#### Locator strategies
+
+```
+playwright_execute { code: "await page.getByRole('button', { name: 'Submit' }).click()" }
+playwright_execute { code: "await page.getByText('Sign up').click()" }
+playwright_execute { code: "await page.getByLabel('Email').fill('test@example.com')" }
+playwright_execute { code: "await page.getByPlaceholder('Search...').fill('query')" }
+playwright_execute { code: "await page.getByTestId('submit-btn').click()" }
+playwright_execute { code: "await page.getByAltText('Logo').click()" }
+playwright_execute { code: "await page.getByTitle('Close').click()" }
+playwright_execute { code: "await page.locator('css=.my-class >> text=Click me').click()" }
+playwright_execute { code: "await page.frameLocator('#my-iframe').getByText('Submit').click()" }
+```
+
+#### Waiting & assertions
+
+```
+playwright_execute { code: "await page.waitForSelector('.modal', { state: 'visible' })" }
+playwright_execute { code: "await page.waitForSelector('.spinner', { state: 'hidden' })" }
+playwright_execute { code: "await page.waitForLoadState('networkidle')" }
+playwright_execute { code: "await page.waitForURL('**/dashboard')" }
+playwright_execute { code: "await page.waitForFunction(() => document.querySelectorAll('.item').length > 5)" }
+playwright_execute { code: "return await page.getByRole('heading').textContent()" }
+playwright_execute { code: "return await page.getByRole('button').isVisible()" }
+playwright_execute { code: "return await page.getByRole('listitem').count()" }
+playwright_execute { code: "return await page.getByRole('button').boundingBox()" }
+```
+
+#### Navigation
+
+```
+playwright_execute { code: "await page.goto('https://example.com')" }
+playwright_execute { code: "await page.goBack()" }
+playwright_execute { code: "await page.goForward()" }
+playwright_execute { code: "await page.reload()" }
+```
+
+#### File downloads
+
+The relay maps `Browser.setDownloadBehavior` to per-page `Page.setDownloadBehavior` and synthesizes `Browser.download*` events, so Playwright downloads work in extension mode:
 
 ```
 playwright_execute { code: "const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-btn')]); const path = await download.path(); return path;" }
+```
+
+#### Persistent state across calls
+
+```
+playwright_execute { code: "state.formData = { name: 'Test', email: 'a@b.com' };" }
+playwright_execute { code: "await page.fill('#name', state.formData.name);" }
 ```
 
 ### 5. Debug with console and network logs

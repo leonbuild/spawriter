@@ -2455,8 +2455,7 @@ describe('playwright_execute tool definition', () => {
     name: 'playwright_execute',
     description: `Execute code in a Node.js VM sandbox with full Playwright API access.
 Available variables: page (Playwright Page), context (BrowserContext), state (persistent object across calls).
-Use for: complex interactions, form filling, multi-step flows, Playwright locators, multi-page scenarios.
-For simple/fast JS in page context, use the 'execute' tool instead.`,
+Use for: any browser interaction that needs real input events or Playwright's auto-waiting.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2494,7 +2493,7 @@ For simple/fast JS in page context, use the 'execute' tool instead.`,
   });
 
   it('should differentiate from execute tool', () => {
-    assert.ok(playwrightTool.description.includes("'execute'"));
+    assert.ok(playwrightTool.description.includes('real input events'));
   });
 });
 
