@@ -9302,6 +9302,21 @@ describe('setTabTitlePrefix code generation', () => {
 // ===========================================================================
 
 describe('Tab state lifecycle – title prefix expectations', () => {
+  const TAB_TITLE_PREFIXES: Record<string, string> = {
+    connected: "🟢 ", idle: "🔵 ", connecting: "🟡 ", error: "🔴 ",
+  };
+
+  function resolveBridgeVisualState(args: {
+    attached: boolean;
+    hasLease: boolean;
+    baseState?: 'idle' | 'connected' | 'connecting' | 'error';
+  }): 'idle' | 'connected' | 'connecting' | 'error' {
+    const { attached, hasLease, baseState = 'idle' } = args;
+    if (baseState === 'connecting' || baseState === 'error') return baseState;
+    if (!attached) return 'idle';
+    return hasLease ? 'connected' : 'idle';
+  }
+
   it('acquireLease should result in green prefix', () => {
     // After acquireLease succeeds + enableDomains, setTabTitlePrefix(🟢) is called
     const expectedPrefix = '🟢 ';
@@ -9327,13 +9342,31 @@ describe('Tab state lifecycle – title prefix expectations', () => {
     assert.equal(state, null);
   });
 
-  it('bridge attachTab should set idle (blue) not connected (green)', () => {
-    // Bridge sets 🔵 on attach; MCP sets 🟢 after acquireLease
-    const bridgeAttachState = "idle";
-    const TAB_TITLE_PREFIXES: Record<string, string> = {
-      connected: "🟢 ", idle: "🔵 ", connecting: "🟡 ", error: "🔴 ",
-    };
+  it('bridge attachTab should remain blue until lease is acquired', () => {
+    const bridgeAttachState = resolveBridgeVisualState({
+      attached: true,
+      hasLease: false,
+      baseState: 'idle',
+    });
     assert.equal(TAB_TITLE_PREFIXES[bridgeAttachState], '🔵 ');
+  });
+
+  it('bridge should become green only after lease acquisition', () => {
+    const leasedState = resolveBridgeVisualState({
+      attached: true,
+      hasLease: true,
+      baseState: 'idle',
+    });
+    assert.equal(TAB_TITLE_PREFIXES[leasedState], '🟢 ');
+  });
+
+  it('bridge should revert to blue after lease release', () => {
+    const releasedState = resolveBridgeVisualState({
+      attached: true,
+      hasLease: false,
+      baseState: 'idle',
+    });
+    assert.equal(TAB_TITLE_PREFIXES[releasedState], '🔵 ');
   });
 
   it('rapid switch_tab should not cause prefix corruption', () => {

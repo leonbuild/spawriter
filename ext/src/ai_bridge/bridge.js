@@ -5,6 +5,7 @@ import browser from "webextension-polyfill";
 
   let attachedTabs = new Map();
   let tabStates = new Map();
+  let leaseStateBySessionId = new Map();
   let debuggerEventListenerRegistered = false;
   let offscreenReady = false;
 
@@ -77,6 +78,34 @@ import browser from "webextension-polyfill";
     return Array.from(tabStates.values()).filter((s) => s === "connected").length;
   }
 
+  function isTabLeased(tabId) {
+    const tabInfo = attachedTabs.get(tabId);
+    if (!tabInfo?.sessionId) return false;
+    return leaseStateBySessionId.has(tabInfo.sessionId);
+  }
+
+  function syncLeaseDrivenStates() {
+    for (const [tabId, tabInfo] of attachedTabs.entries()) {
+      const leased = !!tabInfo?.sessionId && leaseStateBySessionId.has(tabInfo.sessionId);
+      const nextState = leased ? "connected" : "idle";
+      setTabState(tabId, nextState);
+      markTabTitle(tabId, nextState);
+    }
+    updateIcons();
+  }
+
+  function applyLeaseSnapshot(leases) {
+    leaseStateBySessionId.clear();
+    if (Array.isArray(leases)) {
+      for (const lease of leases) {
+        if (lease?.sessionId) {
+          leaseStateBySessionId.set(lease.sessionId, lease);
+        }
+      }
+    }
+    syncLeaseDrivenStates();
+  }
+
   const icons = {
     connected: {
       path: {
@@ -133,6 +162,7 @@ import browser from "webextension-polyfill";
       const state = tabId !== undefined ? getTabState(tabId) : "idle";
       const tabUrl = tabId !== undefined ? tabUrlMap.get(tabId) : undefined;
       const restricted = tabId !== undefined && isRestrictedUrl(tabUrl);
+      const attached = tabId !== undefined && attachedTabs.has(tabId);
 
       let title, badgeText, badgeColor, iconPath;
 
@@ -152,10 +182,15 @@ import browser from "webextension-polyfill";
         badgeColor = "#FFC107";
         iconPath = icons.gray.path;
       } else if (state === "connected") {
-        title = "spawriter - Connected (click to disconnect)";
+        title = "spawriter - In use by agent (lease active)";
         badgeText = connectedCount > 0 ? String(connectedCount) : "";
         badgeColor = "#4CAF50";
         iconPath = icons.connected.path;
+      } else if (attached) {
+        title = "spawriter - Attached (no active lease)";
+        badgeText = connectedCount > 0 ? String(connectedCount) : "";
+        badgeColor = "#3F51B5";
+        iconPath = icons.idle.path;
       } else {
         title = "spawriter - Click to attach debugger";
         badgeText = connectedCount > 0 ? String(connectedCount) : "";
@@ -164,7 +199,7 @@ import browser from "webextension-polyfill";
       }
 
       if (tabId !== undefined) {
-        log(`[updateIcons] tabId=${tabId} state=${state} restricted=${restricted} → icon=${state === "connected" ? "green" : state === "connecting" ? "gray" : state === "error" ? "gray" : restricted ? "gray" : "idle(blue)"} badge="${badgeText}" badgeColor=${badgeColor}`);
+        log(`[updateIcons] tabId=${tabId} state=${state} attached=${attached} restricted=${restricted} → icon=${state === "connected" ? "green" : state === "connecting" ? "gray" : state === "error" ? "gray" : restricted ? "gray" : attached ? "attached-idle(blue)" : "detached-idle(blue)"} badge="${badgeText}" badgeColor=${badgeColor}`);
       }
 
       try {
@@ -215,7 +250,7 @@ import browser from "webextension-polyfill";
     browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       updateIcons();
       if (changeInfo.status === "complete" && attachedTabs.has(tabId)) {
-        markTabTitle(tabId, "idle");
+        markTabTitle(tabId, getTabState(tabId));
       }
     });
 
@@ -257,6 +292,9 @@ import browser from "webextension-polyfill";
     const tabInfo = attachedTabs.get(tabId);
     if (!tabInfo) return;
 
+    if (tabInfo.sessionId) {
+      leaseStateBySessionId.delete(tabInfo.sessionId);
+    }
     attachedTabs.delete(tabId);
     persistState();
     markTabTitle(tabId, false);
@@ -406,6 +444,30 @@ import browser from "webextension-polyfill";
       handleTraceCommand(message)
         .then((result) => sendMessage({ id: message.id, ...result }))
         .catch((e) => sendMessage({ id: message.id, error: e.message || String(e) }));
+      return;
+    }
+
+    if (message.method === "Target.leaseSnapshot") {
+      const leases = Array.isArray(message?.params?.leases) ? message.params.leases : [];
+      applyLeaseSnapshot(leases);
+      return;
+    }
+
+    if (message.method === "Target.leaseAcquired") {
+      const sessionId = message?.params?.sessionId;
+      if (sessionId) {
+        leaseStateBySessionId.set(sessionId, message?.params?.lease || { sessionId });
+        syncLeaseDrivenStates();
+      }
+      return;
+    }
+
+    if (message.method === "Target.leaseReleased" || message.method === "Target.leaseLost") {
+      const sessionId = message?.params?.sessionId;
+      if (sessionId) {
+        leaseStateBySessionId.delete(sessionId);
+        syncLeaseDrivenStates();
+      }
       return;
     }
 
@@ -589,6 +651,7 @@ import browser from "webextension-polyfill";
     }
 
     const state = getTabState(tabId);
+    const attached = attachedTabs.has(tabId);
 
     if (state === "error") {
       await disconnectTab(tabId);
@@ -601,6 +664,8 @@ import browser from "webextension-polyfill";
     }
 
     if (state === "connected") {
+      await disconnectTab(tabId);
+    } else if (attached && state === "idle") {
       await disconnectTab(tabId);
     } else {
       await connectTab(tabId);
@@ -647,7 +712,8 @@ import browser from "webextension-polyfill";
       attachedAt: Date.now(),
     });
     persistState();
-    setTabState(tabId, "connected");
+    const initialState = isTabLeased(tabId) ? "connected" : "idle";
+    setTabState(tabId, initialState);
 
     if (!skipAttachedEvent) {
       sendMessage({
@@ -661,7 +727,7 @@ import browser from "webextension-polyfill";
     }
 
     log(`Attached to tab ${tabId}, sessionId: ${sessionId}`);
-    markTabTitle(tabId, "idle");
+    markTabTitle(tabId, initialState);
     updateIcons();
     syncTabGroup();
     return { tabId, sessionId };
@@ -742,7 +808,7 @@ import browser from "webextension-polyfill";
           const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
           existing = { sessionId, attachedAt: Date.now() };
           attachedTabs.set(tabId, existing);
-          setTabState(tabId, "connected");
+          setTabState(tabId, leaseStateBySessionId.has(sessionId) ? "connected" : "idle");
           log(`resyncAttachedTabs: new entry for tab ${tabId} with sessionId ${sessionId}`);
         }
 
@@ -780,6 +846,10 @@ import browser from "webextension-polyfill";
             },
           },
         });
+
+        const nextState = leaseStateBySessionId.has(existing.sessionId) ? "connected" : "idle";
+        setTabState(tabId, nextState);
+        markTabTitle(tabId, nextState);
       }
 
       persistState();
@@ -896,6 +966,10 @@ import browser from "webextension-polyfill";
   async function init() {
     log("spawriter bridge initializing...");
     await restoreState();
+    leaseStateBySessionId.clear();
+    for (const tabId of attachedTabs.keys()) {
+      setTabState(tabId, "idle");
+    }
     ensureDebuggerEventListener();
     updateIcons();
 
@@ -919,6 +993,7 @@ import browser from "webextension-polyfill";
         offscreenReady = message.state === "open";
         log("Relay WebSocket state:", message.state);
         if (message.state === "closed") {
+          leaseStateBySessionId.clear();
           for (const tabId of attachedTabs.keys()) {
             setTabState(tabId, "idle");
             markTabTitle(tabId, "idle");
@@ -927,9 +1002,12 @@ import browser from "webextension-polyfill";
           syncTabGroup();
         }
         if (message.state === "open") {
-          for (const [tabId, info] of attachedTabs.entries()) {
-            setTabState(tabId, "connected");
+          leaseStateBySessionId.clear();
+          for (const [tabId] of attachedTabs.entries()) {
+            setTabState(tabId, "idle");
+            markTabTitle(tabId, "idle");
           }
+          sendMessage({ method: "requestLeaseSnapshot" });
           resyncAttachedTabs();
           updateIcons();
           syncTabGroup();
@@ -979,6 +1057,12 @@ import browser from "webextension-polyfill";
           const resp = await chrome.runtime.sendMessage({ type: "ws-status" });
           if (resp?.state === "open") {
             offscreenReady = true;
+            leaseStateBySessionId.clear();
+            for (const [tabId] of attachedTabs.entries()) {
+              setTabState(tabId, "idle");
+              markTabTitle(tabId, "idle");
+            }
+            sendMessage({ method: "requestLeaseSnapshot" });
             resyncAttachedTabs();
           }
         } catch (_) {}

@@ -86,15 +86,20 @@ function getLeaseInfo(sessionId: string): LeaseInfo | null {
 }
 
 function releaseClientLeases(clientId: string, reason: string): void {
+  let released = false;
   for (const [sid, lease] of tabLeases) {
     if (lease.clientId === clientId) {
       tabLeases.delete(sid);
+      released = true;
       log(`Auto-released lease on ${sid} (${reason})`);
       broadcastToCDPClients({
         method: 'Target.leaseReleased',
         params: { sessionId: sid, reason },
       });
     }
+  }
+  if (released) {
+    sendLeaseSnapshotToExtension(reason);
   }
 }
 
@@ -253,6 +258,22 @@ function sendToExtension(message: unknown): void {
   } else {
     error('Extension WebSocket not connected, cannot send message');
   }
+}
+
+function sendLeaseSnapshotToExtension(reason: string): void {
+  if (extensionWs?.readyState !== WebSocket.OPEN) return;
+  sendToExtension({
+    method: 'Target.leaseSnapshot',
+    params: {
+      reason,
+      leases: Array.from(tabLeases.values()).map((lease) => ({
+        sessionId: lease.sessionId,
+        clientId: lease.clientId,
+        label: lease.label,
+        acquiredAt: lease.acquiredAt,
+      })),
+    },
+  });
 }
 
 function isExtensionConnected(): boolean {
@@ -651,6 +672,14 @@ function handleServerCdpCommand(
       tabLeases.set(leaseSessionId, lease);
       log(`Lease granted: ${leaseSessionId} → ${clientId}${leaseLabel ? ` (${leaseLabel})` : ''}`);
 
+      if (isExtensionConnected()) {
+        sendToExtension({
+          method: 'Target.leaseAcquired',
+          params: { sessionId: leaseSessionId, lease: getLeaseInfo(leaseSessionId) },
+        });
+      }
+      sendLeaseSnapshotToExtension('acquire');
+
       sendCdpResponse(clientId, {
         id,
         sessionId,
@@ -680,6 +709,13 @@ function handleServerCdpCommand(
 
       tabLeases.delete(releaseSessionId);
       log(`Lease released: ${releaseSessionId} by ${clientId}`);
+      if (isExtensionConnected()) {
+        sendToExtension({
+          method: 'Target.leaseReleased',
+          params: { sessionId: releaseSessionId, reason: 'explicit-release' },
+        });
+      }
+      sendLeaseSnapshotToExtension('explicit-release');
       broadcastToCDPClients({
         method: 'Target.leaseReleased',
         params: { sessionId: releaseSessionId, reason: 'explicit-release' },
@@ -713,6 +749,11 @@ function handleExtensionMessage(data: Buffer) {
       return;
     }
 
+    if (message.method === 'requestLeaseSnapshot') {
+      sendLeaseSnapshotToExtension('extension-request');
+      return;
+    }
+
     if (isExtensionLogMessage(message)) {
       const params = message.params as { level?: string; args?: unknown[] };
       const level = params.level ?? 'log';
@@ -739,6 +780,13 @@ function handleExtensionMessage(data: Buffer) {
                   method: 'Target.leaseLost',
                   params: { sessionId: existingSessionId, reason: 'target-replaced' },
                 });
+                if (isExtensionConnected()) {
+                  sendToExtension({
+                    method: 'Target.leaseLost',
+                    params: { sessionId: existingSessionId, reason: 'target-replaced' },
+                  });
+                }
+                sendLeaseSnapshotToExtension('target-replaced');
               }
               broadcastToCDPClients({
                 method: 'Target.detachedFromTarget',
@@ -793,6 +841,13 @@ function handleExtensionMessage(data: Buffer) {
               method: 'Target.leaseLost',
               params: { sessionId: detachedSessionId, reason: 'tab-detached' },
             });
+            if (isExtensionConnected()) {
+              sendToExtension({
+                method: 'Target.leaseLost',
+                params: { sessionId: detachedSessionId, reason: 'tab-detached' },
+              });
+            }
+            sendLeaseSnapshotToExtension('tab-detached');
           }
         }
       }
@@ -1012,6 +1067,7 @@ export async function startRelayServer(): Promise<void> {
 
       log('Extension WebSocket connected');
       extensionWs = ws as WebSocket;
+      sendLeaseSnapshotToExtension('extension-connected');
 
       ws.on('message', (data) => {
         handleExtensionMessage(rawDataToBuffer(data));
