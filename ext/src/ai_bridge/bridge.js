@@ -78,6 +78,14 @@ import browser from "webextension-polyfill";
     return Array.from(tabStates.values()).filter((s) => s === "connected").length;
   }
 
+  function getIdleAttachedCount() {
+    let count = 0;
+    for (const tabId of attachedTabs.keys()) {
+      if (getTabState(tabId) !== "connected") count++;
+    }
+    return count;
+  }
+
   function isTabLeased(tabId) {
     const tabInfo = attachedTabs.get(tabId);
     if (!tabInfo?.sessionId) return false;
@@ -133,8 +141,20 @@ import browser from "webextension-polyfill";
     },
   };
 
+  function buildBadgeInfo(leaseCount, idleCount) {
+    if (leaseCount > 0 && idleCount > 0) {
+      return { text: `${leaseCount}·${idleCount}`, color: "#4CAF50" };
+    } else if (leaseCount > 0) {
+      return { text: String(leaseCount), color: "#4CAF50" };
+    } else if (idleCount > 0) {
+      return { text: String(idleCount), color: "#3F51B5" };
+    }
+    return { text: "", color: "#9E9E9E" };
+  }
+
   async function updateIcons() {
     const connectedCount = getConnectedCount();
+    const idleCount = getIdleAttachedCount();
 
     const actionApi =
       typeof browser !== "undefined" && browser.action
@@ -156,7 +176,9 @@ import browser from "webextension-polyfill";
       ...allTabs.map((t) => t.id).filter((id) => id !== undefined),
     ];
 
-    log(`[updateIcons] connectedCount=${connectedCount}, tabStates=${JSON.stringify([...tabStates.entries()])}, attachedTabs=${JSON.stringify([...attachedTabs.keys()])}`);
+    const globalBadge = buildBadgeInfo(connectedCount, idleCount);
+
+    log(`[updateIcons] connected=${connectedCount} idle=${idleCount}, tabStates=${JSON.stringify([...tabStates.entries()])}, attachedTabs=${JSON.stringify([...attachedTabs.keys()])}`);
 
     for (const tabId of allTabIds) {
       const state = tabId !== undefined ? getTabState(tabId) : "idle";
@@ -168,7 +190,7 @@ import browser from "webextension-polyfill";
 
       if (restricted) {
         title = "spawriter - Cannot attach to this page";
-        badgeText = connectedCount > 0 ? String(connectedCount) : "";
+        badgeText = globalBadge.text;
         badgeColor = "#9E9E9E";
         iconPath = icons.gray.path;
       } else if (state === "error") {
@@ -182,24 +204,24 @@ import browser from "webextension-polyfill";
         badgeColor = "#FFC107";
         iconPath = icons.gray.path;
       } else if (state === "connected") {
-        title = "spawriter - In use by agent (lease active)";
-        badgeText = connectedCount > 0 ? String(connectedCount) : "";
+        title = `spawriter - In use by agent (${connectedCount} leased` + (idleCount > 0 ? `, ${idleCount} idle)` : ")");
+        badgeText = globalBadge.text;
         badgeColor = "#4CAF50";
         iconPath = icons.connected.path;
       } else if (attached) {
-        title = "spawriter - Attached (no active lease)";
-        badgeText = connectedCount > 0 ? String(connectedCount) : "";
+        title = `spawriter - Attached, no lease (${idleCount} idle` + (connectedCount > 0 ? `, ${connectedCount} leased)` : ")");
+        badgeText = globalBadge.text;
         badgeColor = "#3F51B5";
         iconPath = icons.idle.path;
       } else {
         title = "spawriter - Click to attach debugger";
-        badgeText = connectedCount > 0 ? String(connectedCount) : "";
-        badgeColor = "#9E9E9E";
+        badgeText = globalBadge.text;
+        badgeColor = globalBadge.color;
         iconPath = icons.idle.path;
       }
 
       if (tabId !== undefined) {
-        log(`[updateIcons] tabId=${tabId} state=${state} attached=${attached} restricted=${restricted} → icon=${state === "connected" ? "green" : state === "connecting" ? "gray" : state === "error" ? "gray" : restricted ? "gray" : attached ? "attached-idle(blue)" : "detached-idle(blue)"} badge="${badgeText}" badgeColor=${badgeColor}`);
+        log(`[updateIcons] tabId=${tabId} state=${state} attached=${attached} restricted=${restricted} badge="${badgeText}" badgeColor=${badgeColor}`);
       }
 
       try {
@@ -285,7 +307,9 @@ import browser from "webextension-polyfill";
         },
         args: [prefix, ALL_PREFIXES_RE_SRC],
       });
-    } catch (_) {}
+    } catch (e) {
+      warn(`markTabTitle failed for tab ${tabId} (state=${state}):`, e?.message || e);
+    }
   }
 
   function emitDetachedFromTarget(tabId, reason) {
@@ -973,83 +997,11 @@ import browser from "webextension-polyfill";
     ensureDebuggerEventListener();
     updateIcons();
 
-    browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      if (!message) return undefined;
-
-      if (message.type === "trace_event" && traceActive) {
-        if (traceEvents.length >= TRACE_MAX_EVENTS) {
-          traceEvents.shift();
-        }
-        traceEvents.push(message.payload);
-        return;
+    setInterval(() => {
+      if (offscreenReady && attachedTabs.size > 0) {
+        sendMessage({ method: "requestLeaseSnapshot" });
       }
-
-      if (message.type === "ws-message") {
-        handleRelayIncoming(message.payload);
-        return;
-      }
-
-      if (message.type === "ws-state-change") {
-        offscreenReady = message.state === "open";
-        log("Relay WebSocket state:", message.state);
-        if (message.state === "closed") {
-          leaseStateBySessionId.clear();
-          for (const tabId of attachedTabs.keys()) {
-            setTabState(tabId, "idle");
-            markTabTitle(tabId, "idle");
-          }
-          updateIcons();
-          syncTabGroup();
-        }
-        if (message.state === "open") {
-          leaseStateBySessionId.clear();
-          for (const [tabId] of attachedTabs.entries()) {
-            setTabState(tabId, "idle");
-            markTabTitle(tabId, "idle");
-          }
-          sendMessage({ method: "requestLeaseSnapshot" });
-          resyncAttachedTabs();
-          updateIcons();
-          syncTabGroup();
-        }
-        return;
-      }
-
-      if (message.type === "spawriter-toggle") {
-        const tabId = message.tabId;
-        if (tabId) {
-          toggleTab(tabId)
-            .then(() => sendResponse({ success: true }))
-            .catch((err) =>
-              sendResponse({ success: false, error: err.message })
-            );
-        } else {
-          sendResponse({ success: false, error: "No tabId provided" });
-        }
-        return true;
-      }
-
-      if (message.type === "spawriter-status") {
-        sendResponse({
-          connectedCount: getConnectedCount(),
-          wsConnected: offscreenReady,
-          attachedTabIds: [...attachedTabs.keys()],
-        });
-        return true;
-      }
-
-      if (message.type === "ai-bridge-command") {
-        const command = message.payload || message;
-        handleRelayMessage(command)
-          .then(sendResponse)
-          .catch((err) =>
-            sendResponse({ success: false, error: err.message })
-          );
-        return true;
-      }
-
-      return undefined;
-    });
+    }, 5000);
 
     ensureOffscreen()
       .then(async () => {
@@ -1062,8 +1014,10 @@ import browser from "webextension-polyfill";
               setTabState(tabId, "idle");
               markTabTitle(tabId, "idle");
             }
-            sendMessage({ method: "requestLeaseSnapshot" });
-            resyncAttachedTabs();
+            resyncAttachedTabs().then(async () => {
+              await sleep(500);
+              sendMessage({ method: "requestLeaseSnapshot" });
+            });
           }
         } catch (_) {}
       })
@@ -1073,6 +1027,88 @@ import browser from "webextension-polyfill";
 
     log("spawriter bridge initialized (offscreen relay connection active)");
   }
+
+  // Register message listener synchronously at module scope to avoid
+  // missing messages when the service worker wakes from termination.
+  browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!message) return undefined;
+
+    if (message.type === "trace_event" && traceActive) {
+      if (traceEvents.length >= TRACE_MAX_EVENTS) {
+        traceEvents.shift();
+      }
+      traceEvents.push(message.payload);
+      return;
+    }
+
+    if (message.type === "ws-message") {
+      handleRelayIncoming(message.payload);
+      return;
+    }
+
+    if (message.type === "ws-state-change") {
+      offscreenReady = message.state === "open";
+      log("Relay WebSocket state:", message.state);
+      if (message.state === "closed") {
+        leaseStateBySessionId.clear();
+        for (const tabId of attachedTabs.keys()) {
+          setTabState(tabId, "idle");
+          markTabTitle(tabId, "idle");
+        }
+        updateIcons();
+        syncTabGroup();
+      }
+      if (message.state === "open") {
+        leaseStateBySessionId.clear();
+        for (const [tabId] of attachedTabs.entries()) {
+          setTabState(tabId, "idle");
+          markTabTitle(tabId, "idle");
+        }
+        updateIcons();
+        resyncAttachedTabs().then(async () => {
+          await sleep(500);
+          sendMessage({ method: "requestLeaseSnapshot" });
+          syncTabGroup();
+        });
+      }
+      return;
+    }
+
+    if (message.type === "spawriter-toggle") {
+      const tabId = message.tabId;
+      if (tabId) {
+        toggleTab(tabId)
+          .then(() => sendResponse({ success: true }))
+          .catch((err) =>
+            sendResponse({ success: false, error: err.message })
+          );
+      } else {
+        sendResponse({ success: false, error: "No tabId provided" });
+      }
+      return true;
+    }
+
+    if (message.type === "spawriter-status") {
+      sendResponse({
+        connectedCount: getConnectedCount(),
+        wsConnected: offscreenReady,
+        attachedTabIds: [...attachedTabs.keys()],
+      });
+      return true;
+    }
+
+    if (message.type === "ai-bridge-command") {
+      const command = message.payload || message;
+      handleRelayMessage(command)
+        .then(sendResponse)
+        .catch((err) =>
+          sendResponse({ success: false, error: err.message })
+        );
+      return true;
+    }
+
+    return undefined;
+  });
 
   if (typeof browser !== "undefined") {
     init();
