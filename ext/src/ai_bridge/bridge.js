@@ -75,7 +75,7 @@ import browser from "webextension-polyfill";
   }
 
   function getConnectedCount() {
-    return Array.from(tabStates.values()).filter((s) => s === "connected").length;
+    return leaseStateBySessionId.size;
   }
 
   function getIdleAttachedCount() {
@@ -1007,7 +1007,6 @@ import browser from "webextension-polyfill";
     updateIcons();
 
     setInterval(async () => {
-      if (attachedTabs.size === 0) return;
       try {
         const resp = await fetch("http://localhost:19989/json/list", { signal: AbortSignal.timeout(2000) });
         const targets = await resp.json();
