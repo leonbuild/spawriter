@@ -4,7 +4,7 @@ import AppStatusOverride from "./app-status-override.component";
 import Button from "./button";
 import ToggleSwitch from "./toggle-switch";
 import ClearCacheButton from "./clear-cache-button";
-import { evalDevtoolsCmd } from "../inspected-window.helper.js";
+import { evalDevtoolsCmd, evalCmd } from "../inspected-window.helper.js";
 import useImportMapOverrides from "./useImportMapOverrides";
 import ToggleGroup from "./toggle-group";
 import ToggleOption from "./toggle-option";
@@ -92,19 +92,15 @@ export default function Apps(props) {
   ]);
 
   // Export override URLs
-  const handleExportOverrides = () => {
+  const handleExportOverrides = async () => {
     try {
-      // Export all apps with their URLs (or empty string if no URL)
       const tempData = {};
       
-      // Include all apps from props.apps
       props.apps.forEach(app => {
         const savedConfig = importMaps.savedOverrides[app.name];
-        // Use saved URL if exists, otherwise empty string
         tempData[app.name] = savedConfig?.url || '';
       });
 
-      // Sort by appName alphabetically
       const sortedKeys = Object.keys(tempData).sort((a, b) => 
         a.toUpperCase().localeCompare(b.toUpperCase())
       );
@@ -114,20 +110,28 @@ export default function Apps(props) {
         exportData[key] = tempData[key];
       });
 
+      let siteHost = '';
+      try {
+        siteHost = await evalCmd('window.location.host');
+        if (Array.isArray(siteHost)) siteHost = siteHost[0] || '';
+        siteHost = String(siteHost).replace(/[^a-zA-Z0-9._-]/g, '_');
+      } catch (_) {}
+
       const dataStr = JSON.stringify(exportData, null, 2);
       const blob = new Blob([dataStr], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = 'exported single-spa overrides.json';
+      const filename = siteHost
+        ? `single-spa-overrides_${siteHost}.json`
+        : 'single-spa-overrides.json';
+      link.download = filename;
       link.click();
       URL.revokeObjectURL(url);
       
-      // Count apps with URLs
       const appsWithUrls = Object.values(exportData).filter(url => url.trim()).length;
       const totalApps = Object.keys(exportData).length;
       
-      // Show success message
       setImportExportMessage({ 
         type: 'success', 
         text: `Successfully exported ${totalApps} app(s) (${appsWithUrls} with URLs)` 
