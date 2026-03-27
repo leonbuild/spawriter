@@ -1006,10 +1006,24 @@ import browser from "webextension-polyfill";
     ensureDebuggerEventListener();
     updateIcons();
 
-    setInterval(() => {
-      if (offscreenReady && attachedTabs.size > 0) {
-        sendMessage({ method: "requestLeaseSnapshot" });
-      }
+    setInterval(async () => {
+      if (attachedTabs.size === 0) return;
+      try {
+        const resp = await fetch("http://localhost:19989/json/list", { signal: AbortSignal.timeout(2000) });
+        const targets = await resp.json();
+        leaseStateBySessionId.clear();
+        for (const target of targets) {
+          if (target.lease) {
+            leaseStateBySessionId.set(target.id, {
+              sessionId: target.id,
+              clientId: target.lease.clientId,
+              tabId: target.tabId,
+              acquiredAt: target.lease.acquiredAt,
+            });
+          }
+        }
+        syncLeaseDrivenStates();
+      } catch (_) {}
     }, 5000);
 
     ensureOffscreen()
