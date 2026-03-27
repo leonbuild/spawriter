@@ -93,8 +93,17 @@ import browser from "webextension-polyfill";
   }
 
   function syncLeaseDrivenStates() {
+    const leaseByTabId = new Map();
+    for (const lease of leaseStateBySessionId.values()) {
+      if (lease?.tabId !== undefined) {
+        leaseByTabId.set(lease.tabId, lease);
+      }
+    }
+
     for (const [tabId, tabInfo] of attachedTabs.entries()) {
-      const leased = !!tabInfo?.sessionId && leaseStateBySessionId.has(tabInfo.sessionId);
+      const leasedBySessionId = !!tabInfo?.sessionId && leaseStateBySessionId.has(tabInfo.sessionId);
+      const leasedByTabId = leaseByTabId.has(tabId);
+      const leased = leasedBySessionId || leasedByTabId;
       const nextState = leased ? "connected" : "idle";
       setTabState(tabId, nextState);
       markTabTitle(tabId, nextState);

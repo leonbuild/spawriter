@@ -266,12 +266,16 @@ function sendLeaseSnapshotToExtension(reason: string): void {
     method: 'Target.leaseSnapshot',
     params: {
       reason,
-      leases: Array.from(tabLeases.values()).map((lease) => ({
-        sessionId: lease.sessionId,
-        clientId: lease.clientId,
-        label: lease.label,
-        acquiredAt: lease.acquiredAt,
-      })),
+      leases: Array.from(tabLeases.values()).map((lease) => {
+        const target = attachedTargets.get(lease.sessionId);
+        return {
+          sessionId: lease.sessionId,
+          clientId: lease.clientId,
+          label: lease.label,
+          acquiredAt: lease.acquiredAt,
+          tabId: target?.tabId,
+        };
+      }),
     },
   });
 }
