@@ -700,6 +700,7 @@ async function doEnsureSession(agentId?: string): Promise<CdpSession> {
     log(`Reconnecting to previously leased tab: ${myLeased.url} (clientId: ${effectiveClientId})`);
     const s = await connectCdp(myLeased.id, agentId ? effectiveClientId : undefined);
     await enableDomains(s);
+    await setTabTitlePrefix(s, '🟢 ');
     return setSession(s, myLeased.id);
   }
 
@@ -728,6 +729,7 @@ async function doEnsureSession(agentId?: string): Promise<CdpSession> {
       if (leased) {
         log(`Acquired lease on tab: ${candidate.url} (clientId: ${effectiveClientId})`);
         await enableDomains(s);
+        await setTabTitlePrefix(s, '🟢 ');
         return setSession(s, candidate.id);
       }
       s.ws.close();
@@ -749,6 +751,7 @@ async function doEnsureSession(agentId?: string): Promise<CdpSession> {
         const s = await connectCdp(newTarget.id, agentId ? effectiveClientId : undefined);
         await acquireLease(s, newTarget.id);
         await enableDomains(s);
+        await setTabTitlePrefix(s, '🟢 ');
         return setSession(s, newTarget.id);
       }
     }
@@ -766,6 +769,7 @@ async function doEnsureSession(agentId?: string): Promise<CdpSession> {
         const s = await connectCdp(available.id, agentId ? effectiveClientId : undefined);
         await acquireLease(s, available.id);
         await enableDomains(s);
+        await setTabTitlePrefix(s, '🟢 ');
         return setSession(s, available.id);
       }
       if (targets.length > 0) break;
@@ -820,6 +824,23 @@ async function evaluateJs(session: CdpSession, expression: string, evalTimeout =
   return result.result?.value;
 }
 
+// ---------------------------------------------------------------------------
+// Structured error formatting
+// ---------------------------------------------------------------------------
+
+interface StructuredError {
+  error: string;
+  hint?: string;
+  recovery?: string;
+}
+
+function formatError(err: StructuredError): string {
+  const parts = [`Error: ${err.error}`];
+  if (err.hint) parts.push(`Hint: ${err.hint}`);
+  if (err.recovery) parts.push(`Recovery: call "${err.recovery}" tool`);
+  return parts.join('\n');
+}
+
 interface AXNode {
   nodeId: string;
   parentId?: string;
@@ -831,13 +852,21 @@ interface AXNode {
   ignored?: boolean;
 }
 
-function formatAXTreeAsText(nodes: AXNode[]): string {
+function formatAXTreeAsText(nodes: AXNode[], assignRefs: boolean = false, targetId?: string): string {
+  const refCache = (assignRefs && targetId) ? getRefCache(targetId) : new Map<number, RefInfo>();
+  if (assignRefs) refCache.clear();
+
+  const interactiveNodeIds = assignRefs ? new Set(
+    getInteractiveElements(nodes).map(e => e.backendDOMNodeId)
+  ) : new Set<number>();
+
   const nodeMap = new Map<string, AXNode>();
   for (const node of nodes) {
     nodeMap.set(node.nodeId, node);
   }
 
   const lines: string[] = [];
+  let refIdx = 1;
 
   function walk(nodeId: string, depth: number) {
     const node = nodeMap.get(nodeId);
@@ -863,8 +892,21 @@ function formatAXTreeAsText(nodes: AXNode[]): string {
     const indent = '  '.repeat(depth);
     const nameStr = name ? ` "${name}"` : '';
     const propsStr = props.length > 0 ? ` [${props.join(', ')}]` : '';
+
+    const isInteractive = assignRefs && node.backendDOMNodeId && interactiveNodeIds.has(node.backendDOMNodeId);
+    let refPrefix = '';
+    if (isInteractive && node.backendDOMNodeId) {
+      refPrefix = `@${refIdx} `;
+      refCache.set(refIdx, {
+        backendDOMNodeId: node.backendDOMNodeId,
+        role,
+        name,
+      });
+      refIdx++;
+    }
+
     if (role || name) {
-      lines.push(`${indent}${role}${nameStr}${propsStr}`);
+      lines.push(`${indent}${refPrefix}${role}${nameStr}${propsStr}`);
     }
 
     for (const childId of node.childIds ?? []) {
@@ -885,6 +927,35 @@ function formatAXTreeAsText(nodes: AXNode[]): string {
 // ---------------------------------------------------------------------------
 
 let lastSnapshot: string | null = null;
+
+// ---------------------------------------------------------------------------
+// Ref cache: maps @ref numbers to backendDOMNodeId (per-tab isolation)
+// ---------------------------------------------------------------------------
+
+interface RefInfo { backendDOMNodeId: number; role: string; name: string }
+
+const refCacheByTab: Map<string, Map<number, RefInfo>> = new Map();
+
+function getRefCache(targetId: string): Map<number, RefInfo> {
+  if (!refCacheByTab.has(targetId)) {
+    refCacheByTab.set(targetId, new Map());
+  }
+  return refCacheByTab.get(targetId)!;
+}
+
+// ---------------------------------------------------------------------------
+// Tab title prefix — update via CDP to reflect lease state
+// ---------------------------------------------------------------------------
+
+const TITLE_PREFIX_RE = /^(?:🟢 |🟡 |🔴 |🔵 )+/;
+
+async function setTabTitlePrefix(session: CdpSession, prefix: string | null) {
+  const reSrc = '^(?:🟢 |🟡 |🔴 |🔵 )+';
+  const code = prefix
+    ? `(() => { document.title = ${JSON.stringify(prefix)} + document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`
+    : `(() => { document.title = document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`;
+  await evaluateJs(session, code).catch(() => {});
+}
 
 // ---------------------------------------------------------------------------
 // Debugger state
@@ -954,9 +1025,13 @@ function handleLeaseEvent(method: string, params: Record<string, unknown>) {
   }
 }
 
+function stripRefPrefixes(text: string): string {
+  return text.replace(/^(\s*)@\d+ /gm, '$1');
+}
+
 function computeSnapshotDiff(oldSnap: string, newSnap: string): string {
-  const oldLines = oldSnap.split('\n');
-  const newLines = newSnap.split('\n');
+  const oldLines = stripRefPrefixes(oldSnap).split('\n');
+  const newLines = stripRefPrefixes(newSnap).split('\n');
   const oldSet = new Set(oldLines);
   const newSet = new Set(newLines);
 
@@ -1047,6 +1122,14 @@ function getInteractiveElements(nodes: AXNode[]): LabeledElement[] {
   return elements;
 }
 
+function formatInteractiveSnapshot(elements: LabeledElement[]): string {
+  if (elements.length === 0) return 'No interactive elements found.';
+  const lines = elements.map(e =>
+    `@${e.index} [${e.role}]${e.name ? ` "${e.name}"` : ''}`
+  );
+  return `Interactive elements (${elements.length}):\n${lines.join('\n')}\n\n(Note: @ref numbers are display-only in this mode. Use accessibility_snapshot without interactive_only for full tree with actionable refs.)`;
+}
+
 function buildLabelInjectionScript(labels: Array<{ index: number; x: number; y: number; width: number; height: number }>): string {
   return `(function() {
     var container = document.createElement('div');
@@ -1099,12 +1182,13 @@ const tools = [
   },
   {
     name: 'accessibility_snapshot',
-    description: 'Get accessibility snapshot of the page. Supports search to find specific elements and diff to see changes since last call.',
+    description: 'Get accessibility snapshot of the page. Supports search to find specific elements, diff to see changes, and interactive_only to list only interactive elements.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         search: { type: 'string', description: 'Search for elements matching this text (case-insensitive). Returns matching lines with context.' },
         diff: { type: 'boolean', description: 'Show diff against the previous snapshot (default: true when no search)' },
+        interactive_only: { type: 'boolean', description: 'If true, only show interactive elements (buttons, links, inputs, etc.) with @ref numbers. Takes priority over search and diff.' },
       },
     },
   },
@@ -1506,6 +1590,53 @@ Actions: get_html, get_text, get_metadata, search_dom.`,
       required: ['action'],
     },
   },
+  {
+    name: 'interact',
+    description: 'Interact with a page element by @ref number from accessibility_snapshot. Lightweight alternative to playwright_execute for single-step actions.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        ref: { type: 'number', description: '@ref number from the most recent accessibility_snapshot' },
+        action: {
+          type: 'string',
+          enum: ['click', 'hover', 'fill', 'focus', 'check', 'uncheck', 'select'],
+          description: 'Action to perform on the element',
+        },
+        value: { type: 'string', description: 'Value for fill/select actions' },
+      },
+      required: ['ref', 'action'],
+    },
+  },
+  {
+    name: 'browser_fetch',
+    description: "Make HTTP requests in the browser context with the user's cookies and session. Automatically includes credentials.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        url: { type: 'string', description: 'URL to fetch (absolute or relative to current page)' },
+        method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP method (default: GET)' },
+        headers: { type: 'string', description: 'JSON string of custom headers' },
+        body: { type: 'string', description: 'Request body (for POST/PUT/PATCH)' },
+        max_body_size: { type: 'number', description: 'Max response body size in chars (default: 10000, max: 100000)' },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'trace',
+    description: 'Record user interactions on the page. Start recording, stop to get events, or check status.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['start', 'stop', 'status'],
+          description: 'start: begin recording user interactions, stop: end recording and return events, status: check recording state',
+        },
+      },
+      required: ['action'],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -1551,6 +1682,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     clearNetworkLog();
     clearInterceptState();
     lastSnapshot = null;
+    refCacheByTab.clear();
     await pwExecutor.reset();
     debuggerEnabled = false;
     breakpoints.clear();
@@ -1606,7 +1738,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const switchSessionId = args.session_id as string | undefined;
     const effectiveClientId = getEffectiveClientId(switchSessionId);
     if (!targetId) {
-      return { content: [{ type: 'text', text: 'Error: targetId is required. Use list_tabs to see available targets.' }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: 'targetId is required', hint: 'Use list_tabs to see available targets', recovery: 'list_tabs' }) }], isError: true };
     }
 
     await ensureRelayServer();
@@ -1614,16 +1746,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const target = targets.find(t => t.id === targetId);
     if (!target) {
       const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
-      return { content: [{ type: 'text', text: `Error: target "${targetId}" not found.\n\nAvailable targets:\n${available}` }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: `Target "${targetId}" not found`, hint: `Available targets:\n${available}` }) }], isError: true };
     }
 
     if (target.lease && target.lease.clientId !== effectiveClientId) {
       const holder = target.lease.label || target.lease.clientId;
       return {
-        content: [{ type: 'text', text:
-          `Error: Tab is leased by "${holder}". You cannot switch to a tab owned by another agent.\n\n` +
-          `Use list_tabs to find an available tab, or use connect_tab to attach a new one.`
-        }],
+        content: [{ type: 'text', text: formatError({ error: `Tab leased by another agent`, hint: `Tab ${targetId} is owned by "${holder}". Use list_tabs to find available tabs.`, recovery: 'list_tabs' }) }],
         isError: true,
       };
     }
@@ -1664,7 +1793,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       } else {
         preferredTargetId = null;
       }
-      return { content: [{ type: 'text', text: `Error: failed to connect to tab "${targetId}". The tab may have been closed or the relay may be unreachable.\nDetail: ${String(e)}\n\nUse list_tabs to see available tabs, or call reset and retry.` }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: 'CDP connection failed', hint: `Failed to connect to tab "${targetId}". The tab may have been closed or the relay may be unreachable.\nDetail: ${String(e)}`, recovery: 'reset' }) }], isError: true };
     }
 
     if (switchSessionId) {
@@ -1680,11 +1809,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (!target.lease || target.lease.clientId !== effectiveClientId) {
       const leased = await acquireLease(newSession, targetId);
       if (!leased) {
-        return { content: [{ type: 'text', text: 'Error: Failed to acquire lease on this tab (another agent may have just claimed it). Use list_tabs to see available tabs.' }], isError: true };
+        return { content: [{ type: 'text', text: formatError({ error: 'Lease acquisition failed', hint: 'Another agent may have just claimed this tab', recovery: 'list_tabs' }) }], isError: true };
       }
     }
 
     await enableDomains(newSession);
+    await setTabTitlePrefix(newSession, '🟢 ');
 
     return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}\nSession: ${targetId}\n\nCleared: console logs, network entries, intercept rules, debugger state, snapshot baseline.\nPreserved: Playwright sessions, leases on other tabs.` }] };
   }
@@ -1698,7 +1828,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const effectiveClientId = getEffectiveClientId(connectSessionId);
 
     if (!url && tabId === undefined) {
-      return { content: [{ type: 'text', text: 'Error: Provide either url or tabId.' }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter', hint: 'Provide either url or tabId to identify the tab to connect' }) }], isError: true };
     }
 
     let result = await requestConnectTab({ url, tabId, create });
@@ -1714,7 +1844,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (!result.success) {
-      return { content: [{ type: 'text', text: `Failed to connect tab: ${(result as { error?: string }).error || 'Unknown error'}` }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: `Failed to connect tab: ${(result as { error?: string }).error || 'Unknown error'}`, hint: 'Chrome tab may not be available or extension may not be loaded', recovery: 'reset' }) }], isError: true };
     }
 
     await sleep(500);
@@ -1733,6 +1863,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await enableDomains(agent.cdpSession);
         }
         await acquireLease(agent.cdpSession, newTarget.id);
+        await setTabTitlePrefix(agent.cdpSession, '🟢 ');
         agent.preferredTargetId = newTarget.id;
         activeAgentId = connectSessionId;
         log(`Session "${connectSessionId}" acquired lease on tab: ${newTarget.url} (clientId: ${effectiveClientId})`);
@@ -1754,11 +1885,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const activeSession = resolveActiveSession(releaseSessionId);
     const targetId = (args.targetId as string | undefined) || activeSession?.sessionId;
     if (!targetId) {
-      return { content: [{ type: 'text', text: 'No active tab to release. Specify targetId or ensure a session is active.' }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: 'No tab connected', hint: 'No active tab to release. Specify targetId or ensure a session is active.', recovery: 'connect_tab' }) }], isError: true };
     }
 
     try {
       const session = await ensureSession(releaseSessionId);
+      await setTabTitlePrefix(session, '🔵 ');
       await releaseLease(session, targetId);
       if (releaseSessionId) {
         const agent = agentSessions.get(releaseSessionId);
@@ -1770,7 +1902,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       return { content: [{ type: 'text', text: `Released lease on tab ${targetId}. It is now available to other agents.` }] };
     } catch (e) {
-      return { content: [{ type: 'text', text: `Error releasing lease: ${e}` }], isError: true };
+      return { content: [{ type: 'text', text: formatError({ error: `Failed to release lease: ${e}`, hint: 'The CDP connection may have been lost', recovery: 'reset' }) }], isError: true };
     }
   }
 
@@ -1787,7 +1919,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     } catch (e) {
       error('Error in playwright_execute:', e);
       return {
-        content: [{ type: 'text', text: `Error: ${String(e)}` }],
+        content: [{ type: 'text', text: formatError({ error: `Playwright execution failed: ${String(e)}`, hint: 'Relay server may not be running or CDP connection lost', recovery: 'reset' }) }],
         isError: true,
       };
     }
@@ -1944,7 +2076,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'accessibility_snapshot': {
         await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
         const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
-        const fullText = formatAXTreeAsText(axResult.nodes ?? []);
+        const axNodes = axResult.nodes ?? [];
+
+        const interactiveOnly = args.interactive_only as boolean | undefined;
+        if (interactiveOnly) {
+          const interactive = getInteractiveElements(axNodes);
+          const text = formatInteractiveSnapshot(interactive);
+          lastSnapshot = text;
+          return { content: [{ type: 'text', text }] };
+        }
+
+        const fullText = formatAXTreeAsText(axNodes, true, session.sessionId);
 
         const searchQuery = args.search as string | undefined;
         const showDiff = args.diff as boolean | undefined;
@@ -2951,6 +3093,185 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
+      case 'interact': {
+        const ref = args.ref as number;
+        const action = args.action as string;
+        const value = args.value as string | undefined;
+
+        const refCache = getRefCache(session.sessionId);
+        const cached = refCache.get(ref);
+        if (!cached) {
+          return { content: [{ type: 'text', text: formatError({
+            error: `Ref @${ref} not found`,
+            hint: 'Run accessibility_snapshot first to get fresh @ref numbers',
+            recovery: 'accessibility_snapshot',
+          }) }], isError: true };
+        }
+
+        const resolved = await sendCdpCommand(session, 'DOM.resolveNode', {
+          backendNodeId: cached.backendDOMNodeId,
+        }, 10000) as { object?: { objectId?: string } };
+        const objectId = resolved.object?.objectId;
+        if (!objectId) {
+          return { content: [{ type: 'text', text: formatError({
+            error: `Could not resolve @${ref} to a live DOM node`,
+            hint: 'The element may have been removed. Rerun accessibility_snapshot for fresh refs.',
+            recovery: 'accessibility_snapshot',
+          }) }], isError: true };
+        }
+
+        const boxModel = await sendCdpCommand(session, 'DOM.getBoxModel', {
+          backendNodeId: cached.backendDOMNodeId,
+        }, 10000) as { model?: { border: number[] } };
+        const b = boxModel.model?.border;
+        const cx = b ? (Math.min(b[0], b[2], b[4], b[6]) + Math.max(b[0], b[2], b[4], b[6])) / 2 : 0;
+        const cy = b ? (Math.min(b[1], b[3], b[5], b[7]) + Math.max(b[1], b[3], b[5], b[7])) / 2 : 0;
+
+        switch (action) {
+          case 'click':
+            await sendCdpCommand(session, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
+            await sendCdpCommand(session, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
+            break;
+          case 'hover':
+            await sendCdpCommand(session, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy }, 10000);
+            break;
+          case 'fill':
+            await sendCdpCommand(session, 'Runtime.callFunctionOn', {
+              objectId,
+              functionDeclaration: `function(v) {
+                this.focus();
+                this.value = v;
+                this.dispatchEvent(new Event('input', { bubbles: true }));
+                this.dispatchEvent(new Event('change', { bubbles: true }));
+              }`,
+              arguments: [{ value: value ?? '' }],
+            }, 10000);
+            break;
+          case 'focus':
+            await sendCdpCommand(session, 'DOM.focus', { backendNodeId: cached.backendDOMNodeId }, 10000);
+            break;
+          case 'check':
+          case 'uncheck':
+            await sendCdpCommand(session, 'Runtime.callFunctionOn', {
+              objectId,
+              functionDeclaration: `function(checked) {
+                if (this.checked !== checked) {
+                  this.checked = checked;
+                  this.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+              }`,
+              arguments: [{ value: action === 'check' }],
+            }, 10000);
+            break;
+          case 'select':
+            if (!value) {
+              return { content: [{ type: 'text', text: formatError({
+                error: 'Missing value for select action',
+                hint: 'Provide a value parameter with the option value to select',
+              }) }], isError: true };
+            }
+            await sendCdpCommand(session, 'Runtime.callFunctionOn', {
+              objectId,
+              functionDeclaration: `function(v) {
+                this.value = v;
+                this.dispatchEvent(new Event('change', { bubbles: true }));
+              }`,
+              arguments: [{ value }],
+            }, 10000);
+            break;
+          default:
+            return { content: [{ type: 'text', text: formatError({
+              error: `Unknown action: ${action}`,
+              hint: 'Valid actions: click, hover, fill, focus, check, uncheck, select',
+            }) }], isError: true };
+        }
+
+        return { content: [{ type: 'text', text: `Performed ${action} on @${ref} [${cached.role}]${cached.name ? ` "${cached.name}"` : ''}\nTip: call screenshot to verify the result` }] };
+      }
+
+      case 'browser_fetch': {
+        const url = args.url as string;
+        const method = (args.method as string) || 'GET';
+        const headers = args.headers as string | undefined;
+        const body = args.body as string | undefined;
+        const rawMaxSize = args.max_body_size;
+        const maxSize = Math.max(1, Math.min(Number.isFinite(rawMaxSize as number) ? (rawMaxSize as number) : 10000, 100000));
+        const timeoutMs = 30000;
+
+        const fetchCode = `
+          (async () => {
+            try {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), ${timeoutMs});
+              const resp = await fetch(${JSON.stringify(url)}, {
+                method: ${JSON.stringify(method)},
+                ${headers ? `headers: JSON.parse(${JSON.stringify(headers)}),` : ''}
+                ${body ? `body: ${JSON.stringify(body)},` : ''}
+                credentials: 'include',
+                signal: controller.signal
+              });
+              clearTimeout(timer);
+              const text = await resp.text();
+              return JSON.stringify({
+                status: resp.status,
+                statusText: resp.statusText,
+                headers: Object.fromEntries(resp.headers.entries()),
+                body: text.slice(0, ${maxSize}),
+                truncated: text.length > ${maxSize}
+              });
+            } catch (e) {
+              return JSON.stringify({ error: e.name === 'AbortError' ? 'Request timed out after ${timeoutMs / 1000}s' : e.message });
+            }
+          })()
+        `;
+
+        const result = await evaluateJs(session, fetchCode);
+        return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }] };
+      }
+
+      case 'trace': {
+        const traceAction = args.action as string;
+        await ensureRelayServer();
+        const port = getRelayPort();
+        const traceResp = await fetch(`http://localhost:${port}/trace`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: traceAction }),
+          signal: AbortSignal.timeout(18000),
+        });
+        if (!traceResp.ok) {
+          const text = await traceResp.text().catch(() => '');
+          return { content: [{ type: 'text', text: formatError({
+            error: `Trace request failed (HTTP ${traceResp.status})`,
+            hint: text || 'Relay may need to be restarted to load trace support',
+            recovery: 'reset',
+          }) }], isError: true };
+        }
+        const traceResult = await traceResp.json() as { status?: string; recording?: boolean; eventCount?: number; events?: unknown[]; count?: number; error?: string };
+
+        if (traceResult.error) {
+          return { content: [{ type: 'text', text: formatError({ error: traceResult.error, hint: 'Extension may not be connected', recovery: 'reset' }) }], isError: true };
+        }
+
+        if (traceAction === 'stop') {
+          const events = traceResult.events ?? [];
+          const count = traceResult.count ?? events.length;
+          if (count === 0) {
+            return { content: [{ type: 'text', text: 'Recording stopped. No events captured.' }] };
+          }
+          const summary = JSON.stringify(events, null, 2);
+          const maxLen = 50000;
+          const text = summary.length > maxLen
+            ? summary.slice(0, maxLen) + `\n[Truncated — ${count} total events]`
+            : summary;
+          return { content: [{ type: 'text', text: `Recording stopped. ${count} events captured:\n${text}` }] };
+        }
+        if (traceAction === 'status') {
+          return { content: [{ type: 'text', text: `Trace status: recording=${traceResult.recording ?? false}, events=${traceResult.eventCount ?? 0}` }] };
+        }
+        return { content: [{ type: 'text', text: `Trace ${traceAction}: ${traceResult.status ?? 'ok'}` }] };
+      }
+
       default:
         return {
           content: [{ type: 'text', text: `Unknown tool: ${name}` }],
@@ -2960,7 +3281,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     error(`Error executing tool ${name}:`, e);
     cdpSession = null;
     return {
-      content: [{ type: 'text', text: `Error: ${String(e)}` }],
+      content: [{ type: 'text', text: formatError({ error: `${String(e)}`, hint: 'CDP connection may have been lost', recovery: 'reset' }) }],
       isError: true,
     };
   }
@@ -2972,7 +3293,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (e) {
     error(`Tool ${name} global timeout:`, e);
     return {
-      content: [{ type: 'text', text: `Error: ${String(e)}` }],
+      content: [{ type: 'text', text: formatError({ error: `Tool "${name}" timed out after ${MCP_REQUEST_TIMEOUT / 1000}s`, hint: 'The browser may be busy or unreachable', recovery: 'reset' }) }],
       isError: true,
     };
   }

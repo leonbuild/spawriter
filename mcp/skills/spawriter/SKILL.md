@@ -181,6 +181,73 @@ After calling `connect_tab` or `switch_tab` with a `session_id`, all subsequent 
 
 **Backward compatible:** single-agent setups and calls without `session_id` work unchanged.
 
+## interact tool — ref-based element interaction
+
+After calling `accessibility_snapshot`, interactive elements are labeled with `@ref` numbers. Use `interact` for single-step actions on those elements:
+
+```
+interact { ref: 1, action: "click" }
+interact { ref: 2, action: "fill", value: "hello" }
+interact { ref: 3, action: "hover" }
+interact { ref: 4, action: "focus" }
+interact { ref: 5, action: "check" }
+interact { ref: 6, action: "select", value: "option-value" }
+```
+
+**Rules:**
+1. Always run `accessibility_snapshot` first to get `@ref` numbers
+2. Page changes invalidate refs — rerun `accessibility_snapshot` if `interact` reports "Ref not found"
+3. Refs are per-tab (cached independently per session)
+4. After `interact`, call `screenshot` to verify the result
+5. For multi-step flows (form + submit + wait), prefer `playwright_execute`
+6. `interact` does NOT support: drag, iframe elements, Shadow DOM, keyboard combos
+
+**When to use interact vs playwright_execute:**
+| Scenario | Tool |
+|----------|------|
+| Click a button from snapshot | `interact` |
+| Fill one input from snapshot | `interact` |
+| Hover + verify tooltip appears | `playwright_execute` (needs waitForSelector) |
+| Fill 3 fields + submit form | `playwright_execute` (one call, less roundtrips) |
+| Operate inside iframe | `playwright_execute` (frameLocator) |
+| Drag-and-drop | `playwright_execute` |
+
+## browser_fetch tool — authenticated HTTP requests
+
+Make HTTP requests in the browser context with the user's cookies/session:
+
+```
+browser_fetch { url: "/api/user/me" }
+browser_fetch { url: "/api/data", method: "POST", body: "{\"key\":\"value\"}", headers: "{\"Content-Type\":\"application/json\"}" }
+browser_fetch { url: "/api/big-data", max_body_size: 50000 }
+```
+
+**Rules:**
+1. Automatically includes `credentials: 'include'` — carries cookies/session
+2. Default method is GET; response body truncated at 10000 chars (max 100000)
+3. Built-in 30s timeout with AbortController
+4. CORS still applies — cross-origin requests may be blocked by the browser
+5. Relative URLs resolve against the current page origin
+6. For complex fetch logic (retry, streaming, pagination), use `execute` instead
+
+## trace tool — record user interactions
+
+Record what the human user does in the browser (clicks, typing, scrolling):
+
+```
+trace { action: "start" }   → begin recording
+trace { action: "status" }  → check if recording
+trace { action: "stop" }    → stop and return all events
+```
+
+**Rules:**
+1. Records human user actions only — agent actions via `interact`/`playwright_execute` are NOT recorded
+2. Password inputs are automatically masked (`********`)
+3. Input events are debounced (500ms); scroll events debounced (300ms)
+4. Max 10000 events retained; oldest evicted when full
+5. Content script is dynamically injected only when trace starts (no performance impact otherwise)
+6. Use for: understanding user workflows, generating test scripts, reproducing issues
+
 ## Safety rules
 
 - Prefer normal web pages; avoid `chrome://`, `edge://`, and extension pages.

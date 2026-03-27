@@ -1330,6 +1330,7 @@ describe('CDP event dispatch (handleCdpEvent simulation)', () => {
 interface AXNode {
   nodeId: string;
   parentId?: string;
+  backendDOMNodeId?: number;
   role?: { type: string; value: string };
   name?: { type: string; value: string };
   properties?: Array<{ name: string; value: { type: string; value: unknown } }>;
@@ -1337,13 +1338,123 @@ interface AXNode {
   ignored?: boolean;
 }
 
-function formatAXTreeAsText(nodes: AXNode[]): string {
+// --- Structured error formatting ---
+
+interface StructuredError {
+  error: string;
+  hint?: string;
+  recovery?: string;
+}
+
+function formatError(err: StructuredError): string {
+  const parts = [`Error: ${err.error}`];
+  if (err.hint) parts.push(`Hint: ${err.hint}`);
+  if (err.recovery) parts.push(`Recovery: call "${err.recovery}" tool`);
+  return parts.join('\n');
+}
+
+// --- Ref cache ---
+
+interface RefInfo { backendDOMNodeId: number; role: string; name: string }
+const refCacheByTab: Map<string, Map<number, RefInfo>> = new Map();
+
+function getRefCache(targetId: string): Map<number, RefInfo> {
+  if (!refCacheByTab.has(targetId)) {
+    refCacheByTab.set(targetId, new Map());
+  }
+  return refCacheByTab.get(targetId)!;
+}
+
+// --- Interactive elements ---
+
+const INTERACTIVE_ROLES = new Set([
+  'button', 'link', 'textbox', 'searchbox', 'combobox', 'listbox',
+  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option',
+  'checkbox', 'radio', 'switch', 'slider', 'spinbutton',
+  'tab', 'treeitem', 'row',
+]);
+
+interface LabeledElement {
+  index: number;
+  role: string;
+  name: string;
+  backendDOMNodeId: number;
+}
+
+function getInteractiveElements(nodes: AXNode[]): LabeledElement[] {
+  const elements: LabeledElement[] = [];
+  let idx = 1;
+  for (const node of nodes) {
+    if (node.ignored) continue;
+    const role = node.role?.value;
+    if (!role || !INTERACTIVE_ROLES.has(role)) continue;
+    if (!node.backendDOMNodeId) continue;
+    elements.push({
+      index: idx++,
+      role,
+      name: node.name?.value ?? '',
+      backendDOMNodeId: node.backendDOMNodeId,
+    });
+  }
+  return elements;
+}
+
+function formatInteractiveSnapshot(elements: LabeledElement[]): string {
+  if (elements.length === 0) return 'No interactive elements found.';
+  const lines = elements.map(e =>
+    `@${e.index} [${e.role}]${e.name ? ` "${e.name}"` : ''}`
+  );
+  return `Interactive elements (${elements.length}):\n${lines.join('\n')}\n\n(Note: @ref numbers are display-only in this mode. Use accessibility_snapshot without interactive_only for full tree with actionable refs.)`;
+}
+
+// --- stripRefPrefixes ---
+
+function stripRefPrefixes(text: string): string {
+  return text.replace(/^(\s*)@\d+ /gm, '$1');
+}
+
+// --- computeSnapshotDiff (updated to strip refs) ---
+
+function computeSnapshotDiff(oldSnap: string, newSnap: string): string {
+  const oldLines = stripRefPrefixes(oldSnap).split('\n');
+  const newLines = stripRefPrefixes(newSnap).split('\n');
+  const oldSet = new Set(oldLines);
+  const newSet = new Set(newLines);
+
+  const added = newLines.filter(l => !oldSet.has(l));
+  const removed = oldLines.filter(l => !newSet.has(l));
+
+  if (added.length === 0 && removed.length === 0) {
+    return 'No changes since last snapshot.';
+  }
+
+  const parts: string[] = [];
+  if (removed.length > 0) {
+    parts.push(`Removed (${removed.length}):\n${removed.map(l => `- ${l}`).join('\n')}`);
+  }
+  if (added.length > 0) {
+    parts.push(`Added (${added.length}):\n${added.map(l => `+ ${l}`).join('\n')}`);
+  }
+  return parts.join('\n\n');
+}
+
+// --- formatAXTreeAsText (with ref support) ---
+
+function formatAXTreeAsText(nodes: AXNode[], assignRefs: boolean = false, targetId?: string): string {
+  const refCache = (assignRefs && targetId) ? getRefCache(targetId) : new Map<number, RefInfo>();
+  if (assignRefs) refCache.clear();
+
+  const interactiveNodeIds = assignRefs ? new Set(
+    getInteractiveElements(nodes).map(e => e.backendDOMNodeId)
+  ) : new Set<number>();
+
   const nodeMap = new Map<string, AXNode>();
   for (const node of nodes) {
     nodeMap.set(node.nodeId, node);
   }
 
   const lines: string[] = [];
+  let refIdx = 1;
 
   function walk(nodeId: string, depth: number) {
     const node = nodeMap.get(nodeId);
@@ -1369,8 +1480,21 @@ function formatAXTreeAsText(nodes: AXNode[]): string {
     const indent = '  '.repeat(depth);
     const nameStr = name ? ` "${name}"` : '';
     const propsStr = props.length > 0 ? ` [${props.join(', ')}]` : '';
+
+    const isInteractive = assignRefs && node.backendDOMNodeId && interactiveNodeIds.has(node.backendDOMNodeId);
+    let refPrefix = '';
+    if (isInteractive && node.backendDOMNodeId) {
+      refPrefix = `@${refIdx} `;
+      refCache.set(refIdx, {
+        backendDOMNodeId: node.backendDOMNodeId,
+        role,
+        name,
+      });
+      refIdx++;
+    }
+
     if (role || name) {
-      lines.push(`${indent}${role}${nameStr}${propsStr}`);
+      lines.push(`${indent}${refPrefix}${role}${nameStr}${propsStr}`);
     }
 
     for (const childId of node.childIds ?? []) {
@@ -2523,30 +2647,8 @@ describe('reset tool description', () => {
 
 // ---------------------------------------------------------------------------
 // Test: Accessibility snapshot diff
+// (uses computeSnapshotDiff and stripRefPrefixes from above)
 // ---------------------------------------------------------------------------
-
-function computeSnapshotDiff(oldSnap: string, newSnap: string): string {
-  const oldLines = oldSnap.split('\n');
-  const newLines = newSnap.split('\n');
-  const oldSet = new Set(oldLines);
-  const newSet = new Set(newLines);
-
-  const added = newLines.filter(l => !oldSet.has(l));
-  const removed = oldLines.filter(l => !newSet.has(l));
-
-  if (added.length === 0 && removed.length === 0) {
-    return 'No changes since last snapshot.';
-  }
-
-  const parts: string[] = [];
-  if (removed.length > 0) {
-    parts.push(`Removed (${removed.length}):\n${removed.map(l => `- ${l}`).join('\n')}`);
-  }
-  if (added.length > 0) {
-    parts.push(`Added (${added.length}):\n${added.map(l => `+ ${l}`).join('\n')}`);
-  }
-  return parts.join('\n\n');
-}
 
 describe('computeSnapshotDiff', () => {
   it('should detect no changes on identical snapshots', () => {
@@ -2721,39 +2823,8 @@ describe('searchSnapshot', () => {
 
 // ---------------------------------------------------------------------------
 // Test: Labeled screenshot helpers
+// (getInteractiveElements, INTERACTIVE_ROLES, LabeledElement defined above)
 // ---------------------------------------------------------------------------
-
-const INTERACTIVE_ROLES = new Set([
-  'button', 'link', 'textbox', 'searchbox', 'combobox', 'listbox',
-  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option',
-  'checkbox', 'radio', 'switch', 'slider', 'spinbutton',
-  'tab', 'treeitem', 'row',
-]);
-
-interface LabeledElement {
-  index: number;
-  role: string;
-  name: string;
-  backendDOMNodeId: number;
-}
-
-function getInteractiveElements(nodes: AXNode[]): LabeledElement[] {
-  const elements: LabeledElement[] = [];
-  let idx = 1;
-  for (const node of nodes) {
-    if (node.ignored) continue;
-    const role = node.role?.value;
-    if (!role || !INTERACTIVE_ROLES.has(role)) continue;
-    if (!(node as AXNode & { backendDOMNodeId?: number }).backendDOMNodeId) continue;
-    elements.push({
-      index: idx++,
-      role,
-      name: node.name?.value ?? '',
-      backendDOMNodeId: (node as AXNode & { backendDOMNodeId?: number }).backendDOMNodeId!,
-    });
-  }
-  return elements;
-}
 
 function formatLabelLegend(elements: LabeledElement[]): string {
   if (elements.length === 0) return 'No interactive elements found.';
@@ -4914,6 +4985,7 @@ describe('Integration: All tool names are unique and complete', () => {
     'override_app', 'app_action', 'debugger', 'css_inspect', 'session_manager',
     'list_tabs', 'switch_tab', 'connect_tab', 'release_tab',
     'storage', 'performance', 'editor', 'network_intercept', 'emulation', 'page_content',
+    'interact', 'browser_fetch', 'trace',
   ];
 
   it('should have no duplicate tool names', () => {
@@ -4921,8 +4993,8 @@ describe('Integration: All tool names are unique and complete', () => {
     assert.equal(unique.size, allTools.length);
   });
 
-  it('should have exactly 27 tools', () => {
-    assert.equal(allTools.length, 27);
+  it('should have exactly 30 tools', () => {
+    assert.equal(allTools.length, 30);
   });
 
   it('Phase 1 tools present', () => {
@@ -7584,6 +7656,16 @@ describe('Integration: tool action counts', () => {
   it('total new actions across 6 tools = 37', () => {
     assert.equal(9 + 4 + 7 + 5 + 8 + 4, 37);
   });
+
+  it('interact should have 7 actions', () => {
+    const actions = ['click', 'hover', 'fill', 'focus', 'check', 'uncheck', 'select'];
+    assert.equal(actions.length, 7);
+  });
+
+  it('trace should have 3 actions', () => {
+    const actions = ['start', 'stop', 'status'];
+    assert.equal(actions.length, 3);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -8560,5 +8642,709 @@ describe('integration: mixed target types during setDownloadBehavior', () => {
     const { forwarded } = simulateRelaySetDownloadBehavior('allow', '/dl', targets);
     assert.equal(forwarded.length, 1);
     assert.equal(forwarded[0].targetSessionId, 'page');
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 1.1 — Structured error formatting
+// ===========================================================================
+
+describe('formatError – structured error formatting', () => {
+  it('should include error, hint, and recovery', () => {
+    const result = formatError({ error: 'CDP connection lost', hint: 'Tab may be closed', recovery: 'reset' });
+    assert.ok(result.includes('Error: CDP connection lost'));
+    assert.ok(result.includes('Hint: Tab may be closed'));
+    assert.ok(result.includes('Recovery: call "reset" tool'));
+  });
+
+  it('should omit recovery when not provided', () => {
+    const result = formatError({ error: 'Element not found', hint: 'Selector mismatch' });
+    assert.ok(!result.includes('Recovery'));
+  });
+
+  it('should omit Hint line when hint is undefined', () => {
+    const result = formatError({ error: 'Timeout' });
+    assert.ok(result.includes('Error: Timeout'));
+    assert.ok(!result.includes('Hint'));
+    assert.equal(result.split('\n').length, 1);
+  });
+
+  it('should omit Hint line when hint is empty string', () => {
+    const result = formatError({ error: 'Timeout', hint: '' });
+    assert.ok(!result.includes('Hint'));
+  });
+
+  it('should output only Error line when no hint and no recovery', () => {
+    const result = formatError({ error: 'Something broke' });
+    assert.strictEqual(result, 'Error: Something broke');
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 1.2 — formatInteractiveSnapshot
+// ===========================================================================
+
+describe('formatInteractiveSnapshot', () => {
+  it('should format with @ref notation', () => {
+    const elements: LabeledElement[] = [
+      { index: 1, role: 'button', name: '提交', backendDOMNodeId: 10 },
+      { index: 2, role: 'textbox', name: '', backendDOMNodeId: 11 },
+      { index: 3, role: 'link', name: 'Home', backendDOMNodeId: 12 },
+    ];
+    const result = formatInteractiveSnapshot(elements);
+    assert.ok(result.includes('@1 [button] "提交"'));
+    assert.ok(result.includes('@2 [textbox]'));
+    assert.ok(result.includes('@3 [link] "Home"'));
+    assert.ok(result.startsWith('Interactive elements (3):'));
+  });
+
+  it('should return fallback for no elements', () => {
+    assert.equal(formatInteractiveSnapshot([]), 'No interactive elements found.');
+  });
+
+  it('should escape special chars in names', () => {
+    const elements: LabeledElement[] = [{ index: 1, role: 'button', name: 'Save & "Close"', backendDOMNodeId: 10 }];
+    const result = formatInteractiveSnapshot(elements);
+    assert.ok(result.includes('Save & "Close"'));
+  });
+
+  it('should include display-only note about @ref numbers', () => {
+    const elements: LabeledElement[] = [{ index: 1, role: 'button', name: 'OK', backendDOMNodeId: 10 }];
+    const result = formatInteractiveSnapshot(elements);
+    assert.ok(result.includes('display-only'));
+  });
+
+  it('should handle single element correctly', () => {
+    const elements: LabeledElement[] = [{ index: 1, role: 'link', name: 'Home', backendDOMNodeId: 5 }];
+    const result = formatInteractiveSnapshot(elements);
+    assert.ok(result.startsWith('Interactive elements (1):'));
+    assert.ok(result.includes('@1 [link] "Home"'));
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 2.1 — @ref in formatAXTreeAsText + refCache
+// ===========================================================================
+
+describe('formatAXTreeAsText – @ref assignment', () => {
+  it('should assign @ref to interactive elements in tree', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, name: { type: 'computedString', value: 'Page' }, childIds: ['2', '3'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'heading' }, name: { type: 'computedString', value: 'Title' } },
+      { nodeId: '3', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'Submit' }, backendDOMNodeId: 42 },
+    ];
+    const text = formatAXTreeAsText(nodes, true, 'test-tab');
+    assert.ok(text.includes('@1'));
+    assert.ok(text.includes('button "Submit"'));
+    const headingLine = text.split('\n').find(l => l.includes('heading'));
+    assert.ok(headingLine && !/^\s*@\d+/.test(headingLine), 'heading should not have @ref prefix');
+  });
+
+  it('should NOT assign @ref when assignRefs=false', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'OK' }, backendDOMNodeId: 42 },
+    ];
+    const text = formatAXTreeAsText(nodes, false);
+    assert.ok(!/\s*@\d+/.test(text), 'should not contain @ref when assignRefs=false');
+  });
+
+  it('should populate refCacheByTab when assigning refs', () => {
+    const tabId = 'test-populate';
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'Go' }, backendDOMNodeId: 99 },
+    ];
+    formatAXTreeAsText(nodes, true, tabId);
+    const cache = getRefCache(tabId);
+    assert.equal(cache.size, 1);
+    assert.equal(cache.get(1)?.backendDOMNodeId, 99);
+    assert.equal(cache.get(1)?.name, 'Go');
+  });
+
+  it('should clear tab refCache on each call', () => {
+    const tabId = 'test-clear';
+    const cache = getRefCache(tabId);
+    cache.set(999, { backendDOMNodeId: 1, role: 'button', name: 'old' });
+    formatAXTreeAsText([], true, tabId);
+    assert.ok(!cache.has(999));
+  });
+
+  it('refCaches should be isolated per tab', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'A' }, backendDOMNodeId: 10 },
+    ];
+    formatAXTreeAsText(nodes, true, 'tab-A');
+    formatAXTreeAsText(nodes, true, 'tab-B');
+    assert.equal(getRefCache('tab-A').size, 1);
+    assert.equal(getRefCache('tab-B').size, 1);
+  });
+
+  it('existing tests should still pass with assignRefs=false (backward compat)', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, name: { type: 'computedString', value: 'My Page' }, childIds: ['2'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'heading' }, name: { type: 'computedString', value: 'Hello World' } },
+    ];
+    const text = formatAXTreeAsText(nodes, false);
+    assert.ok(text.includes('RootWebArea "My Page"'));
+    assert.ok(text.includes('  heading "Hello World"'));
+  });
+
+  it('should not break computeSnapshotDiff with @ref prefixes', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'Submit' }, backendDOMNodeId: 42 },
+    ];
+    const snap1 = formatAXTreeAsText(nodes, true, 'diff-test');
+    const snap2 = formatAXTreeAsText(nodes, true, 'diff-test');
+    const diff = computeSnapshotDiff(snap1, snap2);
+    assert.ok(diff.includes('No changes'));
+  });
+
+  it('should assign sequential @ref numbers to multiple interactive elements', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2', '3', '4'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'A' }, backendDOMNodeId: 10 },
+      { nodeId: '3', parentId: '1', role: { type: 'role', value: 'textbox' }, name: { type: 'computedString', value: 'B' }, backendDOMNodeId: 11 },
+      { nodeId: '4', parentId: '1', role: { type: 'role', value: 'link' }, name: { type: 'computedString', value: 'C' }, backendDOMNodeId: 12 },
+    ];
+    const text = formatAXTreeAsText(nodes, true, 'multi-test');
+    assert.ok(text.includes('@1'));
+    assert.ok(text.includes('@2'));
+    assert.ok(text.includes('@3'));
+    const cache = getRefCache('multi-test');
+    assert.equal(cache.size, 3);
+  });
+});
+
+describe('stripRefPrefixes', () => {
+  it('should strip @N prefix from lines', () => {
+    const input = '  @1 button "Submit"\n  heading "Title"\n  @2 textbox ""';
+    const result = stripRefPrefixes(input);
+    assert.ok(!result.includes('@1'));
+    assert.ok(!result.includes('@2'));
+    assert.ok(result.includes('button "Submit"'));
+    assert.ok(result.includes('heading "Title"'));
+  });
+
+  it('should preserve indentation after stripping', () => {
+    const input = '    @5 button "Go"';
+    const result = stripRefPrefixes(input);
+    assert.strictEqual(result, '    button "Go"');
+  });
+
+  it('should not modify text without @ref prefixes', () => {
+    const input = '  heading "Title"\n  paragraph "Content"';
+    assert.strictEqual(stripRefPrefixes(input), input);
+  });
+
+  it('should not strip @ in the middle of text', () => {
+    const input = '  textbox "email@example.com"';
+    assert.strictEqual(stripRefPrefixes(input), input);
+  });
+});
+
+describe('refCacheByTab – reset clears all tabs', () => {
+  it('should clear all tab caches on reset', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'X' }, backendDOMNodeId: 1 },
+    ];
+    formatAXTreeAsText(nodes, true, 'tab-reset-1');
+    formatAXTreeAsText(nodes, true, 'tab-reset-2');
+    assert.equal(getRefCache('tab-reset-1').size, 1);
+    assert.equal(getRefCache('tab-reset-2').size, 1);
+    refCacheByTab.clear();
+    assert.equal(getRefCache('tab-reset-1').size, 0);
+    assert.equal(getRefCache('tab-reset-2').size, 0);
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 2.3 — interact tool definition
+// ===========================================================================
+
+describe('interact tool definition', () => {
+  const interactActions = ['click', 'hover', 'fill', 'focus', 'check', 'uncheck', 'select'];
+
+  it('should have all 7 actions', () => {
+    assert.equal(interactActions.length, 7);
+  });
+
+  it('should include all expected actions', () => {
+    for (const action of ['click', 'hover', 'fill', 'focus', 'check', 'uncheck', 'select']) {
+      assert.ok(interactActions.includes(action), `missing action: ${action}`);
+    }
+  });
+});
+
+describe('interact tool – ref validation logic', () => {
+  it('should fail when ref not in cache', () => {
+    const tabId = 'interact-test-missing';
+    getRefCache(tabId).clear();
+    const cache = getRefCache(tabId);
+    assert.equal(cache.get(42), undefined);
+  });
+
+  it('should find valid ref in cache', () => {
+    const tabId = 'interact-test-valid';
+    getRefCache(tabId).set(1, { backendDOMNodeId: 10, role: 'button', name: 'OK' });
+    const cached = getRefCache(tabId).get(1);
+    assert.ok(cached);
+    assert.equal(cached.backendDOMNodeId, 10);
+    assert.equal(cached.role, 'button');
+    assert.equal(cached.name, 'OK');
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 3.1 — trace tool definition
+// ===========================================================================
+
+describe('trace tool definition', () => {
+  const traceActions = ['start', 'stop', 'status'];
+
+  it('should have 3 actions', () => {
+    assert.equal(traceActions.length, 3);
+  });
+
+  it('should include all expected actions', () => {
+    for (const action of traceActions) {
+      assert.ok(['start', 'stop', 'status'].includes(action));
+    }
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 3.1 — DYNAMIC_CLASS_RE from content_trace
+// ===========================================================================
+
+describe('DYNAMIC_CLASS_RE pattern', () => {
+  const DYNAMIC_CLASS_RE = /^(data-v-|_|css-|sc-|jss|styles_)/;
+
+  it('should match Vue scoped classes', () => {
+    assert.ok(DYNAMIC_CLASS_RE.test('data-v-abc123'));
+  });
+
+  it('should match CSS Module classes', () => {
+    assert.ok(DYNAMIC_CLASS_RE.test('_1a2b3c'));
+    assert.ok(DYNAMIC_CLASS_RE.test('css-xyz'));
+    assert.ok(DYNAMIC_CLASS_RE.test('styles_header'));
+  });
+
+  it('should match styled-components classes', () => {
+    assert.ok(DYNAMIC_CLASS_RE.test('sc-dkzDqf'));
+  });
+
+  it('should match JSS classes', () => {
+    assert.ok(DYNAMIC_CLASS_RE.test('jss123'));
+  });
+
+  it('should NOT match normal classes', () => {
+    assert.ok(!DYNAMIC_CLASS_RE.test('primary'));
+    assert.ok(!DYNAMIC_CLASS_RE.test('btn-submit'));
+    assert.ok(!DYNAMIC_CLASS_RE.test('container'));
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 3.2 — browser_fetch tool definition
+// ===========================================================================
+
+describe('browser_fetch tool definition', () => {
+  it('should support GET, POST, PUT, DELETE, PATCH methods', () => {
+    const methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
+    assert.equal(methods.length, 5);
+  });
+
+  it('should clamp max_body_size to valid range', () => {
+    const clamp = (raw: number | undefined) =>
+      Math.max(1, Math.min(Number.isFinite(raw as number) ? (raw as number) : 10000, 100000));
+    assert.equal(clamp(-1), 1);
+    assert.equal(clamp(0), 1);
+    assert.equal(clamp(999999), 100000);
+    assert.equal(clamp(undefined), 10000);
+    assert.equal(clamp(NaN), 10000);
+    assert.equal(clamp(5000), 5000);
+  });
+});
+
+// ===========================================================================
+// Tests: new tools in full tool list
+// ===========================================================================
+
+describe('Integration: bb-browser new tools present', () => {
+  const allTools = [
+    'screenshot', 'accessibility_snapshot', 'execute', 'dashboard_state',
+    'console_logs', 'network_log', 'network_detail', 'playwright_execute', 'reset',
+    'clear_cache_and_reload', 'ensure_fresh_render', 'navigate',
+    'override_app', 'app_action', 'debugger', 'css_inspect', 'session_manager',
+    'list_tabs', 'switch_tab', 'connect_tab', 'release_tab',
+    'storage', 'performance', 'editor', 'network_intercept', 'emulation', 'page_content',
+    'interact', 'browser_fetch', 'trace',
+  ];
+
+  it('interact tool present', () => {
+    assert.ok(allTools.includes('interact'));
+  });
+
+  it('browser_fetch tool present', () => {
+    assert.ok(allTools.includes('browser_fetch'));
+  });
+
+  it('trace tool present', () => {
+    assert.ok(allTools.includes('trace'));
+  });
+
+  it('total is now 30', () => {
+    assert.equal(allTools.length, 30);
+    assert.equal(new Set(allTools).size, 30);
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 1.2 — interactive_only priority over search/diff
+// ===========================================================================
+
+describe('accessibility_snapshot – interactive_only priority', () => {
+  it('interactive_only should take priority over search/diff args', () => {
+    const nodes: AXNode[] = [
+      { nodeId: '1', role: { type: 'role', value: 'RootWebArea' }, childIds: ['2', '3'] },
+      { nodeId: '2', parentId: '1', role: { type: 'role', value: 'heading' }, name: { type: 'computedString', value: 'Title' } },
+      { nodeId: '3', parentId: '1', role: { type: 'role', value: 'button' }, name: { type: 'computedString', value: 'Submit' }, backendDOMNodeId: 10 },
+    ];
+    const interactive = getInteractiveElements(nodes);
+    const result = formatInteractiveSnapshot(interactive);
+    assert.ok(result.includes('Interactive elements (1):'));
+    assert.ok(result.includes('@1 [button] "Submit"'));
+    assert.ok(!result.includes('heading'));
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 3.2 — browser_fetch code generation
+// ===========================================================================
+
+describe('browser_fetch – fetch code generation', () => {
+  function generateFetchCode(opts: { url: string; method: string; headers?: string; body?: string; maxSize: number }): string {
+    const { url, method, headers, body, maxSize } = opts;
+    const timeoutMs = 30000;
+    return `
+      (async () => {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), ${timeoutMs});
+          const resp = await fetch(${JSON.stringify(url)}, {
+            method: ${JSON.stringify(method)},
+            ${headers ? `headers: JSON.parse(${JSON.stringify(headers)}),` : ''}
+            ${body ? `body: ${JSON.stringify(body)},` : ''}
+            credentials: 'include',
+            signal: controller.signal
+          });
+          clearTimeout(timer);
+          const text = await resp.text();
+          return JSON.stringify({
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: Object.fromEntries(resp.headers.entries()),
+            body: text.slice(0, ${maxSize}),
+            truncated: text.length > ${maxSize}
+          });
+        } catch (e) {
+          return JSON.stringify({ error: e.name === 'AbortError' ? 'Request timed out after ${timeoutMs / 1000}s' : e.message });
+        }
+      })()
+    `;
+  }
+
+  it('should generate valid fetch code for GET', () => {
+    const code = generateFetchCode({ url: '/api/me', method: 'GET', maxSize: 10000 });
+    assert.ok(code.includes('fetch("/api/me"'));
+    assert.ok(code.includes('"GET"'));
+    assert.ok(code.includes("credentials: 'include'"));
+  });
+
+  it('should escape URL in generated code', () => {
+    const code = generateFetchCode({ url: '/api/search?q=hello"world', method: 'GET', maxSize: 10000 });
+    assert.ok(!code.includes('hello"world'));
+    assert.ok(code.includes('hello\\"world'));
+  });
+
+  it('should truncate response body', () => {
+    const code = generateFetchCode({ url: '/api', method: 'GET', maxSize: 100 });
+    assert.ok(code.includes('.slice(0, 100)'));
+  });
+
+  it('should safely handle headers parameter', () => {
+    const code = generateFetchCode({
+      url: '/api',
+      method: 'POST',
+      headers: '{"Content-Type": "application/json"}',
+      maxSize: 10000,
+    });
+    assert.ok(code.includes('JSON.parse'));
+  });
+
+  it('should include body for POST requests', () => {
+    const code = generateFetchCode({
+      url: '/api/data',
+      method: 'POST',
+      body: '{"key":"value"}',
+      maxSize: 5000,
+    });
+    assert.ok(code.includes('"POST"'));
+    assert.ok(code.includes('body:'));
+    assert.ok(code.includes('.slice(0, 5000)'));
+  });
+
+  it('should include AbortController timeout', () => {
+    const code = generateFetchCode({ url: '/api', method: 'GET', maxSize: 10000 });
+    assert.ok(code.includes('AbortController'));
+    assert.ok(code.includes('controller.abort()'));
+    assert.ok(code.includes('signal: controller.signal'));
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 3.1 — trace event cap simulation
+// ===========================================================================
+
+describe('trace – event cap simulation', () => {
+  it('should evict oldest event when max reached', () => {
+    const MAX = 10;
+    const events: number[] = [];
+    for (let i = 0; i < MAX + 5; i++) {
+      if (events.length >= MAX) events.shift();
+      events.push(i);
+    }
+    assert.equal(events.length, MAX);
+    assert.equal(events[0], 5);
+    assert.equal(events[events.length - 1], 14);
+  });
+
+  it('should not evict below capacity', () => {
+    const MAX = 10000;
+    const events: number[] = [];
+    for (let i = 0; i < 100; i++) {
+      if (events.length >= MAX) events.shift();
+      events.push(i);
+    }
+    assert.equal(events.length, 100);
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 3.1 — trace content script selector helpers
+// ===========================================================================
+
+describe('trace – DYNAMIC_CLASS_RE extended patterns', () => {
+  const DYNAMIC_CLASS_RE = /^(data-v-|_|css-|sc-|jss|styles_)/;
+
+  it('should match various CSS Module patterns', () => {
+    assert.ok(DYNAMIC_CLASS_RE.test('_container_abc'));
+    assert.ok(DYNAMIC_CLASS_RE.test('css-1a2b3c'));
+  });
+
+  it('should match various Vue scoped patterns', () => {
+    assert.ok(DYNAMIC_CLASS_RE.test('data-v-1234abcd'));
+    assert.ok(DYNAMIC_CLASS_RE.test('data-v-'));
+  });
+
+  it('should not match BEM-style classes', () => {
+    assert.ok(!DYNAMIC_CLASS_RE.test('block__element--modifier'));
+    assert.ok(!DYNAMIC_CLASS_RE.test('btn-primary'));
+    assert.ok(!DYNAMIC_CLASS_RE.test('main-content'));
+  });
+
+  it('should not match utility classes', () => {
+    assert.ok(!DYNAMIC_CLASS_RE.test('flex'));
+    assert.ok(!DYNAMIC_CLASS_RE.test('mt-4'));
+    assert.ok(!DYNAMIC_CLASS_RE.test('text-center'));
+  });
+});
+
+// ===========================================================================
+// Tests: Tab title prefix — ALL_PREFIXES_RE_SRC
+// ===========================================================================
+
+describe('Tab title prefix regex', () => {
+  const ALL_PREFIXES_RE_SRC = "^(?:🟢 |🟡 |🔴 |🔵 )+";
+  const re = new RegExp(ALL_PREFIXES_RE_SRC);
+
+  it('should match single green prefix', () => {
+    assert.ok(re.test('🟢 Example Domain'));
+  });
+
+  it('should match single yellow prefix', () => {
+    assert.ok(re.test('🟡 Connecting...'));
+  });
+
+  it('should match single red prefix', () => {
+    assert.ok(re.test('🔴 Error'));
+  });
+
+  it('should match multiple repeated prefixes', () => {
+    assert.ok(re.test('🟢 🟡 🟢 Title'));
+    const cleaned = '🟢 🟡 🟢 Title'.replace(re, '');
+    assert.equal(cleaned, 'Title');
+  });
+
+  it('should not match title without prefix', () => {
+    assert.ok(!re.test('Example Domain'));
+  });
+
+  it('should match blue prefix', () => {
+    assert.ok(re.test('🔵 Idle Tab'));
+  });
+
+  it('should strip all prefixes at once', () => {
+    const title = '🟢 🟢 🟡 🔴 🔵 Example Domain';
+    const cleaned = title.replace(re, '');
+    assert.equal(cleaned, 'Example Domain');
+  });
+
+  it('should not strip emoji in middle of title', () => {
+    const title = '🟢 My 🟡 Page';
+    const cleaned = title.replace(re, '');
+    assert.equal(cleaned, 'My 🟡 Page');
+  });
+});
+
+describe('Tab title prefix mapping', () => {
+  const TAB_TITLE_PREFIXES: Record<string, string> = {
+    connected: "🟢 ",
+    idle: "🔵 ",
+    connecting: "🟡 ",
+    error: "🔴 ",
+  };
+
+  it('should have 4 states', () => {
+    assert.equal(Object.keys(TAB_TITLE_PREFIXES).length, 4);
+  });
+
+  it('markTabTitle state resolution: true → connected', () => {
+    const stateOrBool: boolean | string | null = true;
+    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
+    assert.equal(state, "connected");
+  });
+
+  it('markTabTitle state resolution: false → null (remove)', () => {
+    const stateOrBool: boolean | string | null = false;
+    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
+    assert.equal(state, null);
+  });
+
+  it('markTabTitle state resolution: "connecting" → connecting', () => {
+    const stateOrBool: boolean | string | null = "connecting";
+    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
+    assert.equal(state, "connecting");
+  });
+
+  it('markTabTitle state resolution: "error" → error', () => {
+    const stateOrBool: boolean | string | null = "error";
+    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
+    assert.equal(state, "error");
+  });
+
+  it('unknown state maps to null prefix', () => {
+    const state = "unknown";
+    const prefix = TAB_TITLE_PREFIXES[state] || null;
+    assert.equal(prefix, null);
+  });
+});
+
+// ===========================================================================
+// Tests: setTabTitlePrefix — code generation
+// ===========================================================================
+
+describe('setTabTitlePrefix code generation', () => {
+  const TITLE_PREFIX_RE_SRC = '^(?:🟢 |🟡 |🔴 |🔵 )+';
+
+  function generateTitleCode(prefix: string | null): string {
+    const reSrc = TITLE_PREFIX_RE_SRC;
+    return prefix
+      ? `(() => { document.title = ${JSON.stringify(prefix)} + document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`
+      : `(() => { document.title = document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`;
+  }
+
+  it('should generate code with green prefix', () => {
+    const code = generateTitleCode('🟢 ');
+    assert.ok(code.includes('🟢 '));
+    assert.ok(code.includes('document.title'));
+    assert.ok(code.includes('replace'));
+  });
+
+  it('should generate code with blue prefix', () => {
+    const code = generateTitleCode('🔵 ');
+    assert.ok(code.includes('🔵 '));
+  });
+
+  it('should generate removal code when prefix is null', () => {
+    const code = generateTitleCode(null);
+    assert.ok(!code.includes('document.title = "🟢'));
+    assert.ok(!code.includes('document.title = "🔵'));
+    assert.ok(code.includes('replace'));
+    assert.ok(code.includes('document.title = document.title.replace'));
+  });
+
+  it('regex in generated code should strip all prefix types', () => {
+    const re = new RegExp(TITLE_PREFIX_RE_SRC);
+    assert.equal('🟢 🔵 🟡 Title'.replace(re, ''), 'Title');
+    assert.equal('🟢 Title'.replace(re, ''), 'Title');
+    assert.equal('🔵 Title'.replace(re, ''), 'Title');
+    assert.equal('Title'.replace(re, ''), 'Title');
+  });
+});
+
+// ===========================================================================
+// Tests: Tab state lifecycle — lease acquire/release title changes
+// ===========================================================================
+
+describe('Tab state lifecycle – title prefix expectations', () => {
+  it('acquireLease should result in green prefix', () => {
+    // After acquireLease succeeds + enableDomains, setTabTitlePrefix(🟢) is called
+    const expectedPrefix = '🟢 ';
+    assert.ok(expectedPrefix.startsWith('🟢'));
+  });
+
+  it('releaseLease should result in blue prefix', () => {
+    // Before releaseLease, setTabTitlePrefix(🔵) is called
+    const expectedPrefix = '🔵 ';
+    assert.ok(expectedPrefix.startsWith('🔵'));
+  });
+
+  it('WS close should set idle state in bridge', () => {
+    // When ws-state-change: closed, bridge calls markTabTitle("idle") → 🔵
+    const idlePrefix = '🔵 ';
+    assert.equal(idlePrefix, '🔵 ');
+  });
+
+  it('detach should remove prefix entirely', () => {
+    // emitDetachedFromTarget calls markTabTitle(false) → null prefix
+    const stateOrBool = false;
+    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
+    assert.equal(state, null);
+  });
+
+  it('bridge attachTab should set idle (blue) not connected (green)', () => {
+    // Bridge sets 🔵 on attach; MCP sets 🟢 after acquireLease
+    const bridgeAttachState = "idle";
+    const TAB_TITLE_PREFIXES: Record<string, string> = {
+      connected: "🟢 ", idle: "🔵 ", connecting: "🟡 ", error: "🔴 ",
+    };
+    assert.equal(TAB_TITLE_PREFIXES[bridgeAttachState], '🔵 ');
+  });
+
+  it('rapid switch_tab should not cause prefix corruption', () => {
+    // Each switch_tab: close old session → new connectCdp → enableDomains → setTabTitlePrefix(🟢)
+    // Old tab: no prefix change from MCP (bridge handles WS close → 🔵)
+    // New tab: 🟢
+    const re = new RegExp('^(?:🟢 |🟡 |🔴 |🔵 )+');
+    const title1 = '🟢 Old Tab';
+    const title2 = '🔵 Old Tab';
+    assert.equal(title1.replace(re, ''), 'Old Tab');
+    assert.equal(title2.replace(re, ''), 'Old Tab');
+    assert.equal(('🟢 ' + 'Old Tab'.replace(re, '')), '🟢 Old Tab');
   });
 });

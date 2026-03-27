@@ -8,6 +8,11 @@ import browser from "webextension-polyfill";
   let debuggerEventListenerRegistered = false;
   let offscreenReady = false;
 
+  // Trace recording state
+  const TRACE_MAX_EVENTS = 10000;
+  let traceEvents = [];
+  let traceActive = false;
+
   async function persistState() {
     try {
       await chrome.storage.session.set({
@@ -122,6 +127,8 @@ import browser from "webextension-polyfill";
       ...allTabs.map((t) => t.id).filter((id) => id !== undefined),
     ];
 
+    log(`[updateIcons] connectedCount=${connectedCount}, tabStates=${JSON.stringify([...tabStates.entries()])}, attachedTabs=${JSON.stringify([...attachedTabs.keys()])}`);
+
     for (const tabId of allTabIds) {
       const state = tabId !== undefined ? getTabState(tabId) : "idle";
       const tabUrl = tabId !== undefined ? tabUrlMap.get(tabId) : undefined;
@@ -154,6 +161,10 @@ import browser from "webextension-polyfill";
         badgeText = connectedCount > 0 ? String(connectedCount) : "";
         badgeColor = "#9E9E9E";
         iconPath = icons.idle.path;
+      }
+
+      if (tabId !== undefined) {
+        log(`[updateIcons] tabId=${tabId} state=${state} restricted=${restricted} → icon=${state === "connected" ? "green" : state === "connecting" ? "gray" : state === "error" ? "gray" : restricted ? "gray" : "idle(blue)"} badge="${badgeText}" badgeColor=${badgeColor}`);
       }
 
       try {
@@ -204,65 +215,41 @@ import browser from "webextension-polyfill";
     browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       updateIcons();
       if (changeInfo.status === "complete" && attachedTabs.has(tabId)) {
-        markTabTitle(tabId, true);
+        markTabTitle(tabId, "idle");
       }
     });
 
     debuggerEventListenerRegistered = true;
   }
 
-  const TAB_TITLE_PREFIX = "🟢 ";
+  const TAB_TITLE_PREFIXES = {
+    connected: "🟢 ",
+    idle: "🔵 ",
+    connecting: "🟡 ",
+    error: "🔴 ",
+  };
+  const ALL_PREFIXES_RE_SRC = "^(?:🟢 |🟡 |🔴 |🔵 )+";
 
-  async function markTabTitle(tabId, attach) {
+  async function markTabTitle(tabId, stateOrBool) {
+    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
+    const prefix = state ? TAB_TITLE_PREFIXES[state] || null : null;
     try {
-      const prefix = TAB_TITLE_PREFIX;
-      if (attach) {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (p) => {
-            if (window.__spawriterTitleObserver) return;
-            const ensure = () => {
-              if (!document.title.startsWith(p)) document.title = p + document.title;
-            };
-            ensure();
-            const titleEl = document.querySelector("title");
-            if (titleEl) {
-              const obs = new MutationObserver(ensure);
-              obs.observe(titleEl, { childList: true, characterData: true, subtree: true });
-              window.__spawriterTitleObserver = obs;
-            }
-            const origDesc = Object.getOwnPropertyDescriptor(Document.prototype, "title") ||
-                             Object.getOwnPropertyDescriptor(HTMLDocument.prototype, "title");
-            if (origDesc?.set) {
-              Object.defineProperty(document, "title", {
-                get: origDesc.get,
-                set(v) {
-                  origDesc.set.call(this, v.startsWith(p) ? v : p + v);
-                },
-                configurable: true,
-              });
-              window.__spawriterOrigTitleDesc = origDesc;
-            }
-          },
-          args: [prefix],
-        });
-      } else {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (p) => {
-            if (window.__spawriterTitleObserver) {
-              window.__spawriterTitleObserver.disconnect();
-              window.__spawriterTitleObserver = null;
-            }
-            if (window.__spawriterOrigTitleDesc) {
-              Object.defineProperty(document, "title", window.__spawriterOrigTitleDesc);
-              window.__spawriterOrigTitleDesc = null;
-            }
-            if (document.title.startsWith(p)) document.title = document.title.slice(p.length);
-          },
-          args: [prefix],
-        });
-      }
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (newPrefix, reSrc) => {
+          const re = new RegExp(reSrc);
+          if (window.__spawriterTitleObserver) {
+            window.__spawriterTitleObserver.disconnect();
+            window.__spawriterTitleObserver = null;
+          }
+          if (window.__spawriterOrigTitleDesc) {
+            Object.defineProperty(document, "title", window.__spawriterOrigTitleDesc);
+            window.__spawriterOrigTitleDesc = null;
+          }
+          document.title = (newPrefix || '') + document.title.replace(re, '');
+        },
+        args: [prefix, ALL_PREFIXES_RE_SRC],
+      });
     } catch (_) {}
   }
 
@@ -354,6 +341,46 @@ import browser from "webextension-polyfill";
     }
   }
 
+  async function handleTraceCommand(message) {
+    const params = message.params || {};
+    const action = params.action;
+
+    if (action === "start") {
+      traceActive = true;
+      traceEvents = [];
+      for (const [tabId] of attachedTabs) {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ["build/contentTrace.js"],
+          });
+          chrome.tabs.sendMessage(tabId, { type: "trace_start" });
+        } catch (e) {
+          warn(`Failed to inject trace script into tab ${tabId}:`, e);
+        }
+      }
+      return { status: "recording" };
+    }
+
+    if (action === "stop") {
+      traceActive = false;
+      const events = [...traceEvents];
+      traceEvents = [];
+      for (const [tabId] of attachedTabs) {
+        try {
+          chrome.tabs.sendMessage(tabId, { type: "trace_stop" });
+        } catch (_) {}
+      }
+      return { status: "stopped", events, count: events.length };
+    }
+
+    if (action === "status") {
+      return { recording: traceActive, eventCount: traceEvents.length };
+    }
+
+    return { error: `Unknown trace action: ${action}` };
+  }
+
   function handleRelayIncoming(message) {
     if (message.method === "ping") {
       sendMessage({ method: "pong" });
@@ -372,6 +399,13 @@ import browser from "webextension-polyfill";
       handleRelayMessage(message)
         .then((result) => sendMessage({ id: message.id, ...result }))
         .catch((e) => sendMessage({ id: message.id, success: false, error: e.message }));
+      return;
+    }
+
+    if (message.method === "trace") {
+      handleTraceCommand(message)
+        .then((result) => sendMessage({ id: message.id, ...result }))
+        .catch((e) => sendMessage({ id: message.id, error: e.message || String(e) }));
       return;
     }
 
@@ -510,6 +544,7 @@ import browser from "webextension-polyfill";
     try {
       log(`Starting connection to tab ${tabId}`);
       setTabState(tabId, "connecting");
+      markTabTitle(tabId, "connecting");
       updateIcons();
 
       await ensureRelayConnected();
@@ -519,6 +554,7 @@ import browser from "webextension-polyfill";
     } catch (err) {
       error(`Failed to connect tab ${tabId}:`, err);
       setTabState(tabId, "error");
+      markTabTitle(tabId, "error");
       updateIcons();
     }
   }
@@ -625,57 +661,14 @@ import browser from "webextension-polyfill";
     }
 
     log(`Attached to tab ${tabId}, sessionId: ${sessionId}`);
-    markTabTitle(tabId, true);
+    markTabTitle(tabId, "idle");
     updateIcons();
     syncTabGroup();
     return { tabId, sessionId };
   }
 
   async function syncTabGroup() {
-    if (
-      typeof chrome === "undefined" ||
-      !chrome.tabs?.group ||
-      !chrome.tabGroups?.update
-    ) {
-      log("syncTabGroup: tab group API not available");
-      return;
-    }
-    try {
-      const connectedTabIds = [...attachedTabs.keys()];
-      log(`syncTabGroup: ${connectedTabIds.length} connected tabs:`, connectedTabIds);
-      const existingGroups = await chrome.tabGroups.query({
-        title: "spawriter",
-      });
-
-      if (connectedTabIds.length === 0) {
-        for (const group of existingGroups) {
-          const tabsInGroup = await chrome.tabs.query({ groupId: group.id });
-          const idsToUngroup = tabsInGroup
-            .map((t) => t.id)
-            .filter((id) => id !== undefined);
-          if (idsToUngroup.length > 0) {
-            await chrome.tabs.ungroup(idsToUngroup);
-          }
-        }
-        return;
-      }
-
-      const groupId =
-        existingGroups.length > 0 ? existingGroups[0].id : undefined;
-      if (groupId !== undefined) {
-        await chrome.tabs.group({ tabIds: connectedTabIds, groupId });
-      } else {
-        const newGroupId = await chrome.tabs.group({
-          tabIds: connectedTabIds,
-        });
-        await chrome.tabGroups.update(newGroupId, {
-          title: "spawriter",
-          color: "green",
-        });
-      }
-    } catch (e) {
-      warn("syncTabGroup failed:", e.message, e.stack);
-    }
+    // Tab grouping disabled — status shown via title prefix emoji instead
   }
 
   async function detachAllTabs() {
@@ -909,6 +902,14 @@ import browser from "webextension-polyfill";
     browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!message) return undefined;
 
+      if (message.type === "trace_event" && traceActive) {
+        if (traceEvents.length >= TRACE_MAX_EVENTS) {
+          traceEvents.shift();
+        }
+        traceEvents.push(message.payload);
+        return;
+      }
+
       if (message.type === "ws-message") {
         handleRelayIncoming(message.payload);
         return;
@@ -920,6 +921,7 @@ import browser from "webextension-polyfill";
         if (message.state === "closed") {
           for (const tabId of attachedTabs.keys()) {
             setTabState(tabId, "idle");
+            markTabTitle(tabId, "idle");
           }
           updateIcons();
           syncTabGroup();

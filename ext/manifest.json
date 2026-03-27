@@ -22,7 +22,7 @@
   },
   "devtools_page": "./build/main.html",
   "minimum_chrome_version": "116",
-  "permissions": ["storage", "scripting", "browsingData", "tabs", "tabGroups", "debugger", "offscreen"],
+  "permissions": ["storage", "scripting", "browsingData", "tabs", "debugger", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "content_scripts": [
     {

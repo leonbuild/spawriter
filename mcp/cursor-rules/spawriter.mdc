@@ -12,7 +12,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 
 **You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it. Especially when you are given an URL. 
 
-## Available Tools (27)
+## Available Tools (30)
 
 ### Inspection & State
 
@@ -20,12 +20,15 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 |------|-------------|----------|
 | `dashboard_state` | Get single-spa app list, statuses, active import-map-overrides | `appName?` |
 | `screenshot` | Capture page screenshot, optionally with numbered labels on interactive elements | `labels?` (boolean) |
-| `accessibility_snapshot` | Get condensed accessibility tree with search and diff support | `search?`, `diff?` |
+| `accessibility_snapshot` | Get condensed accessibility tree with search, diff, and interactive_only support. Returns @ref numbers on interactive elements. | `search?`, `diff?`, `interactive_only?` |
 | `execute` | Run JS in page context (fast, lightweight, direct CDP) | `code` |
 | `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API — supports click, hover, fill, drag, keyboard, scroll, tap, wait, and all locator strategies. All actions trigger real browser input events (CSS :hover/:focus work correctly) | `code`, `timeout?` |
+| `interact` | Interact with a page element by @ref number from accessibility_snapshot. Lightweight alternative to playwright_execute for single-step actions (click, hover, fill, focus, check, uncheck, select). | `ref`, `action`, `value?` |
 | `console_logs` | Get captured browser console logs with filtering | `count?`, `level?`, `search?`, `clear?` |
 | `network_log` | Get captured network requests with filtering | `count?`, `url_filter?`, `status_filter?`, `clear?` |
 | `network_detail` | Get full details of a specific request: headers, request/response body | `requestId`, `include?`, `max_body_size?` |
+| `browser_fetch` | Make HTTP requests in the browser context with the user's cookies and session | `url`, `method?`, `headers?`, `body?`, `max_body_size?` |
+| `trace` | Record user interactions on the page (clicks, typing, scrolling) | `action` (start/stop/status) |
 
 ### Debugging & CSS
 
@@ -373,10 +376,39 @@ network_detail { requestId: "R1.2", include: "response_body", max_body_size: 500
 ### 6. Track page changes with snapshot diff
 
 ```
-accessibility_snapshot                    →  first call caches baseline
+accessibility_snapshot                    →  first call caches baseline (returns @ref numbers on interactive elements)
 accessibility_snapshot                    →  second call shows diff
 accessibility_snapshot { search: "button" } →  search for specific elements
 accessibility_snapshot { diff: false }    →  force full snapshot (no diff)
+accessibility_snapshot { interactive_only: true } → only show interactive elements with @ref numbers
+```
+
+### 6.5. Interact with elements by @ref
+
+After calling `accessibility_snapshot`, use `interact` for quick single-step actions:
+
+```
+interact { ref: 1, action: "click" }     →  click element @1
+interact { ref: 2, action: "fill", value: "hello" }  →  fill input @2
+interact { ref: 3, action: "hover" }     →  hover over @3
+interact { ref: 4, action: "focus" }     →  focus @4
+interact { ref: 5, action: "check" }     →  check checkbox @5
+interact { ref: 6, action: "select", value: "blue" }  →  select option
+```
+
+### 6.6. Fetch data with user's cookies
+
+```
+browser_fetch { url: "/api/user/me" }
+browser_fetch { url: "/api/data", method: "POST", body: "{\"key\":\"value\"}" }
+```
+
+### 6.7. Record user interactions
+
+```
+trace { action: "start" }    →  begin recording
+trace { action: "status" }   →  check recording state
+trace { action: "stop" }     →  stop and return all captured events
 ```
 
 ### 7. Debug JavaScript with breakpoints

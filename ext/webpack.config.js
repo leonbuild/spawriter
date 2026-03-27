@@ -8,6 +8,7 @@ module.exports = {
   entry: {
     contentScript: "./src/content_script.js",
     contentScriptMain: "./src/content_script_main.js",
+    contentTrace: "./src/content_trace.js",
     backgroundScript: "./src/background_script.js",
     offscreen: "./src/offscreen.js",
     panel: "./src/panel.js",

@@ -181,6 +181,43 @@ app.post('/connect-tab', async (c) => {
   });
 });
 
+app.post('/trace', async (c) => {
+  if (!isExtensionConnected()) {
+    return c.json({ error: 'Extension not connected' }, 503);
+  }
+
+  const body = await c.req.json<{ action: string }>().catch(() => ({ action: '' }));
+
+  return new Promise<Response>((resolve) => {
+    const relayId = nextExtensionRequestId++;
+    const timeoutId = setTimeout(() => {
+      pendingExtensionCmdRequests.delete(relayId);
+      resolve(c.json({ error: 'Timeout waiting for extension' }, 504));
+    }, 15000);
+
+    const mockWs = {
+      send(data: string) {
+        clearTimeout(timeoutId);
+        pendingExtensionCmdRequests.delete(relayId);
+        try {
+          resolve(c.json(JSON.parse(data)));
+        } catch {
+          resolve(c.json({ error: 'Invalid response' }, 500));
+        }
+      },
+      readyState: 1,
+    } as unknown as WebSocket;
+
+    pendingExtensionCmdRequests.set(relayId, { ws: mockWs, timeoutId });
+
+    sendToExtension({
+      id: relayId,
+      method: 'trace',
+      params: body,
+    });
+  });
+});
+
 app.get('/version', (c) => {
   return c.json({ version: VERSION });
 });
