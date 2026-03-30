@@ -5,7 +5,7 @@
   "description": "spawriter Chrome/Firefox extension",
   "scripts": {
     "convert-icons": "node scripts/convert-icons.js",
-    "webpack-build": "npm run convert-icons && node --openssl-legacy-provider ./node_modules/webpack/bin/webpack.js --mode=production",
+    "webpack-build": "npm run convert-icons && node --openssl-legacy-provider ../node_modules/webpack/bin/webpack.js --mode=production",
     "build:firefox": "npm run webpack-build && web-ext build --overwrite-dest --filename spawriter-firefox-{version}.zip",
     "build:chrome": "npm run webpack-build && node scripts/build-chrome.js && web-ext build --source-dir dist-chrome --artifacts-dir web-ext-artifacts --overwrite-dest --filename spawriter-chrome-{version}.zip",
     "lint": "web-ext lint",

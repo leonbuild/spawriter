@@ -1,5 +1,5 @@
 {
-  "name": "spawriter",
+  "name": "spawriter-mcp",
   "version": "1.0.0",
   "type": "module",
   "description": "spawriter MCP server + CDP relay — AI-assisted browser automation with zero-touch tab management, multi-agent isolation (Tab Lease System), and 27 MCP tools for Chrome DevTools Protocol access",

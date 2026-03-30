@@ -11,8 +11,10 @@ ext/web-ext-artifacts
 # Generated icons (built from SVG by convert-icons.js)
 ext/src/icons/*.png
 
-# prefer package-lock.json
+# prefer root package-lock.json (workspaces)
 yarn.lock
+ext/package-lock.json
+mcp/package-lock.json
 
 # "Keep it secret. Keep it safe." - Gandalf the Grey
 .env
