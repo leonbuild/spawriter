@@ -1,0 +1,4 @@
+# Enforce LF line endings for all text files to prevent
+# npm install on Windows from causing phantom git changes
+# (npm rewrites bin.js and package-lock.json with CRLF)
+* text=auto eol=lf
