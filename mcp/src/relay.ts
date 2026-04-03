@@ -1108,6 +1108,7 @@ export async function startRelayServer(): Promise<void> {
           });
         }
         pendingRequests.clear();
+        checkIdleShutdown();
       });
 
       ws.on('error', (err) => {
@@ -1159,6 +1160,7 @@ export async function startRelayServer(): Promise<void> {
             pendingRequests.delete(requestId);
           }
         }
+        checkIdleShutdown();
       });
 
       ws.on('error', (err) => {
@@ -1208,16 +1210,42 @@ export async function startRelayServer(): Promise<void> {
     ws.close(1008, 'Unknown endpoint');
   });
 
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      log(`Port ${port} already in use — another relay instance is running. Exiting gracefully.`);
+      process.exit(0);
+    }
+    error('Relay server error:', err.message);
+    process.exit(1);
+  });
+
   server.listen(port, () => {
     log(`Relay server started on port ${port}`);
     log(`Extension endpoint: ws://localhost:${port}/extension`);
     log(`CDP endpoint: ws://localhost:${port}/cdp/:clientId`);
   });
 
+  const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function checkIdleShutdown() {
+    if (idleTimer) clearTimeout(idleTimer);
+    if (cdpClients.size > 0 || extensionWs) return;
+    idleTimer = setTimeout(() => {
+      if (cdpClients.size === 0 && !extensionWs) {
+        log('No clients connected for 5 minutes. Shutting down idle relay.');
+        process.exit(0);
+      }
+    }, IDLE_TIMEOUT_MS);
+  }
+
+  checkIdleShutdown();
+
   setInterval(() => {
     if (extensionWs?.readyState === WebSocket.OPEN) {
       extensionWs.send(JSON.stringify({ method: 'ping' }));
     }
+    checkIdleShutdown();
   }, 30000);
 }
 

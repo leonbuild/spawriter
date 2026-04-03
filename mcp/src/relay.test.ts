@@ -678,3 +678,141 @@ describe('Lease label handling', () => {
     assert.ok(result.error?.includes('agent-a'));
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: EADDRINUSE handling (Fix #1)
+// ---------------------------------------------------------------------------
+
+describe('EADDRINUSE error handling logic', () => {
+  function handleServerError(err: { code?: string }): 'exit-graceful' | 'exit-error' | 'ignore' {
+    if (err.code === 'EADDRINUSE') return 'exit-graceful';
+    return 'exit-error';
+  }
+
+  it('should exit gracefully on EADDRINUSE', () => {
+    assert.equal(handleServerError({ code: 'EADDRINUSE' }), 'exit-graceful');
+  });
+
+  it('should exit with error on other errors', () => {
+    assert.equal(handleServerError({ code: 'EACCES' }), 'exit-error');
+  });
+
+  it('should exit with error on unknown errors', () => {
+    assert.equal(handleServerError({}), 'exit-error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: Idle shutdown logic (Fix #4)
+// ---------------------------------------------------------------------------
+
+describe('Idle shutdown decision logic', () => {
+  function shouldShutdown(cdpClientCount: number, hasExtension: boolean): boolean {
+    return cdpClientCount === 0 && !hasExtension;
+  }
+
+  it('should shut down when no CDP clients and no extension', () => {
+    assert.equal(shouldShutdown(0, false), true);
+  });
+
+  it('should not shut down when CDP clients are connected', () => {
+    assert.equal(shouldShutdown(1, false), false);
+    assert.equal(shouldShutdown(3, false), false);
+  });
+
+  it('should not shut down when extension is connected', () => {
+    assert.equal(shouldShutdown(0, true), false);
+  });
+
+  it('should not shut down when both are connected', () => {
+    assert.equal(shouldShutdown(2, true), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: checkIdleShutdown timer behavior (Fix #4 — behavioral)
+// ---------------------------------------------------------------------------
+
+describe('checkIdleShutdown timer lifecycle', () => {
+  function createIdleChecker() {
+    let timerSet = false;
+    let timerCleared = false;
+    let shutdownCalled = false;
+
+    function checkIdleShutdown(cdpClientCount: number, hasExtension: boolean) {
+      timerCleared = timerSet;
+      if (cdpClientCount > 0 || hasExtension) {
+        timerSet = false;
+        return;
+      }
+      timerSet = true;
+    }
+
+    function fireTimer(cdpClientCount: number, hasExtension: boolean) {
+      if (!timerSet) return;
+      if (cdpClientCount === 0 && !hasExtension) {
+        shutdownCalled = true;
+      }
+      timerSet = false;
+    }
+
+    return {
+      checkIdleShutdown,
+      fireTimer,
+      state: () => ({ timerSet, timerCleared, shutdownCalled }),
+    };
+  }
+
+  it('should set timer when no clients at startup', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(0, false);
+    assert.equal(checker.state().timerSet, true);
+  });
+
+  it('should not set timer when clients are present', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(1, false);
+    assert.equal(checker.state().timerSet, false);
+  });
+
+  it('should cancel timer when client connects', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(0, false);
+    assert.equal(checker.state().timerSet, true);
+    checker.checkIdleShutdown(1, false);
+    assert.equal(checker.state().timerSet, false);
+    assert.equal(checker.state().timerCleared, true);
+  });
+
+  it('should trigger shutdown when timer fires with no clients', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(0, false);
+    checker.fireTimer(0, false);
+    assert.equal(checker.state().shutdownCalled, true);
+  });
+
+  it('should NOT trigger shutdown when timer fires but clients reconnected', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(0, false);
+    checker.checkIdleShutdown(1, false);
+    checker.fireTimer(1, false);
+    assert.equal(checker.state().shutdownCalled, false);
+  });
+
+  it('should re-arm timer after client disconnects again', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(0, false);
+    checker.checkIdleShutdown(1, false);
+    assert.equal(checker.state().timerSet, false);
+    checker.checkIdleShutdown(0, false);
+    assert.equal(checker.state().timerSet, true);
+  });
+
+  it('should cancel timer when extension connects', () => {
+    const checker = createIdleChecker();
+    checker.checkIdleShutdown(0, false);
+    assert.equal(checker.state().timerSet, true);
+    checker.checkIdleShutdown(0, true);
+    assert.equal(checker.state().timerSet, false);
+  });
+});

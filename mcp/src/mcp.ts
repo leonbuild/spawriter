@@ -351,19 +351,33 @@ function handleCdpEvent(method: string, params: Record<string, unknown>) {
   }
 }
 
+let relayStartPromise: Promise<void> | null = null;
+
 async function ensureRelayServer(): Promise<void> {
   try {
     const response = await fetch(`http://localhost:${getRelayPort()}/version`, {
       signal: AbortSignal.timeout(2000),
     });
     if (response.ok) {
-      log('Relay server already running');
       return;
     }
   } catch {
-    log('Relay server not running, attempting to start...');
+    // relay not reachable, needs start
   }
 
+  if (relayStartPromise) {
+    return relayStartPromise;
+  }
+  relayStartPromise = doStartRelay();
+  try {
+    return await relayStartPromise;
+  } finally {
+    relayStartPromise = null;
+  }
+}
+
+async function doStartRelay(): Promise<void> {
+  log('Relay server not running, attempting to start...');
   try {
     const { spawn } = await import('child_process');
     const path = await import('path');
@@ -392,7 +406,7 @@ async function ensureRelayServer(): Promise<void> {
       }
     }
 
-    throw new Error('Failed to start relay server');
+    throw new Error('Failed to start relay server after 10 attempts');
   } catch (e) {
     error('Error starting relay server:', e);
     throw e;
@@ -1165,9 +1179,15 @@ const server = new Server(
   {
     capabilities: {
       tools: {},
+      logging: {},
     },
   }
 );
+
+function mcpLog(level: 'debug' | 'info' | 'warning' | 'error', data: string): void {
+  log(data);
+  server.sendLoggingMessage({ level, logger: 'spawriter', data }).catch(() => {});
+}
 
 const tools = [
   {
@@ -3321,7 +3341,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  log('MCP server ready');
+  mcpLog('info', 'MCP server ready');
 
   process.on('SIGINT', async () => {
     log('Shutting down...');

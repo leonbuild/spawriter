@@ -13,7 +13,9 @@ const port = Number.isFinite(parsedPort) ? parsedPort : getRelayPort();
 const help = args.includes("--help") || args.includes("-h");
 const version = args.includes("--version") || args.includes("-v");
 
-process.stderr.write(`spawriter v${VERSION}\n`);
+if (command !== 'serve' && command !== 'relay') {
+  process.stderr.write(`spawriter v${VERSION}\n`);
+}
 
 if (help) {
   console.log(`

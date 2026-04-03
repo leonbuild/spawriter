@@ -6,7 +6,7 @@
 
 ## 结论概要
 
-spawriter 在仓库中 **不包含任何构建产物**，所有运行时所需文件（MCP 编译输出、Extension webpack 打包、PNG 图标）都在 `.gitignore` 中被排除。clone 后需要执行 **`npm run setup`** 即可一键完成安装和构建。
+spawriter 在仓库中 **不包含任何构建产物**，所有运行时所需文件（MCP 编译输出、Extension webpack 打包、PNG 图标）都在 `.gitignore` 中被排除。clone 后需要执行 `**npm run setup`** 即可一键完成安装和构建。
 
 ---
 
@@ -35,20 +35,22 @@ npm run setup    # 一键安装 + 构建
 
 ## 二、为什么不能拖拽文件夹到 Chrome 加载 Extension
 
-Chrome 的 "Load unpacked" 需要一个包含 **`manifest.json`** 的目录。spawriter 存在两个问题：
+Chrome 的 "Load unpacked" 需要一个包含 `**manifest.json**` 的目录。spawriter 存在两个问题：
 
 ### 问题 1：仓库内没有可直接加载的 Chrome extension 目录
 
-| 目录/文件 | 状态 | 说明 |
-|---|---|---|
-| `ext/` 根目录 | 不可加载 | 没有 Chrome 所需的 `manifest.json`（只有 `manifest.chrome.json` 和 Firefox 的 `manifest.json`） |
-| `ext/build/` | gitignored | webpack 打包输出，不存在 |
-| `ext/dist-chrome/` | gitignored | Chrome 专用构建目录（含正确的 manifest.json + build/ + icons/），不存在 |
+
+| 目录/文件              | 状态         | 说明                                                                                   |
+| ------------------ | ---------- | ------------------------------------------------------------------------------------ |
+| `ext/` 根目录         | 不可加载       | 没有 Chrome 所需的 `manifest.json`（只有 `manifest.chrome.json` 和 Firefox 的 `manifest.json`） |
+| `ext/build/`       | gitignored | webpack 打包输出，不存在                                                                     |
+| `ext/dist-chrome/` | gitignored | Chrome 专用构建目录（含正确的 manifest.json + build/ + icons/），不存在                              |
+
 
 ### 问题 2：源码中的 manifest 文件不匹配 Chrome 加载需求
 
-- **`ext/manifest.json`** — 这是 **Firefox** manifest（MV2/MV3 混合），Chrome 无法直接加载
-- **`ext/manifest.chrome.json`** — 这是 Chrome MV3 manifest 的**源文件**，但文件名不是 `manifest.json`，Chrome 不认识
+- `**ext/manifest.json**` — 这是 **Firefox** manifest（MV2/MV3 混合），Chrome 无法直接加载
+- `**ext/manifest.chrome.json`** — 这是 Chrome MV3 manifest 的**源文件**，但文件名不是 `manifest.json`，Chrome 不认识
 - Chrome manifest 引用 `./build/backgroundScript.js` 等 webpack 输出文件，即使强行重命名，源码也不存在这些编译后的 JS
 
 ### 问题 3：PNG 图标不存在
@@ -61,7 +63,7 @@ Chrome MV3 **不支持 SVG 图标**，必须使用 PNG。仓库仅包含 SVG 源
 npm run setup    # 一键安装 + 构建
 ```
 
-构建完成后，在 Chrome 中加载 **`ext/dist-chrome/`** 目录。
+构建完成后，在 Chrome 中加载 `**ext/dist-chrome/**` 目录。
 
 ---
 
@@ -84,13 +86,15 @@ spawriter/           ← 根（orchestrator）
 
 ### 3.2 可用脚本
 
-| 命令 | 作用 | 说明 |
-|---|---|---|
-| `npm run setup` | **一键初始化** | `npm install` → `build:ext` → `build:mcp` |
-| `npm run build` | 构建全部 | `build:ext` + `build:mcp`（**不清理产物**） |
-| `npm run release` | 发布打包 | `build` + `package-release` + `clean:artifacts` |
-| `npm run build:ext` | 构建 Extension | convert-icons → webpack → build-chrome |
-| `npm run build:mcp` | 构建 MCP server | tsc 编译 |
+
+| 命令                  | 作用            | 说明                                              |
+| ------------------- | ------------- | ----------------------------------------------- |
+| `npm run setup`     | **一键初始化**     | `npm install` → `build:ext` → `build:mcp`       |
+| `npm run build`     | 构建全部          | `build:ext` + `build:mcp`（**不清理产物**）            |
+| `npm run release`   | 发布打包          | `build` + `package-release` + `clean:artifacts` |
+| `npm run build:ext` | 构建 Extension  | convert-icons → webpack → build-chrome          |
+| `npm run build:mcp` | 构建 MCP server | tsc 编译                                          |
+
 
 ### 3.3 Extension 构建链（`npm run build:ext`）
 
@@ -116,8 +120,8 @@ mcp/src/*.ts ──→ [tsc] ──→ mcp/dist/*.js + *.d.ts + *.map
 
 ### 3.5 build 与 release 的区别
 
-- **`npm run build`**：只构建，产物保留在 `ext/dist-chrome/` 和 `mcp/dist/`，可直接使用
-- **`npm run release`**：构建 → 打包到 `release/spawriter-v{version}/` → 清理中间产物（`ext/build/`、`ext/dist-chrome/`、`ext/web-ext-artifacts/`）
+- `**npm run build**`：只构建，产物保留在 `ext/dist-chrome/` 和 `mcp/dist/`，可直接使用
+- `**npm run release**`：构建 → 打包到 `release/spawriter-v{version}/` → 清理中间产物（`ext/build/`、`ext/dist-chrome/`、`ext/web-ext-artifacts/`）
 
 ---
 
@@ -128,6 +132,7 @@ mcp/src/*.ts ──→ [tsc] ──→ mcp/dist/*.js + *.d.ts + *.map
 `sharp` 在 `ext/package.json` 中被用于 SVG→PNG 图标转换。它包含**平台特定的原生二进制文件**。
 
 **可能遇到的问题：**
+
 - 网络问题导致预编译二进制下载失败
 - 公司代理/镜像不包含 `sharp` 的预编译包
 
@@ -185,22 +190,24 @@ npm run setup
 
 ## 六、问题总结表
 
-| 症状 | 根因 | 类别 | 修复 |
-|---|---|---|---|
-| MCP 配置报 `Cannot find module` | `mcp/dist/` 被 gitignore | 缺少构建产物 | `npm run setup` |
-| Chrome 拒绝加载 `ext/` 目录 | `ext/` 根目录没有 Chrome 可识别的 `manifest.json` | manifest 不匹配 | `npm run setup` |
-| Chrome 加载报 manifest 缺失 | `ext/dist-chrome/` 被 gitignore | 缺少构建产物 | `npm run setup` |
-| 即使有 manifest 也缺少 JS 文件 | webpack 输出的 `ext/build/` 被 gitignore | 缺少构建产物 | `npm run setup` |
-| manifest 中引用的 PNG 图标不存在 | PNG 从 SVG 生成，且被 gitignore | 缺少构建产物 | `npm run setup` |
-| `npm run build` 后 dist-chrome 消失 | 旧版 `build` 包含 `clean:artifacts` | ~~已修复~~：`build` 不再清理 |
-| `sharp` 安装失败 | 原生平台二进制依赖 | 环境依赖 | 手动转换 SVG→PNG |
+
+| 症状                               | 根因                                       | 类别                   | 修复              |
+| -------------------------------- | ---------------------------------------- | -------------------- | --------------- |
+| MCP 配置报 `Cannot find module`     | `mcp/dist/` 被 gitignore                  | 缺少构建产物               | `npm run setup` |
+| Chrome 拒绝加载 `ext/` 目录            | `ext/` 根目录没有 Chrome 可识别的 `manifest.json` | manifest 不匹配         | `npm run setup` |
+| Chrome 加载报 manifest 缺失           | `ext/dist-chrome/` 被 gitignore           | 缺少构建产物               | `npm run setup` |
+| 即使有 manifest 也缺少 JS 文件           | webpack 输出的 `ext/build/` 被 gitignore     | 缺少构建产物               | `npm run setup` |
+| manifest 中引用的 PNG 图标不存在          | PNG 从 SVG 生成，且被 gitignore                | 缺少构建产物               | `npm run setup` |
+| `npm run build` 后 dist-chrome 消失 | 旧版 `build` 包含 `clean:artifacts`          | ~~已修复~~：`build` 不再清理 |                 |
+| `sharp` 安装失败                     | 原生平台二进制依赖                                | 环境依赖                 | 手动转换 SVG→PNG    |
+
 
 ---
 
 ## 七、已完成改进
 
 1. **npm workspaces**：根 `package.json` 添加 `"workspaces": ["ext", "mcp"]`，一次 `npm install` 安装所有依赖
-2. **`npm run setup`** 一键脚本：`install → build:ext → build:mcp`，clone 后一条命令即可使用
+2. `**npm run setup`** 一键脚本：`install → build:ext → build:mcp`，clone 后一条命令即可使用
 3. **分离 build 和 release**：`npm run build` 只构建不清理产物；`npm run release` 构建 + 打包 + 清理
 4. **mcp 包名修正**：`mcp/package.json` name 改为 `spawriter-mcp` 避免与根包名冲突
 5. **webpack 路径修复**：ext 的 webpack 调用路径从 `./node_modules/` 改为 `../node_modules/` 适配 hoisting
@@ -209,3 +216,4 @@ npm run setup
 
 1. **提供 prebuilt release**：在 GitHub Releases 中发布包含 `mcp/dist/` + `ext/dist-chrome/` 的压缩包，使非开发者可以直接使用
 2. **GitHub Actions CI**：自动化构建、测试、发布流程
+

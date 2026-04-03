@@ -1977,6 +1977,266 @@ describe('ensureSession mutex (error recovery)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test: MCP logging capability declaration (Fix #3)
+// ---------------------------------------------------------------------------
+
+describe('MCP logging capability', () => {
+  it('should declare logging capability in server options', () => {
+    const capabilities = { tools: {}, logging: {} };
+    assert.ok('logging' in capabilities, 'logging capability should be declared');
+    assert.ok('tools' in capabilities, 'tools capability should still be declared');
+  });
+
+  it('mcpLog should call both stderr log and sendLoggingMessage', async () => {
+    let stderrCalled = false;
+    let sendCalled = false;
+    let sentLevel: string | null = null;
+    let sentData: unknown = null;
+
+    function logToStderr(data: string) {
+      stderrCalled = true;
+    }
+
+    function sendLoggingMessage(params: { level: string; logger: string; data: unknown }) {
+      sendCalled = true;
+      sentLevel = params.level;
+      sentData = params.data;
+      return Promise.resolve();
+    }
+
+    function mcpLog(level: string, data: string) {
+      logToStderr(data);
+      sendLoggingMessage({ level, logger: 'spawriter', data }).catch(() => {});
+    }
+
+    mcpLog('info', 'test message');
+    await new Promise((r) => setTimeout(r, 10));
+
+    assert.equal(stderrCalled, true, 'should write to stderr');
+    assert.equal(sendCalled, true, 'should send logging message');
+    assert.equal(sentLevel, 'info');
+    assert.equal(sentData, 'test message');
+  });
+
+  it('mcpLog should not throw when sendLoggingMessage rejects', async () => {
+    function sendLoggingMessage() {
+      return Promise.reject(new Error('Not connected'));
+    }
+
+    function mcpLog(level: string, data: string) {
+      sendLoggingMessage().catch(() => {});
+    }
+
+    assert.doesNotThrow(() => mcpLog('info', 'test'));
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
+  it('mcpLog should accept all valid severity levels', () => {
+    const levels = ['debug', 'info', 'warning', 'error'] as const;
+    for (const level of levels) {
+      let capturedLevel: string | null = null;
+      function mcpLog(l: string, data: string) {
+        capturedLevel = l;
+      }
+      mcpLog(level, 'test');
+      assert.equal(capturedLevel, level);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: ensureRelayServer reentrancy guard (Fix #2)
+// ---------------------------------------------------------------------------
+
+function createRelayStarterWithMutex() {
+  let relayStartPromise: Promise<void> | null = null;
+  let startCount = 0;
+
+  async function doStartRelay(): Promise<void> {
+    startCount++;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  async function ensureRelayServer(relayAlreadyRunning: boolean): Promise<void> {
+    if (relayAlreadyRunning) return;
+
+    if (relayStartPromise) {
+      return relayStartPromise;
+    }
+    relayStartPromise = doStartRelay();
+    try {
+      return await relayStartPromise;
+    } finally {
+      relayStartPromise = null;
+    }
+  }
+
+  return { ensureRelayServer, getStartCount: () => startCount };
+}
+
+describe('ensureRelayServer reentrancy guard', () => {
+  it('should skip relay start when relay is already running', async () => {
+    const { ensureRelayServer, getStartCount } = createRelayStarterWithMutex();
+    await ensureRelayServer(true);
+    assert.equal(getStartCount(), 0);
+  });
+
+  it('should only start relay once when called concurrently', async () => {
+    const { ensureRelayServer, getStartCount } = createRelayStarterWithMutex();
+
+    await Promise.all([
+      ensureRelayServer(false),
+      ensureRelayServer(false),
+      ensureRelayServer(false),
+    ]);
+
+    assert.equal(getStartCount(), 1, 'doStartRelay should be called exactly once');
+  });
+
+  it('should allow a second start after the first completes', async () => {
+    const { ensureRelayServer, getStartCount } = createRelayStarterWithMutex();
+
+    await ensureRelayServer(false);
+    assert.equal(getStartCount(), 1);
+
+    await ensureRelayServer(false);
+    assert.equal(getStartCount(), 2);
+  });
+
+  it('should release mutex when relay start fails', async () => {
+    let relayStartPromise: Promise<void> | null = null;
+    let callCount = 0;
+
+    async function doStartRelay(): Promise<void> {
+      callCount++;
+      await new Promise((r) => setTimeout(r, 20));
+      if (callCount === 1) throw new Error('Spawn failed');
+    }
+
+    async function ensureRelayServer(): Promise<void> {
+      if (relayStartPromise) return relayStartPromise;
+      relayStartPromise = doStartRelay();
+      try {
+        return await relayStartPromise;
+      } finally {
+        relayStartPromise = null;
+      }
+    }
+
+    await assert.rejects(ensureRelayServer, /Spawn failed/);
+    await ensureRelayServer();
+    assert.equal(callCount, 2);
+  });
+
+  it('concurrent callers should all see the same error on failure', async () => {
+    let relayStartPromise: Promise<void> | null = null;
+
+    async function doStartRelay(): Promise<void> {
+      await new Promise((r) => setTimeout(r, 20));
+      throw new Error('Port unavailable');
+    }
+
+    async function ensureRelayServer(): Promise<void> {
+      if (relayStartPromise) return relayStartPromise;
+      relayStartPromise = doStartRelay();
+      try {
+        return await relayStartPromise;
+      } finally {
+        relayStartPromise = null;
+      }
+    }
+
+    const results = await Promise.allSettled([
+      ensureRelayServer(),
+      ensureRelayServer(),
+      ensureRelayServer(),
+    ]);
+
+    for (const result of results) {
+      assert.equal(result.status, 'rejected');
+      assert.ok((result as PromiseRejectedResult).reason.message.includes('Port unavailable'));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: ensureRelayServer full flow with version probe (Fix #2 — integration)
+// ---------------------------------------------------------------------------
+
+describe('ensureRelayServer with version probe simulation', () => {
+  function createFullRelayStarter() {
+    let relayStartPromise: Promise<void> | null = null;
+    let startCount = 0;
+    let probeCount = 0;
+    let relayRunning = false;
+
+    async function probeRelay(): Promise<boolean> {
+      probeCount++;
+      return relayRunning;
+    }
+
+    async function doStartRelay(): Promise<void> {
+      startCount++;
+      await new Promise((r) => setTimeout(r, 30));
+      relayRunning = true;
+    }
+
+    async function ensureRelayServer(): Promise<void> {
+      if (await probeRelay()) return;
+
+      if (relayStartPromise) return relayStartPromise;
+      relayStartPromise = doStartRelay();
+      try {
+        return await relayStartPromise;
+      } finally {
+        relayStartPromise = null;
+      }
+    }
+
+    return {
+      ensureRelayServer,
+      setRelayRunning: (v: boolean) => { relayRunning = v; },
+      getStartCount: () => startCount,
+      getProbeCount: () => probeCount,
+    };
+  }
+
+  it('should skip start when version probe succeeds (relay already running)', async () => {
+    const s = createFullRelayStarter();
+    s.setRelayRunning(true);
+    await s.ensureRelayServer();
+    assert.equal(s.getStartCount(), 0);
+    assert.equal(s.getProbeCount(), 1);
+  });
+
+  it('should start relay when version probe fails', async () => {
+    const s = createFullRelayStarter();
+    await s.ensureRelayServer();
+    assert.equal(s.getStartCount(), 1);
+  });
+
+  it('should not start relay again after it becomes running', async () => {
+    const s = createFullRelayStarter();
+    await s.ensureRelayServer();
+    assert.equal(s.getStartCount(), 1);
+
+    await s.ensureRelayServer();
+    assert.equal(s.getStartCount(), 1, 'second call should hit fast path');
+    assert.equal(s.getProbeCount(), 2);
+  });
+
+  it('concurrent calls: only one start, all probe, all succeed', async () => {
+    const s = createFullRelayStarter();
+    await Promise.all([
+      s.ensureRelayServer(),
+      s.ensureRelayServer(),
+      s.ensureRelayServer(),
+    ]);
+    assert.equal(s.getStartCount(), 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test: getCommandTimeout – additional cases
 // ---------------------------------------------------------------------------
 

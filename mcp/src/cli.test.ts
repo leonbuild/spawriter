@@ -201,3 +201,33 @@ describe('Command dispatch logic', () => {
     assert.equal(getDispatchAction('foo'), 'unknown-command');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Version banner suppression (Fix #5)
+// ---------------------------------------------------------------------------
+
+describe('Version banner suppression', () => {
+  function shouldPrintBanner(command: string | undefined): boolean {
+    return command !== 'serve' && command !== 'relay';
+  }
+
+  it('should suppress banner for "serve" command', () => {
+    assert.equal(shouldPrintBanner('serve'), false);
+  });
+
+  it('should suppress banner for "relay" command', () => {
+    assert.equal(shouldPrintBanner('relay'), false);
+  });
+
+  it('should print banner for unknown command', () => {
+    assert.equal(shouldPrintBanner('foo'), true);
+  });
+
+  it('should print banner when no command', () => {
+    assert.equal(shouldPrintBanner(undefined), true);
+  });
+
+  it('should print banner for --help (command is --help)', () => {
+    assert.equal(shouldPrintBanner('--help'), true);
+  });
+});
