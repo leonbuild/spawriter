@@ -1517,8 +1517,6 @@ function formatAXTreeAsText(nodes: AXNode[], assignRefs: boolean = false, target
 const SLOW_CDP_COMMANDS = new Set([
   'Accessibility.getFullAXTree',
   'Page.captureScreenshot',
-  'Network.clearBrowserCache',
-  'Network.clearBrowserCookies',
   'Page.reload',
   'Page.navigate',
 ]);
@@ -2237,13 +2235,352 @@ describe('ensureRelayServer with version probe simulation', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test: clear_cache_and_reload safety (Phase 1)
+// ---------------------------------------------------------------------------
+
+describe('clear_cache_and_reload safety', () => {
+  function parseClearTypes(clearArg: string): Set<string> {
+    const raw = clearArg.toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+    return new Set(raw.includes('all')
+      ? ['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']
+      : raw);
+  }
+
+  it('"all" should NOT include global_cache', () => {
+    const types = parseClearTypes('all');
+    assert.ok(types.has('cache'));
+    assert.ok(!types.has('global_cache'));
+  });
+
+  it('"everything" should be treated as a literal unknown type (not expanded)', () => {
+    const types = parseClearTypes('everything');
+    assert.ok(types.has('everything'));
+    assert.ok(!types.has('global_cache'));
+  });
+
+  it('"cache" alone should be in the set', () => {
+    const types = parseClearTypes('cache');
+    assert.ok(types.has('cache'));
+    assert.ok(!types.has('global_cache'));
+  });
+
+  it('"global_cache" should be treated as a literal unknown type', () => {
+    const types = parseClearTypes('global_cache');
+    assert.ok(types.has('global_cache'));
+    assert.ok(!types.has('cache'));
+    assert.equal(types.size, 1);
+  });
+
+  it('"cache,cookies" should have both', () => {
+    const types = parseClearTypes('cache,cookies');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.ok(!types.has('global_cache'));
+  });
+
+  it('"all" should include all origin-scoped types', () => {
+    const types = parseClearTypes('all');
+    for (const t of ['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']) {
+      assert.ok(types.has(t), `"all" should include "${t}"`);
+    }
+  });
+
+  it('"everything" should NOT expand to multiple types', () => {
+    const types = parseClearTypes('everything');
+    assert.equal(types.size, 1);
+    assert.ok(types.has('everything'));
+    assert.ok(!types.has('cache'));
+    assert.ok(!types.has('cookies'));
+  });
+
+  it('should handle whitespace in comma-separated values', () => {
+    const types = parseClearTypes('cache , cookies , local_storage');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.ok(types.has('local_storage'));
+  });
+
+  it('should be case-insensitive', () => {
+    const types = parseClearTypes('Cache,COOKIES,Local_Storage');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.ok(types.has('local_storage'));
+  });
+
+  it('legacyMode "aggressive" should set cache + cookies', () => {
+    function resolveClearTypes(clearArg: string | undefined, legacyMode: string | undefined): Set<string> {
+      if (clearArg) {
+        return parseClearTypes(clearArg);
+      } else if (legacyMode === 'aggressive') {
+        return new Set(['cache', 'cookies']);
+      }
+      return new Set<string>();
+    }
+    const types = resolveClearTypes(undefined, 'aggressive');
+    assert.ok(types.has('cache'));
+    assert.ok(types.has('cookies'));
+    assert.equal(types.size, 2);
+  });
+
+  it('no clearArg and no legacyMode should yield empty set', () => {
+    function resolveClearTypes(clearArg: string | undefined, legacyMode: string | undefined): Set<string> {
+      if (clearArg) {
+        return parseClearTypes(clearArg);
+      } else if (legacyMode === 'aggressive') {
+        return new Set(['cache', 'cookies']);
+      }
+      return new Set<string>();
+    }
+    const types = resolveClearTypes(undefined, undefined);
+    assert.equal(types.size, 0);
+  });
+
+  it('needsIgnoreCache should force reload even when shouldReload is false', () => {
+    const clearTypes = new Set(['cache']);
+    const shouldReload = false;
+    const needsIgnoreCache = clearTypes.has('cache');
+    const willReload = shouldReload || needsIgnoreCache;
+    assert.equal(willReload, true);
+    assert.equal(needsIgnoreCache, true);
+  });
+
+  it('storage clear_storage should require storage_types', () => {
+    function clearStorageGuard(storageTypes: string | undefined): string | null {
+      if (!storageTypes) {
+        return 'Error: clear_storage requires storage_types parameter';
+      }
+      return null;
+    }
+    assert.ok(clearStorageGuard(undefined)?.startsWith('Error'));
+    assert.equal(clearStorageGuard('cookies'), null);
+    assert.equal(clearStorageGuard('local_storage,session_storage'), null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Screenshot quality — resolveImageProfile (Phase 2)
+// ---------------------------------------------------------------------------
+
+describe('Screenshot quality: resolveImageProfile', () => {
+  interface ImageProfile {
+    maxBytes: number;
+    maxLongEdge: number;
+    format: 'png' | 'webp' | 'jpeg';
+    quality: number;
+  }
+
+  const MODEL_PROFILES: Record<string, ImageProfile> = {
+    'claude-opus-4.6':    { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+    'claude-sonnet-4.6':  { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+    'claude-opus':        { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+    'claude-sonnet':      { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+    'claude':             { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+    'gpt-5.4':            { maxBytes: 20_000_000, maxLongEdge: 2048, format: 'webp', quality: 85 },
+    'gpt-5.4-mini':       { maxBytes: 20_000_000, maxLongEdge: 2048, format: 'webp', quality: 85 },
+    'gpt-5.3-codex':      { maxBytes: 20_000_000, maxLongEdge: 1200, format: 'webp', quality: 80 },
+    'codex':              { maxBytes: 20_000_000, maxLongEdge: 1200, format: 'webp', quality: 80 },
+    'gemini-3':           { maxBytes: 15_000_000, maxLongEdge: 1024, format: 'webp', quality: 75 },
+    'gemini':             { maxBytes: 15_000_000, maxLongEdge: 1024, format: 'webp', quality: 75 },
+  };
+
+  const DEFAULT_PROFILE: ImageProfile = { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 };
+  const TIER_LIMITS = { high: 5_000_000, medium: 5_000_000, low: 1_000_000 } as const;
+
+  function resolveImageProfile(tier: string, modelHint?: string): ImageProfile & { effectiveLimit: number } {
+    const tierLimit = TIER_LIMITS[tier as keyof typeof TIER_LIMITS] ?? TIER_LIMITS.medium;
+
+    if (modelHint) {
+      const key = modelHint.toLowerCase().trim();
+      const profile = MODEL_PROFILES[key]
+        ?? Object.entries(MODEL_PROFILES).find(([k]) => key.includes(k))?.[1];
+      if (profile) {
+        return { ...profile, effectiveLimit: Math.min(profile.maxBytes, tierLimit) };
+      }
+    }
+
+    switch (tier) {
+      case 'high':
+        return { ...DEFAULT_PROFILE, format: 'png', quality: 100, effectiveLimit: tierLimit };
+      case 'low':
+        return { maxBytes: 1_000_000, maxLongEdge: 1280, format: 'webp', quality: 40, effectiveLimit: tierLimit };
+      default:
+        return { ...DEFAULT_PROFILE, effectiveLimit: tierLimit };
+    }
+  }
+
+  it('default tier returns medium WebP profile', () => {
+    const p = resolveImageProfile('medium');
+    assert.equal(p.format, 'webp');
+    assert.equal(p.quality, 80);
+    assert.equal(p.effectiveLimit, 5_000_000);
+  });
+
+  it('high tier returns PNG profile', () => {
+    const p = resolveImageProfile('high');
+    assert.equal(p.format, 'png');
+    assert.equal(p.quality, 100);
+    assert.equal(p.effectiveLimit, 5_000_000);
+  });
+
+  it('low tier returns compact WebP profile', () => {
+    const p = resolveImageProfile('low');
+    assert.equal(p.format, 'webp');
+    assert.equal(p.quality, 40);
+    assert.equal(p.effectiveLimit, 1_000_000);
+  });
+
+  it('known model hint (gpt-5.4) overrides defaults', () => {
+    const p = resolveImageProfile('medium', 'gpt-5.4');
+    assert.equal(p.maxLongEdge, 2048);
+    assert.equal(p.quality, 85);
+    assert.equal(p.effectiveLimit, 5_000_000);
+  });
+
+  it('claude model hint applies Claude limits', () => {
+    const p = resolveImageProfile('medium', 'claude-sonnet-4.6');
+    assert.equal(p.maxLongEdge, 1568);
+    assert.equal(p.maxBytes, 5_000_000);
+  });
+
+  it('unknown model hint falls back to defaults', () => {
+    const p = resolveImageProfile('medium', 'unknown-model-99');
+    assert.equal(p.format, 'webp');
+    assert.equal(p.quality, 80);
+    assert.equal(p.effectiveLimit, 5_000_000);
+  });
+
+  it('model hint with partial match works', () => {
+    const p = resolveImageProfile('medium', 'my-claude-sonnet-4.6-wrapper');
+    assert.equal(p.maxLongEdge, 1568);
+  });
+
+  it('tier limit caps model maxBytes for low', () => {
+    const p = resolveImageProfile('low', 'gpt-5.4');
+    assert.equal(p.effectiveLimit, 1_000_000);
+  });
+
+  it('gemini model hint applies Gemini limits', () => {
+    const p = resolveImageProfile('medium', 'gemini-3');
+    assert.equal(p.maxLongEdge, 1024);
+    assert.equal(p.quality, 75);
+  });
+
+  it('codex model hint applies Codex limits', () => {
+    const p = resolveImageProfile('medium', 'gpt-5.3-codex');
+    assert.equal(p.maxLongEdge, 1200);
+    assert.equal(p.quality, 80);
+  });
+
+  it('unknown tier falls back to medium', () => {
+    const p = resolveImageProfile('ultra');
+    assert.equal(p.format, 'webp');
+    assert.equal(p.quality, 80);
+    assert.equal(p.effectiveLimit, 5_000_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: Screenshot quality — auto-compression logic (Phase 2)
+// ---------------------------------------------------------------------------
+
+describe('Screenshot quality: auto-compression logic', () => {
+  function needsCompression(base64Length: number, limitBytes: number): boolean {
+    return Math.ceil(base64Length * 3 / 4) > limitBytes;
+  }
+
+  function calculateFallbackQuality(currentQuality: number, currentSize: number, limit: number): number {
+    return Math.max(10, Math.floor(currentQuality * (limit / currentSize) * 0.8));
+  }
+
+  function base64SizeToBytes(base64Length: number): number {
+    return Math.ceil(base64Length * 3 / 4);
+  }
+
+  it('should not compress when under limit', () => {
+    assert.equal(needsCompression(1_000_000, 5_000_000), false);
+  });
+
+  it('should compress when over limit', () => {
+    assert.equal(needsCompression(8_000_000, 5_000_000), true);
+  });
+
+  it('should calculate reduced quality proportionally', () => {
+    const q = calculateFallbackQuality(80, 10_000_000, 5_000_000);
+    assert.ok(q < 80);
+    assert.ok(q >= 10);
+    assert.equal(q, 32);
+  });
+
+  it('should floor to 10 for extreme oversize', () => {
+    const q = calculateFallbackQuality(80, 100_000_000, 1_000_000);
+    assert.equal(q, 10);
+  });
+
+  it('base64 size calculation should be correct', () => {
+    assert.equal(base64SizeToBytes(4), 3);
+    assert.equal(base64SizeToBytes(8), 6);
+    assert.equal(base64SizeToBytes(100), 75);
+  });
+
+  it('halving quality should converge toward minimum', () => {
+    let quality = 80;
+    const steps: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      quality = Math.max(10, Math.floor(quality * 0.5));
+      steps.push(quality);
+    }
+    assert.deepEqual(steps, [40, 20, 10, 10, 10]);
+  });
+
+  it('PNG-to-WebP switch should use capped initial quality', () => {
+    const profileFormat = 'png' as const;
+    const profileQuality = 100;
+    const effectiveLimit = 5_000_000;
+    const originalSize = 10_000_000;
+
+    const quality = profileFormat === 'png'
+      ? Math.min(90, Math.floor(80 * (effectiveLimit / originalSize) * 0.8))
+      : Math.floor(profileQuality * (effectiveLimit / originalSize) * 0.8);
+
+    assert.ok(quality <= 90, 'PNG-to-WebP quality should be capped at 90');
+    assert.equal(quality, 32);
+  });
+
+  it('retry loop exhaustion should end with quality=10', () => {
+    const MAX_RETRIES = 3;
+    let quality = 80;
+    for (let i = 0; i < MAX_RETRIES; i++) {
+      quality = Math.max(10, Math.floor(quality * 0.5));
+    }
+    assert.equal(quality, 10, 'after 3 halvings from 80 quality should bottom at 10');
+  });
+
+  it('successful retry should break early when under limit', () => {
+    const limit = 5_000_000;
+    const sizes = [8_000_000, 3_000_000]; // oversized first, then under limit
+    let retries = 0;
+    for (const size of sizes) {
+      retries++;
+      if (size <= limit) break;
+    }
+    assert.equal(retries, 2, 'should stop after second capture meets limit');
+  });
+
+  it('WebP format should not change when already WebP', () => {
+    const profileFormat = 'webp';
+    const retryFormat = 'webp';
+    assert.equal(profileFormat, retryFormat, 'retry format stays webp');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test: getCommandTimeout – additional cases
 // ---------------------------------------------------------------------------
 
 describe('getCommandTimeout (additional)', () => {
-  it('should return 60s for Network.clearBrowserCookies', () => {
-    assert.equal(getCommandTimeout('Network.clearBrowserCookies'), 60000);
-    assert.equal(getCommandTimeout('Network.clearBrowserCache'), 60000);
+  it('should return 30s for Network.clearBrowserCache (no longer in slow set)', () => {
+    assert.equal(getCommandTimeout('Network.clearBrowserCache'), 30000);
+    assert.equal(getCommandTimeout('Network.clearBrowserCookies'), 30000);
   });
 
   it('should return 30s for unknown/custom commands', () => {

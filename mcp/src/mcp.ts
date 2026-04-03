@@ -31,6 +31,105 @@ let cdpSession: CdpSession | null = null;
 let sessionPromise: Promise<CdpSession> | null = null;
 let preferredTargetId: string | null = null;
 
+interface ImageProfile {
+  maxBytes: number;
+  maxLongEdge: number;
+  format: 'png' | 'webp' | 'jpeg';
+  quality: number;
+}
+
+const MODEL_PROFILES: Record<string, ImageProfile> = {
+  'claude-opus-4.6':    { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+  'claude-sonnet-4.6':  { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+  'claude-opus':        { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+  'claude-sonnet':      { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+  'claude':             { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
+  'gpt-5.4':            { maxBytes: 20_000_000, maxLongEdge: 2048, format: 'webp', quality: 85 },
+  'gpt-5.4-mini':       { maxBytes: 20_000_000, maxLongEdge: 2048, format: 'webp', quality: 85 },
+  'gpt-5.3-codex':      { maxBytes: 20_000_000, maxLongEdge: 1200, format: 'webp', quality: 80 },
+  'codex':              { maxBytes: 20_000_000, maxLongEdge: 1200, format: 'webp', quality: 80 },
+  'gemini-3':           { maxBytes: 15_000_000, maxLongEdge: 1024, format: 'webp', quality: 75 },
+  'gemini':             { maxBytes: 15_000_000, maxLongEdge: 1024, format: 'webp', quality: 75 },
+};
+
+const DEFAULT_IMAGE_PROFILE: ImageProfile = { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 };
+
+const TIER_LIMITS = { high: 5_000_000, medium: 5_000_000, low: 1_000_000 } as const;
+
+function resolveImageProfile(tier: string, modelHint?: string): ImageProfile & { effectiveLimit: number } {
+  const tierLimit = TIER_LIMITS[tier as keyof typeof TIER_LIMITS] ?? TIER_LIMITS.medium;
+
+  if (modelHint) {
+    const key = modelHint.toLowerCase().trim();
+    const profile = MODEL_PROFILES[key]
+      ?? Object.entries(MODEL_PROFILES).find(([k]) => key.includes(k))?.[1];
+    if (profile) {
+      return { ...profile, effectiveLimit: Math.min(profile.maxBytes, tierLimit) };
+    }
+  }
+
+  switch (tier) {
+    case 'high':
+      return { ...DEFAULT_IMAGE_PROFILE, format: 'png', quality: 100, effectiveLimit: tierLimit };
+    case 'low':
+      return { maxBytes: 1_000_000, maxLongEdge: 1280, format: 'webp', quality: 40, effectiveLimit: tierLimit };
+    default:
+      return { ...DEFAULT_IMAGE_PROFILE, effectiveLimit: tierLimit };
+  }
+}
+
+const MAX_COMPRESS_RETRIES = 3;
+
+async function captureWithSizeGuarantee(
+  session: CdpSession,
+  profile: ImageProfile & { effectiveLimit: number },
+): Promise<{ data: string; mimeType: string; originalSize: number; finalSize: number; compressed: boolean }> {
+  const timeout = getCommandTimeout('Page.captureScreenshot');
+  const captureParams: Record<string, unknown> = { format: profile.format };
+  if (profile.format !== 'png') {
+    captureParams.quality = profile.quality;
+  }
+
+  let result = await sendCdpCommand(session, 'Page.captureScreenshot', captureParams, timeout) as { data: string };
+  const originalSize = Math.ceil(result.data.length * 3 / 4);
+
+  if (originalSize <= profile.effectiveLimit) {
+    return {
+      data: result.data,
+      mimeType: profile.format === 'png' ? 'image/png' : 'image/webp',
+      originalSize,
+      finalSize: originalSize,
+      compressed: false,
+    };
+  }
+
+  let quality = profile.format === 'png'
+    ? Math.min(90, Math.floor(80 * (profile.effectiveLimit / originalSize) * 0.8))
+    : Math.floor(profile.quality * (profile.effectiveLimit / originalSize) * 0.8);
+  quality = Math.max(10, quality);
+
+  for (let i = 0; i < MAX_COMPRESS_RETRIES; i++) {
+    result = await sendCdpCommand(session, 'Page.captureScreenshot',
+      { format: 'webp', quality, optimizeForSpeed: true }, timeout) as { data: string };
+    const size = Math.ceil(result.data.length * 3 / 4);
+
+    if (size <= profile.effectiveLimit) {
+      return { data: result.data, mimeType: 'image/webp', originalSize, finalSize: size, compressed: true };
+    }
+    quality = Math.max(10, Math.floor(quality * 0.5));
+  }
+
+  result = await sendCdpCommand(session, 'Page.captureScreenshot',
+    { format: 'webp', quality: 10, optimizeForSpeed: true }, timeout) as { data: string };
+  return {
+    data: result.data,
+    mimeType: 'image/webp',
+    originalSize,
+    finalSize: Math.ceil(result.data.length * 3 / 4),
+    compressed: true,
+  };
+}
+
 const MCP_CLIENT_ID = generateMcpClientId();
 const agentLabel = getAgentLabel();
 const projectUrl = getProjectUrl();
@@ -814,8 +913,6 @@ async function doEnsureSession(agentId?: string): Promise<CdpSession> {
 const SLOW_CDP_COMMANDS = new Set([
   'Accessibility.getFullAXTree',
   'Page.captureScreenshot',
-  'Network.clearBrowserCache',
-  'Network.clearBrowserCookies',
   'Page.reload',
   'Page.navigate',
 ]);
@@ -1192,11 +1289,23 @@ function mcpLog(level: 'debug' | 'info' | 'warning' | 'error', data: string): vo
 const tools = [
   {
     name: 'screenshot',
-    description: 'Take a screenshot of the current page. With labels=true, overlays numbered labels on interactive elements and returns their accessibility info.',
+    description: `Take a screenshot of the current page. Output is always ≤5MB (auto-compressed for LLM API compatibility).
+With labels=true, overlays numbered labels on interactive elements.
+quality: "high" (PNG, auto-downgrades if >5MB), "medium" (WebP q80, default), "low" (WebP <1MB).
+model: optional hint (e.g. "gpt-5.4") to optimize quality for your LLM's specific limits.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
         labels: { type: 'boolean', description: 'Overlay numbered labels on interactive elements (buttons, links, inputs, etc.)' },
+        quality: {
+          type: 'string',
+          enum: ['high', 'medium', 'low'],
+          description: 'Quality tier. Default: "medium". high=PNG lossless (auto-compressed if >5MB), medium=WebP q80, low=compact WebP <1MB',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional: LLM model name (e.g. "claude-sonnet-4.6", "gpt-5.4", "gpt-5.3-codex") for optimized quality/size targeting',
+        },
       },
     },
   },
@@ -1313,22 +1422,24 @@ For simple/fast JS in page context (DOM reads, API calls), use the 'execute' too
   },
   {
     name: 'clear_cache_and_reload',
-    description: `Clear browser cache/storage and optionally reload the page.
-Supports granular control over what to clear via the "clear" parameter.
-Legacy "mode" parameter still works for backward compatibility.`,
+    description: `Clear cache/storage for the current tab/origin and optionally reload. All operations are tab/origin-scoped — never affects other tabs.
+"cache" bypasses HTTP cache via ignoreCache reload (current tab only). "cookies" deletes only cookies matching the current origin.
+"local_storage", "session_storage", "cache_storage", "indexeddb", "service_workers" cleared via Storage.clearDataForOrigin.
+"all" = cache + cookies + local_storage + session_storage + cache_storage + indexeddb + service_workers.
+Note: "cache" forces a reload even if reload=false, since cache bypass requires it.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
         clear: {
           type: 'string',
-          description: 'Comma-separated types to clear: cache, cookies, local_storage, session_storage, cache_storage, indexeddb, service_workers, all. Default: "cache"',
+          description: 'Comma-separated: cache, cookies, local_storage, session_storage, cache_storage, indexeddb, service_workers, all. All are tab/origin-scoped.',
         },
         origin: {
           type: 'string',
-          description: 'Scope storage/cookie clearing to this origin (e.g. "https://cursor.com"). Default: current page origin. Does not affect "cache" (always global).',
+          description: 'Scope storage/cookie clearing to this origin. Default: current page origin.',
         },
-        reload: { type: 'boolean', description: 'Whether to reload the page after clearing. Default: true' },
-        mode: { type: 'string', enum: ['light', 'aggressive'], description: '(Deprecated) Legacy mode. "light" = reload only, "aggressive" = clear cache (global) + cookies (current page origin only, not all browser cookies) + reload. Prefer "clear" parameter for granular control. Overridden by "clear" if both are provided.' },
+        reload: { type: 'boolean', description: 'Reload page after clearing. Default: true. Note: if "cache" is specified, reload is forced regardless.' },
+        mode: { type: 'string', enum: ['light', 'aggressive'], description: '(Deprecated) Use "clear" parameter instead.' },
       },
     },
   },
@@ -1471,7 +1582,8 @@ Actions: enable, set_breakpoint, remove_breakpoint, list_breakpoints, resume, st
   {
     name: 'storage',
     description: `Manage browser storage: cookies, localStorage, sessionStorage, cache.
-Actions: get_cookies, set_cookie, delete_cookie, get_local_storage, set_local_storage, remove_local_storage, get_session_storage, clear_storage, get_storage_usage.`,
+Actions: get_cookies, set_cookie, delete_cookie, get_local_storage, set_local_storage, remove_local_storage, get_session_storage, clear_storage, get_storage_usage.
+clear_storage requires explicit storage_types parameter to prevent accidental full wipe.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1491,7 +1603,7 @@ Actions: get_cookies, set_cookie, delete_cookie, get_local_storage, set_local_st
         sameSite: { type: 'string', enum: ['Strict', 'Lax', 'None'], description: 'Cookie sameSite attribute' },
         expires: { type: 'number', description: 'Cookie expiry (Unix timestamp)' },
         origin: { type: 'string', description: 'Origin for clear/usage operations' },
-        storage_types: { type: 'string', description: 'Comma-separated types to clear: cookies,local_storage,session_storage,cache_storage,indexeddb,service_workers' },
+        storage_types: { type: 'string', description: 'REQUIRED for clear_storage. Comma-separated: cookies,local_storage,session_storage,cache_storage,indexeddb,service_workers' },
       },
       required: ['action'],
     },
@@ -2044,10 +2156,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case 'screenshot': {
         const withLabels = args.labels as boolean | undefined;
+        const tier = (args.quality as string) || 'medium';
+        const modelHint = args.model as string | undefined;
+        const profile = resolveImageProfile(tier, modelHint);
 
         if (!withLabels) {
-          const result = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot')) as { data: string };
-          return { content: [{ type: 'image', data: result.data, mimeType: 'image/png' }] };
+          const capture = await captureWithSizeGuarantee(session, profile);
+          return {
+            content: [
+              { type: 'image', data: capture.data, mimeType: capture.mimeType },
+              ...(capture.compressed ? [{ type: 'text' as const, text: `Screenshot auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit (${(capture.originalSize / 1024).toFixed(0)}KB → ${(capture.finalSize / 1024).toFixed(0)}KB)` }] : []),
+            ],
+          };
         }
 
         await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
@@ -2078,7 +2198,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await evaluateJs(session, buildLabelInjectionScript(labelPositions));
         }
 
-        const screenshotResult = await sendCdpCommand(session, 'Page.captureScreenshot', { format: 'png' }, getCommandTimeout('Page.captureScreenshot')) as { data: string };
+        const capture = await captureWithSizeGuarantee(session, profile);
 
         if (labelPositions.length > 0) {
           await evaluateJs(session, REMOVE_LABELS_SCRIPT).catch(() => {});
@@ -2087,8 +2207,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const legend = formatLabelLegend(interactive);
         return {
           content: [
-            { type: 'image', data: screenshotResult.data, mimeType: 'image/png' },
+            { type: 'image', data: capture.data, mimeType: capture.mimeType },
             { type: 'text', text: legend },
+            ...(capture.compressed ? [{ type: 'text' as const, text: `(auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit)` }] : []),
           ],
         };
       }
@@ -2192,10 +2313,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
         const cleared: string[] = [];
+        let needsIgnoreCache = false;
 
         if (clearTypes.has('cache')) {
-          await sendCdpCommand(session, 'Network.clearBrowserCache', undefined, getCommandTimeout('Network.clearBrowserCache'));
-          cleared.push('cache (global)');
+          needsIgnoreCache = true;
+          cleared.push('cache (per-tab bypass via ignoreCache reload)');
         }
         if (clearTypes.has('cookies')) {
           const cookieResult = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<{ name: string; domain: string }> };
@@ -2224,13 +2346,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           cleared.push(`${storageTypeParts.join(', ')} (${origin})`);
         }
 
-        if (shouldReload) {
-          await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+        if (shouldReload || needsIgnoreCache) {
+          await sendCdpCommand(session, 'Page.reload', { ignoreCache: needsIgnoreCache }, getCommandTimeout('Page.reload'));
           await sleep(2000);
-          cleared.push('page reloaded');
+          cleared.push(needsIgnoreCache ? 'page reloaded (cache bypassed for this tab)' : 'page reloaded');
         }
 
-        const summary = cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'Page reloaded (no storage cleared)';
+        const summary = cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'No storage cleared';
         return {
           content: [{ type: 'text', text: summary }],
         };
@@ -2649,7 +2771,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           case 'clear_storage': {
             const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
-            const types = (args.storage_types as string) || 'all';
+            const types = args.storage_types as string;
+            if (!types) {
+              return { content: [{ type: 'text', text: 'Error: clear_storage requires storage_types parameter (e.g. "cookies,local_storage,session_storage"). This prevents accidental clearing of all storage.' }] };
+            }
             await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: types });
             return { content: [{ type: 'text', text: `Storage cleared for ${origin} (types: ${types}).` }] };
           }

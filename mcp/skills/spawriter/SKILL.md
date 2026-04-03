@@ -63,8 +63,8 @@ Before using any spawriter tool, ensure the browser is connected. If a tool call
 
 After modifying UI code, **always** run this sequence automatically:
 
-1. `ensure_fresh_render` (or `clear_cache_and_reload` if cache might be stale)
-2. `screenshot` — capture the result
+1. `ensure_fresh_render` (or `clear_cache_and_reload { clear: "cache" }` if you need to clear more than just cache)
+2. `screenshot` — capture the result (auto-compressed for LLMs; use `quality: "high"` for pixel-perfect comparison)
 3. Compare with expectations; if wrong: `console_logs` + `network_log` to diagnose
 4. Report the visual result to the user
 
@@ -255,3 +255,4 @@ trace { action: "stop" }    → stop and return all events
 - Keep operations incremental and verify with screenshot between major actions.
 - For project development tasks, do not assume your code change is active until `dashboard_state` confirms localhost override is effective.
 - Mock rules persist until disabled — always clean up with `network_intercept { action: "disable" }` or `reset` after mock testing.
+- All clearing operations are tab/origin-scoped. `clear_cache_and_reload` never affects other tabs or origins. There is no global cache clearing option.

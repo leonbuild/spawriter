@@ -19,7 +19,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 | Tool | Description | Key Args |
 |------|-------------|----------|
 | `dashboard_state` | Get single-spa app list, statuses, active import-map-overrides | `appName?` |
-| `screenshot` | Capture page screenshot, optionally with numbered labels on interactive elements | `labels?` (boolean) |
+| `screenshot` | Capture page screenshot, optionally with numbered labels on interactive elements. Auto-compressed to stay under LLM size limits. | `labels?` (boolean), `quality?` (high/medium/low), `model?` (LLM hint) |
 | `accessibility_snapshot` | Get condensed accessibility tree with search, diff, and interactive_only support. Returns @ref numbers on interactive elements. | `search?`, `diff?`, `interactive_only?` |
 | `execute` | Run JS in page context (fast, lightweight, direct CDP) | `code` |
 | `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API — supports click, hover, fill, drag, keyboard, scroll, tap, wait, and all locator strategies. All actions trigger real browser input events (CSS :hover/:focus work correctly) | `code`, `timeout?` |
@@ -74,7 +74,7 @@ You have access to **spawriter** MCP tools that control the user's real Chrome t
 |------|-------------|----------|
 | `navigate` | Navigate the attached tab to a URL | `url` |
 | `ensure_fresh_render` | Reload page with fresh cache | — |
-| `clear_cache_and_reload` | Granular cache/storage reset + reload. Cookies are always scoped to current page origin (never clears other sites' cookies). | `clear?` (comma-separated types), `origin?`, `reload?` (boolean), `mode?` (deprecated) |
+| `clear_cache_and_reload` | Clear cache/storage for current tab/origin + reload. All operations are tab-scoped — never affects other tabs. | `clear?` (comma-separated types), `origin?`, `reload?` (boolean) |
 
 ### Import-Map Override Management
 
@@ -195,12 +195,14 @@ When you encounter an unfamiliar page or the user asks about page state:
 ### 1. Understand current state first
 
 ```
-dashboard_state           →  see all apps, their statuses, active overrides
-screenshot                →  confirm the visible UI
-screenshot { labels: true } → labeled screenshot showing interactive elements
-accessibility_snapshot    →  get page structure as text
-console_logs              →  check for errors
-network_log               →  verify API calls
+dashboard_state                   →  see all apps, their statuses, active overrides
+screenshot                        →  confirm the visible UI (default: medium quality, auto-compressed)
+screenshot { quality: "high" }    →  maximum fidelity PNG (for visual comparison)
+screenshot { quality: "low" }     →  compact for bandwidth-constrained contexts
+screenshot { labels: true }       →  labeled screenshot showing interactive elements
+accessibility_snapshot            →  get page structure as text
+console_logs                      →  check for errors
+network_log                       →  verify API calls
 ```
 
 ### 2. Set up overrides for local development
@@ -841,7 +843,7 @@ connect_tab { url: "example.com", create: true, session_id: "finetune-debug" }
 5. **Use incremental operations** — prefer targeted `override_app` over broad `reset_all`.
 6. **Handle page reloads gracefully** — after `clear_cache_and_reload` or `ensure_fresh_render`, wait before querying state.
 7. **Parallel calls are safe** — `dashboard_state` + `screenshot` can run concurrently without timeout issues.
-8. **Cookie clearing is origin-scoped** — `clear_cache_and_reload` only removes cookies for the current page's origin. Other sites' cookies are never affected, even with `mode: "aggressive"`.
+8. **All clearing is tab/origin-scoped** — `clear_cache_and_reload` never affects other tabs or origins. Cache bypass is per-tab (via ignoreCache reload), cookie deletion is per-origin, storage clearing is per-origin. There is no global cache clearing option.
 9. **Mock rules persist until disabled** — always call `network_intercept { action: "disable" }` or `reset` when done with mock testing, so real API traffic is not silently intercepted.
 
 ## Troubleshooting
