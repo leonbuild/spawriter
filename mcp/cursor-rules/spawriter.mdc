@@ -8,862 +8,113 @@ alwaysApply: false
 
 # spawriter MCP Tools
 
-You have access to **spawriter** MCP tools that control the user's real Chrome tab via CDP (Chrome DevTools Protocol). This is NOT a headless browser — all actions affect the user's visible browser.
+Controls the user's **real Chrome tab** via CDP. Not headless — all actions affect the visible browser.
 
-**You should proactively use these tools whenever browser context would improve your work.** Do not wait for the user to explicitly ask you to look at the page — if seeing the page would help you give a better answer or verify your work, just do it. Especially when you are given an URL. 
+**Proactively use these tools whenever browser context would improve your work.** Don't wait to be asked — if seeing the page helps, just do it. Tool parameters are self-documented via MCP tool definitions; this file covers behavioral guidance and non-obvious details.
 
-## Available Tools (30)
+## Tool Catalog (30 tools)
 
-### Inspection & State
+**Inspect:** `screenshot` (labels?, quality?), `accessibility_snapshot` (search?, diff?, interactive_only?), `dashboard_state`, `console_logs`, `network_log`, `network_detail`, `page_content` (get_html/get_text/get_metadata/search_dom), `css_inspect`, `trace`
+**Interact:** `execute` (JS in page), `playwright_execute` (Playwright VM), `interact` (@ref actions), `navigate`, `ensure_fresh_render`, `clear_cache_and_reload` (clear: cache,cookies,local_storage,session_storage,cache_storage,indexeddb,service_workers,all)
+**Debug:** `debugger` (breakpoints/stepping/eval), `editor` (view/edit live JS/CSS sources with hot-reload)
+**Network:** `network_intercept` (mock/block requests), `browser_fetch` (HTTP with user's cookies/session)
+**State:** `storage` (cookies/localStorage/sessionStorage/cache), `emulation` (device/network/geo/timezone/media), `performance` (metrics/vitals/memory/resources)
+**Single-spa:** `override_app` (import-map overrides), `app_action` (mount/unmount/unload)
+**Tabs:** `list_tabs`, `switch_tab`, `connect_tab`, `release_tab`
+**Session:** `session_manager` (Playwright VM sessions), `reset` (full reconnect)
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `dashboard_state` | Get single-spa app list, statuses, active import-map-overrides | `appName?` |
-| `screenshot` | Capture page screenshot, optionally with numbered labels on interactive elements. Auto-compressed to stay under LLM size limits. | `labels?` (boolean), `quality?` (high/medium/low), `model?` (LLM hint) |
-| `accessibility_snapshot` | Get condensed accessibility tree with search, diff, and interactive_only support. Returns @ref numbers on interactive elements. | `search?`, `diff?`, `interactive_only?` |
-| `execute` | Run JS in page context (fast, lightweight, direct CDP) | `code` |
-| `playwright_execute` | Run code in Node.js VM sandbox with full Playwright API — supports click, hover, fill, drag, keyboard, scroll, tap, wait, and all locator strategies. All actions trigger real browser input events (CSS :hover/:focus work correctly) | `code`, `timeout?` |
-| `interact` | Interact with a page element by @ref number from accessibility_snapshot. Lightweight alternative to playwright_execute for single-step actions (click, hover, fill, focus, check, uncheck, select). | `ref`, `action`, `value?` |
-| `console_logs` | Get captured browser console logs with filtering | `count?`, `level?`, `search?`, `clear?` |
-| `network_log` | Get captured network requests with filtering | `count?`, `url_filter?`, `status_filter?`, `clear?` |
-| `network_detail` | Get full details of a specific request: headers, request/response body | `requestId`, `include?`, `max_body_size?` |
-| `browser_fetch` | Make HTTP requests in the browser context with the user's cookies and session | `url`, `method?`, `headers?`, `body?`, `max_body_size?` |
-| `trace` | Record user interactions on the page (clicks, typing, scrolling) | `action` (start/stop/status) |
+## Connection Protocol
 
-### Debugging & CSS
+1. On first use, determine a `session_id` (use agent transcript UUID if available, otherwise generate one). Pass it on `connect_tab`, `list_tabs`, `switch_tab`, `release_tab`.
+2. Proactively call `connect_tab { url: "target-url", create: true, session_id: "..." }` when you anticipate needing browser access.
+3. On connection error: retry `connect_tab` → `reset` + retry → ask user to check Chrome/extension/relay.
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `debugger` | Control JavaScript debugger: breakpoints, stepping, variable inspection | `action` (12 actions), `file?`, `line?`, `condition?`, `expression?`, etc. |
-| `css_inspect` | Get computed CSS styles for an element by selector | `selector`, `properties?` (comma-separated) |
-| `editor` | View and edit page JS/CSS sources in real-time (hot-reload) | `action` (7 actions), `scriptId?`, `styleSheetId?`, `search?`, `content?`, `line_start?`, `line_end?` |
+## When to Proactively Use the Browser
 
-### Storage & State
+| Situation | Action |
+|-----------|--------|
+| User shares a URL | `navigate` → `screenshot` + `accessibility_snapshot` |
+| UI problem reported | `screenshot` + `console_logs { level: "error" }` + `network_log { status_filter: "error" }` |
+| After code changes to UI | `ensure_fresh_render` → `screenshot` → verify visually |
+| "How does X look?" | `screenshot { labels: true }` + `accessibility_snapshot` |
+| Implementing UI feature | Screenshot before AND after each significant change |
+| Debugging API issue | `network_log` → `network_detail { requestId }` for full request/response |
+| Design reference needed | `navigate` to reference → `screenshot` → navigate back → implement |
+| Exploring unfamiliar page | `dashboard_state` + `screenshot { labels: true }` + `accessibility_snapshot` |
+| Override set/changed | `dashboard_state` + `ensure_fresh_render` + `screenshot` to confirm |
+| "It doesn't work" | `screenshot` immediately — look, don't ask |
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `storage` | Manage cookies, localStorage, sessionStorage, cache | `action` (9 actions), `key?`, `value?`, `name?`, `domain?`, `origin?`, `storage_types?` |
+**Never say "please check it" without checking yourself first.**
 
-### Performance
+### Verification-After-Changes Protocol
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `performance` | Runtime metrics, Web Vitals, memory, resource timing | `action` (4 actions), `count?`, `type_filter?` |
+After any UI code change, automatically:
+1. `ensure_fresh_render` (or `clear_cache_and_reload` if cache may be stale)
+2. `screenshot` — capture result
+3. Compare with expectations
+4. If wrong: `console_logs { level: "error" }` + `network_log { status_filter: "error" }`
+5. Report what you see to the user
 
-### Network
+### When NOT to Use Browser
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `network_intercept` | Intercept/mock/block network requests (Fetch domain) | `action` (5 actions), `url_pattern?`, `mock_status?`, `mock_body?`, `block?` |
+- Pure backend/algorithmic changes
+- User explicitly opts out
+- Config edits with no rendering impact
 
-### Emulation
+## Key Tool Usage Notes
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `emulation` | Device, network, geolocation, timezone, media feature emulation | `action` (8 actions), `width?`, `height?`, `preset?`, `features?`, etc. |
+### execute vs playwright_execute
+- `execute`: fast JS eval in page context (DOM reads, API calls). No real input events.
+- `playwright_execute`: full Playwright API in Node VM sandbox. Real browser input events (`:hover`/`:focus` work). Use for clicks, form fills, keyboard, drag, waiting. Globals: `page`, `context`, `state` (persistent across calls).
+- `state` object persists across `playwright_execute` calls AND tab switches — use it to store data between navigations.
+- File downloads work: relay bridges `Browser.setDownloadBehavior` to per-page scope. Use `page.waitForEvent('download')`.
+- Cookie reads: use `Network.getCookies` via CDP, NOT `Storage.getCookies` (fails in extension relay mode).
 
-### Page Content
+### interact
+After `accessibility_snapshot`, use `interact { ref, action, value? }` for quick single-step actions (click, hover, fill, focus, check, uncheck, select) by @ref number.
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `page_content` | Get clean HTML, text, metadata, or search the DOM | `action` (4 actions), `selector?`, `search?`, `max_length?` |
+### Single-spa Specific Tools
 
-### Navigation & Refresh
+**`dashboard_state`** — Get app list, statuses, active import-map-overrides. Always check this first on single-spa pages.
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `navigate` | Navigate the attached tab to a URL | `url` |
-| `ensure_fresh_render` | Reload page with fresh cache | — |
-| `clear_cache_and_reload` | Clear cache/storage for current tab/origin + reload. All operations are tab-scoped — never affects other tabs. | `clear?` (comma-separated types), `origin?`, `reload?` (boolean) |
+**`override_app`** — Manage import-map-overrides:
+- `set` (appName, url) — point app to localhost
+- `remove` / `enable` / `disable` (appName) — toggle overrides
+- `reset_all` — clear all overrides
+- Extension panel auto-syncs within ~3s
 
-### Import-Map Override Management
+**`app_action`** — Force `mount`/`unmount`/`unload` a single-spa app.
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `override_app` | Manage import-map-overrides | `action`: `set` / `remove` / `enable` / `disable` / `reset_all`; `appName`; `url` (for set) |
+### Network Mocking
 
-### App Lifecycle Control
+Use `network_intercept` to mock APIs without a backend:
+1. `enable` → `add_rule { url_pattern, mock_status, mock_body }` → test → `disable`
+2. Use `block: true` to simulate offline/loading states
+3. **Always `disable` when done** — rules persist until explicitly removed
 
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `app_action` | Control single-spa app lifecycle | `action`: `mount` / `unmount` / `unload`; `appName` |
+### Multi-Tab
 
-### Tab Management
-
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `list_tabs` | List all attached Chrome tabs with lease ownership status (MINE, LEASED by X, AVAILABLE), session IDs, titles, URLs | `session_id?` |
-| `switch_tab` | Switch CDP session to a different attached Chrome tab (lease-aware: rejects if leased by another agent) | `targetId`, `session_id?` |
-| `connect_tab` | Programmatically attach a Chrome tab by URL match, tab ID, or create a new tab | `url?`, `tabId?`, `create?`, `session_id?` |
-| `release_tab` | Release your lease on a tab, making it available to other agents | `targetId?`, `session_id?` |
-
-### Session & Connection
-
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `session_manager` | Manage multiple Playwright executor sessions | `action`: `list` / `create` / `switch` / `remove` / `remove_all`; `sessionId?` |
-| `reset` | Release all tab leases, reset CDP + Playwright connections, clear all logs/network/debugger/sessions | — |
-
----
-
-## Session Identification for Tab Isolation
-
-When multiple Cursor chat sessions share the same MCP server process, each session must identify itself to prevent cross-session tab access. On your **first spawriter tool call** in a conversation, determine your `session_id`:
-
-1. If your system prompt contains an agent transcript path like `.../agent-transcripts/{UUID}/{UUID}.jsonl`, use that UUID as your `session_id`
-2. Otherwise, generate a short stable identifier from the conversation context (e.g., task name, first 8 chars of a hash, or any session-specific value)
-
-Then pass `session_id` on **every** `connect_tab`, `list_tabs`, `switch_tab`, and `release_tab` call. This ensures your tab leases are isolated from other chat sessions.
-
-## Connection Awareness
-
-Before using any spawriter tool, you must have an active browser connection. If a tool call fails with a connection error or timeout:
-
-1. **First try zero-touch connection** — `connect_tab { url: "your-target-url", create: true, session_id: "your-id" }` to auto-create and attach a tab.
-2. If that fails, call `reset` to re-establish the connection, then retry `connect_tab`.
-3. Only if that also fails, ask the user to ensure: Chrome is open, the extension is loaded, and the MCP relay is running (`node dist/cli.js serve`).
-
-**Proactively use `connect_tab`** when you anticipate needing browser access — don't wait until a tool call fails or ask the user to manually attach tabs. For example, if the user asks you to fix a UI bug, immediately try `connect_tab { url: "their-url", create: true }` before diving into code.
-
----
-
-## Proactive Browser Engagement
-
-**This is the most important section.** You MUST actively use spawriter tools in these situations — do NOT wait for the user to ask:
-
-### When to proactively use the browser
-
-| Situation | What to do | Why |
-|-----------|-----------|-----|
-| **User shares a URL or mentions a page** | `navigate` to the URL, then `screenshot` + `accessibility_snapshot` | Understand what the user is seeing before responding |
-| **User describes a UI problem** | `screenshot` + `console_logs { level: "error" }` + `network_log { status_filter: "error" }` | Get real visual + runtime evidence instead of guessing from code alone |
-| **You need a design/layout reference** | `navigate` to the reference URL, `screenshot`, study the layout, then come back | Ground your implementation in real visual context |
-| **You just made code changes (CSS, HTML, JS, Vue, React, etc.)** | `ensure_fresh_render` → `screenshot` → compare with before | **Always verify your changes visually** — never assume they look correct |
-| **User asks "how does X look?"** or **"what's on the page?"** | `screenshot { labels: true }` + `accessibility_snapshot` | Give a concrete answer based on what's actually rendered |
-| **You're implementing a UI feature** | Screenshot the current state **before** starting, then screenshot **after** each significant change | Maintain visual awareness throughout the implementation |
-| **User mentions an error or unexpected behavior** | `console_logs` + `network_log` + `screenshot` | Gather all runtime evidence in one shot |
-| **You're debugging an API issue** | `network_log` → find the request → `network_detail` for headers + body | See the actual request/response, not just the code that sends it |
-| **User asks to match a design or another site** | `navigate` to the reference, `screenshot`, analyze, then navigate back and compare | Visual side-by-side is far more reliable than verbal description |
-| **You're exploring an unfamiliar page/app** | `dashboard_state` + `screenshot { labels: true }` + `accessibility_snapshot` | Build a mental model of the page structure and available interactions |
-| **You need a browser tab but none is attached** | `connect_tab { url: "about:blank", create: true }` then `navigate` to your target URL | Zero-touch — agents should never ask users to manually attach tabs |
-| **After setting up or changing an override** | `dashboard_state` + `ensure_fresh_render` + `screenshot` | Confirm the override actually took effect |
-| **User says "it doesn't work" or "it looks wrong"** | `screenshot` immediately — see what they see | Don't ask the user to describe it; look at it yourself |
-
-### Verification-after-changes protocol
-
-Whenever you modify code that affects the UI, follow this sequence **automatically**:
-
-1. `ensure_fresh_render` or `clear_cache_and_reload` (if cache might be stale)
-2. `screenshot` — capture the result
-3. Compare with your expectations
-4. If something looks wrong: `console_logs { level: "error" }` + `network_log { status_filter: "error" }` to diagnose
-5. Report the visual result to the user ("Here's how it looks now — [describe what you see]")
-
-**Never tell the user "I've made the change, please check it" without checking it yourself first.**
-
-### Reference-gathering protocol
-
-When you need visual context (e.g., user says "make it look like X", or you want to see how a component library renders):
-
-1. `navigate { url: "..." }` — go to the reference page
-2. `screenshot` — capture the visual
-3. `accessibility_snapshot` or `page_content { action: "get_html", selector: "..." }` — understand the structure
-4. Navigate back to the working page
-5. Use what you learned to inform your implementation
-
-### Exploration protocol
-
-When you encounter an unfamiliar page or the user asks about page state:
-
-1. `dashboard_state` — understand app-level structure (single-spa apps, overrides)
-2. `screenshot { labels: true }` — see all interactive elements with numbered labels
-3. `accessibility_snapshot` — get the semantic structure
-4. `page_content { action: "get_metadata" }` — understand page identity
-5. If needed: `execute { code: "..." }` to query specific DOM state
-
-### When NOT to use the browser
-
-- Pure backend/algorithmic code changes with no UI impact
-- User explicitly says they don't want browser interaction
-- Configuration file edits that don't affect rendering
-- When the user hasn't set up spawriter yet and the task doesn't require it
-
----
-
-## Recommended Workflow
-
-### 1. Understand current state first
-
-```
-dashboard_state                   →  see all apps, their statuses, active overrides
-screenshot                        →  confirm the visible UI (default: medium quality, auto-compressed)
-screenshot { quality: "high" }    →  maximum fidelity PNG (for visual comparison)
-screenshot { quality: "low" }     →  compact for bandwidth-constrained contexts
-screenshot { labels: true }       →  labeled screenshot showing interactive elements
-accessibility_snapshot            →  get page structure as text
-console_logs                      →  check for errors
-network_log                       →  verify API calls
-```
-
-### 2. Set up overrides for local development
-
-```
-override_app { action: "set", appName: "@cnic/main", url: "http://localhost:9100/app.js" }
-```
-
-After setting an override, the extension panel will auto-sync within ~3 seconds.
-
-### 3. Verify changes are effective
-
-```
-dashboard_state  →  confirm overrideUrl shows your localhost URL
-screenshot       →  confirm the UI reflects your local code
-```
-
-### 4. Browser interactions with Playwright
-
-`playwright_execute` gives you the **full Playwright API** — every action triggers real browser input events via CDP (not synthetic JS events). This means CSS `:hover`, `:focus`, `:active` pseudo-classes all work correctly.
-
-Use `playwright_execute` for: any interaction that needs real input events, auto-waiting, or Playwright locators.
-Use `execute` for: quick JS evaluation in page context, reading DOM values, calling page APIs (no real input events).
-
-#### Mouse actions
-
-```
-playwright_execute { code: "await page.getByRole('button').click()" }
-playwright_execute { code: "await page.getByText('Item').dblclick()" }
-playwright_execute { code: "await page.getByText('Item').click({ button: 'right' })" }
-playwright_execute { code: "await page.getByText('Item').click({ modifiers: ['Shift'] })" }
-playwright_execute { code: "await page.getByText('Item').hover()" }
-playwright_execute { code: "await page.getByText('Item').click({ position: { x: 0, y: 0 } })" }
-playwright_execute { code: "await page.locator('#source').dragTo(page.locator('#target'))" }
-```
-
-#### Hover + verify tooltip/dropdown/menu
-
-```
-playwright_execute { code: "await page.hover('.menu-trigger'); await page.waitForSelector('.dropdown-menu', { state: 'visible' })" }
-playwright_execute { code: "await page.getByRole('link').hover(); await page.waitForSelector('.tooltip', { state: 'visible' })" }
-```
-
-#### Form interactions
-
-```
-playwright_execute { code: "await page.getByRole('textbox').fill('Hello')" }
-playwright_execute { code: "await page.getByRole('textbox').clear()" }
-playwright_execute { code: "await page.getByLabel('I agree').check()" }
-playwright_execute { code: "await page.getByLabel('I agree').uncheck()" }
-playwright_execute { code: "await page.getByLabel('Color').selectOption('blue')" }
-playwright_execute { code: "await page.getByLabel('Color').selectOption({ label: 'Blue' })" }
-playwright_execute { code: "await page.getByLabel('Upload').setInputFiles('/path/to/file.pdf')" }
-playwright_execute { code: "state.formData = await page.getByRole('textbox').inputValue()" }
-```
-
-#### Keyboard actions
-
-```
-playwright_execute { code: "await page.getByText('Submit').press('Enter')" }
-playwright_execute { code: "await page.getByRole('textbox').press('Control+ArrowRight')" }
-playwright_execute { code: "await page.keyboard.type('Hello World!')" }
-playwright_execute { code: "await page.keyboard.press('ControlOrMeta+A')" }
-playwright_execute { code: "await page.locator('#area').pressSequentially('Hello', { delay: 100 })" }
-```
-
-#### Low-level mouse control
-
-```
-playwright_execute { code: "await page.mouse.move(100, 200)" }
-playwright_execute { code: "await page.mouse.down()" }
-playwright_execute { code: "await page.mouse.move(200, 300)" }
-playwright_execute { code: "await page.mouse.up()" }
-playwright_execute { code: "await page.mouse.wheel(0, 500)" }
-```
-
-#### Manual drag-and-drop via mouse
-
-```
-playwright_execute { code: "await page.locator('#drag-source').hover(); await page.mouse.down(); await page.locator('#drop-target').hover(); await page.mouse.up();" }
-```
-
-#### Touch (tap)
-
-Requires `hasTouch` browser context. Use for mobile-emulated interactions:
-
-```
-playwright_execute { code: "await page.tap('.mobile-menu-btn')" }
-playwright_execute { code: "await page.touchscreen.tap(200, 300)" }
-```
-
-#### Dispatch synthetic events
-
-For custom events or events not covered by built-in actions:
-
-```
-playwright_execute { code: "await page.locator('#btn').dispatchEvent('click')" }
-playwright_execute { code: "const dt = await page.evaluateHandle(() => new DataTransfer()); await page.locator('#src').dispatchEvent('dragstart', { dataTransfer: dt })" }
-```
-
-#### Focus & scroll
-
-```
-playwright_execute { code: "await page.getByLabel('Password').focus()" }
-playwright_execute { code: "await page.getByRole('button').blur()" }
-playwright_execute { code: "await page.getByText('Footer').scrollIntoViewIfNeeded()" }
-playwright_execute { code: "await page.getByTestId('container').hover(); await page.mouse.wheel(0, 300)" }
-```
-
-#### Locator strategies
-
-```
-playwright_execute { code: "await page.getByRole('button', { name: 'Submit' }).click()" }
-playwright_execute { code: "await page.getByText('Sign up').click()" }
-playwright_execute { code: "await page.getByLabel('Email').fill('test@example.com')" }
-playwright_execute { code: "await page.getByPlaceholder('Search...').fill('query')" }
-playwright_execute { code: "await page.getByTestId('submit-btn').click()" }
-playwright_execute { code: "await page.getByAltText('Logo').click()" }
-playwright_execute { code: "await page.getByTitle('Close').click()" }
-playwright_execute { code: "await page.locator('css=.my-class >> text=Click me').click()" }
-playwright_execute { code: "await page.frameLocator('#my-iframe').getByText('Submit').click()" }
-```
-
-#### Waiting & assertions
-
-```
-playwright_execute { code: "await page.waitForSelector('.modal', { state: 'visible' })" }
-playwright_execute { code: "await page.waitForSelector('.spinner', { state: 'hidden' })" }
-playwright_execute { code: "await page.waitForLoadState('networkidle')" }
-playwright_execute { code: "await page.waitForURL('**/dashboard')" }
-playwright_execute { code: "await page.waitForFunction(() => document.querySelectorAll('.item').length > 5)" }
-playwright_execute { code: "return await page.getByRole('heading').textContent()" }
-playwright_execute { code: "return await page.getByRole('button').isVisible()" }
-playwright_execute { code: "return await page.getByRole('listitem').count()" }
-playwright_execute { code: "return await page.getByRole('button').boundingBox()" }
-```
-
-#### Navigation
-
-```
-playwright_execute { code: "await page.goto('https://example.com')" }
-playwright_execute { code: "await page.goBack()" }
-playwright_execute { code: "await page.goForward()" }
-playwright_execute { code: "await page.reload()" }
-```
-
-#### File downloads
-
-The relay maps `Browser.setDownloadBehavior` to per-page `Page.setDownloadBehavior` and synthesizes `Browser.download*` events, so Playwright downloads work in extension mode:
-
-```
-playwright_execute { code: "const [download] = await Promise.all([page.waitForEvent('download'), page.click('#download-btn')]); const path = await download.path(); return path;" }
-```
-
-#### Persistent state across calls
-
-```
-playwright_execute { code: "state.formData = { name: 'Test', email: 'a@b.com' };" }
-playwright_execute { code: "await page.fill('#name', state.formData.name);" }
-```
-
-### 5. Debug with console and network logs
-
-```
-console_logs { level: "error" }          →  filter errors only
-console_logs { search: "API" }           →  find API-related logs
-network_log { status_filter: "error" }   →  find failed requests
-network_log { url_filter: "api.example" } →  filter by URL
-network_detail { requestId: "R1.2" }     →  get full headers + request/response body
-network_detail { requestId: "R1.2", include: "response_body", max_body_size: 5000 }
-```
-
-### 6. Track page changes with snapshot diff
-
-```
-accessibility_snapshot                    →  first call caches baseline (returns @ref numbers on interactive elements)
-accessibility_snapshot                    →  second call shows diff
-accessibility_snapshot { search: "button" } →  search for specific elements
-accessibility_snapshot { diff: false }    →  force full snapshot (no diff)
-accessibility_snapshot { interactive_only: true } → only show interactive elements with @ref numbers
-```
-
-### 6.5. Interact with elements by @ref
-
-After calling `accessibility_snapshot`, use `interact` for quick single-step actions:
-
-```
-interact { ref: 1, action: "click" }     →  click element @1
-interact { ref: 2, action: "fill", value: "hello" }  →  fill input @2
-interact { ref: 3, action: "hover" }     →  hover over @3
-interact { ref: 4, action: "focus" }     →  focus @4
-interact { ref: 5, action: "check" }     →  check checkbox @5
-interact { ref: 6, action: "select", value: "blue" }  →  select option
-```
-
-### 6.6. Fetch data with user's cookies
-
-```
-browser_fetch { url: "/api/user/me" }
-browser_fetch { url: "/api/data", method: "POST", body: "{\"key\":\"value\"}" }
-```
-
-### 6.7. Record user interactions
-
-```
-trace { action: "start" }    →  begin recording
-trace { action: "status" }   →  check recording state
-trace { action: "stop" }     →  stop and return all captured events
-```
-
-### 7. Debug JavaScript with breakpoints
-
-```
-debugger { action: "enable" }
-debugger { action: "list_scripts", search: "app.js" }
-debugger { action: "set_breakpoint", file: "app.js", line: 42 }
-debugger { action: "set_breakpoint", file: "utils.js", line: 10, condition: "x > 5" }
-debugger { action: "resume" }
-debugger { action: "step_over" }
-debugger { action: "evaluate", expression: "localVar" }
-debugger { action: "inspect_variables" }
-debugger { action: "pause_on_exceptions", state: "uncaught" }
-```
-
-### 8. Inspect CSS styles
-
-```
-css_inspect { selector: "#header" }
-css_inspect { selector: ".btn-primary", properties: "color,background-color,font-size" }
-```
-
-### 9. Manage multiple Playwright sessions
-
-```
-session_manager { action: "create", sessionId: "feature-test" }
-session_manager { action: "list" }
-session_manager { action: "switch", sessionId: "feature-test" }
-session_manager { action: "remove", sessionId: "feature-test" }
-session_manager { action: "remove_all" }
-```
-
-### 10. Manage browser storage
-
-```
-storage { action: "get_cookies" }                               →  list all cookies
-storage { action: "set_cookie", name: "debug", value: "1" }   →  set a cookie
-storage { action: "get_local_storage" }                        →  list all localStorage
-storage { action: "get_local_storage", key: "theme" }          →  get specific key
-storage { action: "set_local_storage", key: "theme", value: "dark" }
-storage { action: "clear_storage", storage_types: "local_storage" }
-storage { action: "get_storage_usage" }                        →  check quota/usage
-```
-
-### 11. Monitor performance
-
-```
-performance { action: "get_metrics" }           →  runtime metrics (heap, nodes, timing)
-performance { action: "get_web_vitals" }        →  LCP, CLS, INP, FCP, TTFB with grading
-performance { action: "get_memory" }            →  JS heap, DOM nodes, listeners
-performance { action: "get_resource_timing" }   →  slowest resources by duration
-performance { action: "get_resource_timing", type_filter: "fetch", count: 10 }
-```
-
-### 12. Edit page sources live
-
-```
-editor { action: "list_sources", search: "app" }    →  find loaded scripts
-editor { action: "get_source", scriptId: "123", line_start: 1, line_end: 50 }
-editor { action: "edit_source", scriptId: "123", content: "..." }   →  hot-reload
-editor { action: "search_source", search: "TODO" }  →  search across all scripts
-editor { action: "list_stylesheets" }                →  find CSS sheets
-editor { action: "get_stylesheet", styleSheetId: "0" }
-editor { action: "edit_stylesheet", styleSheetId: "0", content: "body { color: red; }" }
-```
-
-### 13. Intercept network requests
-
-```
-network_intercept { action: "enable" }
-network_intercept { action: "add_rule", url_pattern: "/api/users", mock_status: 200, mock_body: "[{\"id\":1}]" }
-network_intercept { action: "add_rule", url_pattern: "/ads/", block: true }
-network_intercept { action: "list_rules" }
-network_intercept { action: "remove_rule", rule_id: "rule_1" }
-network_intercept { action: "disable" }
-```
-
-### 14. Emulate devices and conditions
-
-```
-emulation { action: "set_device", width: 375, height: 812, device_scale_factor: 3, mobile: true }
-emulation { action: "set_network_conditions", preset: "slow-3g" }
-emulation { action: "set_geolocation", latitude: 37.7749, longitude: -122.4194 }
-emulation { action: "set_timezone", timezone_id: "America/New_York" }
-emulation { action: "set_media", features: "prefers-color-scheme:dark" }
-emulation { action: "clear_all" }
-```
-
-### 15. Get page content
-
-```
-page_content { action: "get_html" }                    →  clean HTML (no scripts/styles)
-page_content { action: "get_html", selector: "#main" } →  scoped to element
-page_content { action: "get_text" }                    →  plain text content
-page_content { action: "get_metadata" }                →  title, meta, OG tags, counts
-page_content { action: "search_dom", search: "error" } →  find elements by text/attr
-```
-
-### 16. Make code changes, then verify
-
-```
-ensure_fresh_render  →  reload with fresh cache after code changes
-dashboard_state      →  re-confirm state
-screenshot           →  visual check
-```
-
-### 17. Cleanup when done
-
-```
-override_app { action: "remove", appName: "@cnic/main" }
-   — or —
-override_app { action: "reset_all" }    ← removes ALL overrides at once
-```
-
----
-
-## override_app Actions Reference
-
-| Action | Required Args | What It Does |
-|--------|--------------|--------------|
-| `set` | `appName`, `url` | Add or update an import-map override (sets localStorage, syncs to panel) |
-| `remove` | `appName` | Remove the override from localStorage (panel keeps URL for re-enable) |
-| `enable` | `appName` | Re-enable a previously disabled override |
-| `disable` | `appName` | Disable an override without removing its URL |
-| `reset_all` | — | Clear ALL overrides at once |
-
-After any override change, the extension DevTools panel auto-detects and syncs within ~3 seconds.
-
-## app_action Lifecycle Reference
-
-| Action | What It Does |
-|--------|--------------|
-| `mount` | Force-mount an app (calls `activeWhenForced(true)` + `reroute()`) |
-| `unmount` | Force-unmount an app (calls `activeWhenForced(false)` + `reroute()`) |
-| `unload` | Unregister and unload an app completely |
-
----
-
-## Tab Scope & Cross-Page Comparison
-
-> **Multi-agent note:** In multi-agent environments, tab ownership is managed by the Tab Lease System. Each agent can only operate on tabs it has leased. See "Multi-Agent Tab Isolation" below.
-
-spawriter operates on **one Chrome tab at a time**, but supports **multiple attached tabs**. Use `list_tabs` to see all attached tabs and `switch_tab` to change which tab the MCP session operates on. By default, the MCP server connects to the first available target; after `switch_tab`, it remembers and reconnects to the chosen target.
-
-### Multi-tab tools
-
-Two MCP tools are available for working with multiple attached tabs:
-
-| Tool | Description | Key Args |
-|------|-------------|----------|
-| `list_tabs` | List all Chrome tabs currently attached to spawriter, showing session ID, tab ID, title, URL, and which tab is active | — |
-| `switch_tab` | Switch the MCP session to a different attached Chrome tab | `targetId` (session ID from `list_tabs`) |
-
-### How multi-tab works
-
-- The user attaches tabs by clicking the spawriter toolbar button on each tab.
-- `list_tabs` shows all attached tabs and marks which one is currently active.
-- `switch_tab` closes the current CDP session and reconnects to the specified target. Console logs, network entries, intercept rules, and debugger state are cleared on switch (Playwright sessions are preserved).
-- After switching, all tools (`screenshot`, `execute`, `dashboard_state`, etc.) operate on the new tab.
-- `session_manager` manages Playwright executor VM sessions (isolated JS sandboxes), **not** Chrome tabs.
-
-### Multi-tab workflow: compare two pages
-
-```
-list_tabs { session_id: "my-session" }                                      → see all attached tabs
-switch_tab { targetId: "spawriter-tab-123-...", session_id: "my-session" }  → switch to reference tab
-screenshot                                                                  → capture reference
-accessibility_snapshot                                                      → capture reference structure
-switch_tab { targetId: "spawriter-tab-456-...", session_id: "my-session" }  → switch to working tab
-screenshot                                                                  → capture your page
-```
-
-### Single-tab comparison alternative
-
-If only one tab is attached, use navigate-and-snapshot:
-
-1. `navigate { url: "https://reference-page.example.com" }` → go to reference
-2. `screenshot` → capture reference visual
-3. `navigate { url: "http://localhost:8080/your-page" }` → go back to your page
-4. `screenshot` → capture your page visual
-5. Compare the two screenshots
-
-For persistent data across navigations, use `playwright_execute` state:
-
-```
-playwright_execute { code: "state.refLayout = { header: '64px', sidebar: '240px' };" }
-```
-
-### What happens on tab switch
-
-When you call `switch_tab`, the following state is **cleared** (because it's per-tab):
-- Console logs, network log entries
-- Network intercept rules and enabled state
-- Debugger state (breakpoints, known scripts, paused state)
-- Accessibility snapshot diff baseline
-
-The following state is **preserved** (because it's independent of tabs):
-- Playwright executor sessions (`session_manager` / `playwright_execute`)
-- Playwright `state` object (persists across switches)
-
-**Important:** `playwright_execute` maintains its own CDP connection to the relay, independent of `switch_tab`. After switching tabs, `playwright_execute` may still operate on the previously connected page. Call `pwExecutor.reset()` (via the `reset` tool) if you need `playwright_execute` to reconnect.
-
-### What happens when a tab is detached
-
-If the active tab is closed or detached while tools are in use:
-- CDP commands will timeout and return errors
-- Call `list_tabs` to see what's still available
-- Call `switch_tab` to connect to another tab, or `reset` to reconnect to `targets[0]`
-
-If the `preferredTargetId` tab is gone when the session needs to reconnect, `doEnsureSession` automatically falls back to `targets[0]`.
-
----
-
-## Offline UI Testing with Mock Responses
-
-You do **not** need real API servers or network access to test UI and interactions. spawriter provides full network interception capabilities via the CDP Fetch domain. Use mocks proactively to:
-
-- Test UI rendering with specific API responses (success, error, edge cases)
-- Develop and verify frontend features before the backend is ready
-- Simulate error states (500, 404, timeout) to test error handling UI
-- Test loading states by blocking requests temporarily
-- Reproduce bugs that depend on specific API responses
-
-### Mock testing workflow
-
-#### 1. Enable interception and set up mock rules
-
-```
-network_intercept { action: "enable" }
-network_intercept { action: "add_rule", url_pattern: "/api/users", mock_status: 200, mock_body: "[{\"id\":1,\"name\":\"Test User\"}]" }
-```
-
-#### 2. Test error states
-
-```
-network_intercept { action: "add_rule", url_pattern: "/api/data", mock_status: 500, mock_body: "{\"error\":\"Internal Server Error\"}" }
-network_intercept { action: "add_rule", url_pattern: "/api/auth", mock_status: 401, mock_body: "{\"message\":\"Unauthorized\"}" }
-```
-
-#### 3. Test empty / edge-case states
-
-```
-network_intercept { action: "add_rule", url_pattern: "/api/list", mock_status: 200, mock_body: "[]" }
-network_intercept { action: "add_rule", url_pattern: "/api/list", mock_status: 200, mock_body: "[{\"id\":1,\"name\":\"" }
-```
-
-#### 4. Block requests to test loading / offline states
-
-```
-network_intercept { action: "add_rule", url_pattern: "/api/slow-endpoint", block: true }
-```
-
-#### 5. Verify with screenshot after mock is active
-
-```
-ensure_fresh_render
-screenshot
-console_logs { level: "error" }
-```
-
-#### 6. Combine with Playwright for interaction testing
-
-```
-network_intercept { action: "add_rule", url_pattern: "/api/submit", mock_status: 200, mock_body: "{\"success\":true}" }
-playwright_execute { code: "await page.fill('#name', 'Test'); await page.click('button[type=submit]');" }
-screenshot
-```
-
-#### 7. Clean up when done
-
-```
-network_intercept { action: "disable" }
-```
-
-### When to prefer mock testing
-
-| Situation | Approach |
-|-----------|----------|
-| Backend not available or not deployed yet | Mock the expected API responses |
-| Testing error handling UI | Mock 4xx / 5xx responses |
-| Testing empty states or extreme data | Mock with `[]`, very long strings, etc. |
-| Reproducing a specific bug | Mock the exact response that triggers it |
-| Testing loading / skeleton states | Block the request entirely |
-| Normal development with backend running | Use real APIs, inspect with `network_log` / `network_detail` |
-
-### Custom response headers
-
-Pass `mock_headers` as a JSON string to control Content-Type or other headers:
-
-```
-network_intercept { action: "add_rule", url_pattern: "/api/xml", mock_status: 200, mock_headers: "{\"Content-Type\":\"application/xml\"}", mock_body: "<response><status>ok</status></response>" }
-```
-
----
-
-## Multi-Agent Tab Isolation (Tab Lease System)
-
-When multiple AI agents share the same spawriter relay server, the Tab Lease System ensures each agent operates on its own dedicated tab(s) without interference.
-
-### How it works
-
-- Each MCP server process has a unique client ID (`mcp-{pid}-{timestamp}`)
-- When connecting to a tab, the agent acquires an exclusive **lease** on that tab
-- The relay enforces lease ownership: only the lease holder can send CDP commands to the tab
-- CDP events are routed only to the lease holder, preventing cross-agent event pollution
-- Leases are automatically released when an agent disconnects or a tab is closed
-
-### Per-session isolation with `session_id`
-
-IDE hosts like Cursor share a single MCP server process across multiple chat sessions in the same workspace. Without additional identification, all sessions share the same client ID and can freely access each other's tabs.
-
-To isolate tabs per chat session, pass `session_id` on tab management tools. Each unique `session_id` gets its own CDP connection with a distinct client identity, so the relay's lease system correctly scopes ownership.
-
-**Usage:** Pass a stable, unique `session_id` string on `connect_tab`, `list_tabs`, `switch_tab`, and `release_tab`:
-
-```
-connect_tab { url: "localhost:8080", create: true, session_id: "finetune-debug" }
-list_tabs { session_id: "finetune-debug" }
-switch_tab { targetId: "spawriter-tab-...", session_id: "finetune-debug" }
-release_tab { session_id: "finetune-debug" }
-```
-
-- Use a descriptive, stable ID per session (e.g., transcript UUID, task name, session purpose)
-- Different `session_id` values create separate lease scopes — session A cannot access session B's tabs
-- Omitting `session_id` uses the default (shared) scope for backward compatibility
-
-### Session stickiness
-
-After calling `connect_tab` or `switch_tab` with a `session_id`, all subsequent tool calls (like `screenshot`, `navigate`, `execute`) automatically route to that session's CDP connection — you do NOT need to pass `session_id` on every tool call. Only tab management tools (`connect_tab`, `switch_tab`, `list_tabs`, `release_tab`) accept `session_id`.
-
-This "stickiness" works because Cursor's stdio MCP transport is sequential: only one chat session can make a tool call at a time. The most recent `session_id` from `connect_tab`/`switch_tab` becomes the active session until another `session_id` appears.
-
-### Known limitations
-
-- **Console logs, network logs, and debugger state are shared** across sessions (not per-session scoped). In practice this rarely causes issues because stdio is sequential, but be aware that `console_logs` may show entries from another session's tab if sessions interleave.
-- **`reset` is global** — any session calling `reset` releases ALL sessions' leases and clears ALL connections. Use it sparingly in multi-session setups.
-- **Rapid session interleaving** — if two chat sessions alternate tool calls very quickly, the stickiness mechanism ensures correct routing, but shared state (logs, debugger) may mix.
-
-### Environment variables for multi-agent setup
-
-Configure these in your MCP client config to improve automatic tab selection:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `SSPA_AGENT_LABEL` | Human-readable label for this agent (shown in `list_tabs`) | `"frontend-team"` |
-| `SSPA_PROJECT_URL` | URL substring to auto-match tabs to this agent | `"localhost:8080"` |
-
-Example MCP config with environment variables:
-
-```json
-{
-  "mcpServers": {
-    "spawriter": {
-      "command": "node",
-      "args": ["D:/dev/side/spawriter/mcp/dist/cli.js", "serve"],
-      "env": {
-        "SSPA_AGENT_LABEL": "agent-1",
-        "SSPA_PROJECT_URL": "localhost:8080"
-      }
-    }
-  }
-}
-```
-
-### Session negotiation (automatic)
-
-When an agent needs a browser tab, `doEnsureSession` follows this priority:
-
-1. **Reconnect** to a tab already leased by this session (matching `session_id`-scoped client ID)
-2. **Find an unleased tab** (prioritizing `SSPA_PROJECT_URL` match)
-3. **Auto-attach** a Chrome tab matching `SSPA_PROJECT_URL` via the extension
-4. **Fallback** — ask the extension to attach the active tab (only when no tabs exist)
-5. **Error** — if all tabs are leased by other agents, report who holds what and suggest using `connect_tab`
-
-### Multi-agent tools
-
-| Tool | Usage |
-|------|-------|
-| `list_tabs` | Shows lease status: `MINE`, `LEASED by <label>`, `AVAILABLE` + summary counts. Pass `session_id` to scope. |
-| `switch_tab` | Lease-aware switching: rejects if target is leased by another session. Pass `session_id` to scope. |
-| `connect_tab` | Attach a tab by URL, tab ID, or create new. Pass `session_id` for per-session scoping. |
-| `release_tab` | Release a lease. Pass `session_id` to release from the correct scope. |
-| `reset` | Releases all leases (all sessions) before resetting connections |
-
-### Multi-agent workflow
-
-```
-# Chat session 1 (e.g., "finetune-debug")
-connect_tab { url: "localhost:8080", session_id: "finetune-debug" }
-list_tabs { session_id: "finetune-debug" }
-→ shows "Tab A (MINE), Tab B (LEASED by cert-work), Tab C (AVAILABLE)"
-
-# Chat session 2 (e.g., "cert-work")
-connect_tab { url: "localhost:9090", session_id: "cert-work" }
-list_tabs { session_id: "cert-work" }
-→ shows "Tab A (LEASED by finetune-debug), Tab B (MINE), Tab C (AVAILABLE)"
-
-# If a session needs an additional tab:
-connect_tab { url: "example.com", create: true, session_id: "finetune-debug" }
-```
-
-### What happens when...
-
-| Event | Behavior |
-|-------|----------|
-| Agent crashes or disconnects | All its leases are automatically released |
-| Tab is closed by user | Lease is removed, agent gets `Target.leaseLost` event |
-| Agent calls `reset` | All agent session leases are released first |
-| Two agents race for same tab | First one wins; second gets rejection and tries the next available tab |
-| No tabs available | Agent reports which tabs are leased by whom and suggests `connect_tab` |
-| Old relay (no lease support) | Agent falls back to classic mode without isolation |
-| Same MCP process, different `session_id` | Each gets its own CDP connection and lease scope |
-
-### Backward compatibility
-
-- Single-agent setups work exactly as before — no configuration needed
-- Calls without `session_id` use the shared default scope
-- Leases are transparent: if only one agent is connected, it simply acquires a lease automatically
-- Old MCP clients connecting to a new relay continue to work (unleased tabs accept commands from anyone)
-
----
+- `list_tabs` / `switch_tab` / `connect_tab` / `release_tab` for multi-tab work
+- On `switch_tab`: console/network/debugger/intercept state is cleared; Playwright `state` persists
+- After switching, call `reset` if `playwright_execute` needs to reconnect to the new tab
 
 ## Safety Rules
 
-1. **Only operate on normal web pages** — never target `chrome://`, `edge://`, or extension pages.
-2. **Verify state via runtime checks** — use `dashboard_state` and `execute`, not static HTML assumptions.
-3. **Screenshot between major actions** — maintain visual awareness of what the user sees.
-4. **Don't assume code changes are live** — always confirm via `dashboard_state` that the override is effective.
-5. **Use incremental operations** — prefer targeted `override_app` over broad `reset_all`.
-6. **Handle page reloads gracefully** — after `clear_cache_and_reload` or `ensure_fresh_render`, wait before querying state.
-7. **Parallel calls are safe** — `dashboard_state` + `screenshot` can run concurrently without timeout issues.
-8. **All clearing is tab/origin-scoped** — `clear_cache_and_reload` never affects other tabs or origins. Cache bypass is per-tab (via ignoreCache reload), cookie deletion is per-origin, storage clearing is per-origin. There is no global cache clearing option.
-9. **Mock rules persist until disabled** — always call `network_intercept { action: "disable" }` or `reset` when done with mock testing, so real API traffic is not silently intercepted.
+1. Only operate on normal web pages — never `chrome://` or extension pages
+2. Verify state via `dashboard_state` / `execute`, not static assumptions
+3. Screenshot between major actions
+4. Don't assume code changes are live — confirm via `dashboard_state`
+5. All cache/cookie clearing is tab/origin-scoped — never affects other sites
+6. Mock rules persist until disabled — always clean up
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| Tool timeout | Call `reset` to re-establish CDP + Playwright sessions |
-| Override not reflected | Use `ensure_fresh_render` or `clear_cache_and_reload { clear: "cache,service_workers" }` |
-| Panel not syncing | Extension detects changes via 3s polling; wait a few seconds or refresh the panel |
-| App not mounting after override | Navigate to the app's route first (e.g., `/j/:journalId/my/edit`) then check status |
-| `importMapOverrides not available` | Page may not have loaded yet; wait and retry |
-| Debugger not paused | Call `debugger { action: "enable" }` first, then set breakpoints and trigger code execution |
-| CSS inspect "Element not found" | Verify selector with `execute { code: "document.querySelector('...')" }` first |
-| Session limit reached | Sessions auto-evict oldest when max (5) reached; use `session_manager { action: "remove" }` to free slots |
-| Stale cached bundle | `clear_cache_and_reload { clear: "cache,service_workers" }` clears cache + service workers without wiping cookies |
-| Need to clear cookies too | `clear_cache_and_reload { clear: "cache,cookies" }` clears cache + cookies for current origin only (other sites unaffected) |
-| `playwright_execute` connection error | Call `reset` then retry; ensure relay server is running |
-| No console/network logs | Logs are captured after CDP connection is established; re-trigger the action |
-| Labeled screenshot shows no labels | Page may have no interactive elements; check `accessibility_snapshot` |
-| Cookie read fails in `playwright_execute` | Use `Network.getCookies` via CDP session, **not** `Storage.getCookies`. In extension relay mode, `Storage.getCookies` is a root-session command and will fail. Example: `const cdp = await page.context().newCDPSession(page); const { cookies } = await cdp.send('Network.getCookies', { urls: [page.url()] });` |
-| All tabs leased by other agents | Use `connect_tab { url: "your-url" }` to attach a new tab, or ask another agent to `release_tab` |
-| Tab lease rejected | Another agent holds the lease; use `list_tabs` to see ownership, then pick an AVAILABLE tab or use `connect_tab` |
-`
+| Tool timeout | `reset` to re-establish connections |
+| Override not reflected | `ensure_fresh_render` or `clear_cache_and_reload { clear: "cache,service_workers" }` |
+| App not mounting after override | Navigate to the app's route first, then check status |
+| Debugger not pausing | Call `debugger { action: "enable" }` first |
+| `playwright_execute` connection error | `reset` then retry |
+| Cookie read in `playwright_execute` | Use `Network.getCookies` via CDP session, NOT `Storage.getCookies` |
+| All tabs leased | `connect_tab { url, create: true }` to create a new tab |
