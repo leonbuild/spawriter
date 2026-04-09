@@ -116,7 +116,9 @@ command = "node"
 args = ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
 ```
 
-**② Auto-approve all MCP tools** (optional) — spawriter has 30 tools; to avoid approving each one individually, add to `~/.codex/config.toml`:
+**② AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `AGENTS.md` or `~/.codex/AGENTS.md`
+
+**Auto-approve all MCP tools** (optional) — spawriter has 30 tools; to avoid approving each one individually, add to `~/.codex/config.toml`:
 
 ```toml
 [profiles.spawriter]
@@ -128,8 +130,6 @@ mcp_elicitations = "auto-approve"
 ```
 
 Then run: `codex --profile spawriter`
-
-**③ AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `AGENTS.md` or `~/.codex/AGENTS.md`
 
 ### OpenCode
 
