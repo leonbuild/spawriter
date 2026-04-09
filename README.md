@@ -2,9 +2,7 @@
 
 **The missing link between AI coding agents and single-spa micro-frontends.**
 
-spawriter gives AI agents (Cursor, Codex, Cline, etc.) direct access to your **real Chrome tab** via MCP — enabling autonomous **code -> override -> screenshot -> iterate** workflows for micro-frontend development.
-
-> `v1.0.0` · MIT License
+spawriter gives AI agents (Cursor, Claude Code, Codex, Github Copilot, Opencode, etc.) direct access to your **real Chrome tab** via MCP — enabling autonomous **code -> override -> screenshot -> iterate** workflows for micro-frontend development.
 
 ---
 
@@ -19,20 +17,7 @@ npm run setup       # install all dependencies + build extension + build MCP ser
 Then:
 
 1. **Load Chrome Extension**: `chrome://extensions/` -> Developer mode -> Load unpacked -> select `ext/dist-chrome/`
-2. **Configure your AI client** (e.g. Cursor):
-
-```json
-{
-  "mcpServers": {
-    "spawriter": {
-      "command": "node",
-      "args": ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
-    }
-  }
-}
-```
-
-That's it. Your AI agent can now see and control your browser.
+2. **Configure your AI client** — see below
 
 ---
 
@@ -51,42 +36,123 @@ In single-spa, AI agents can edit code but **can't** toggle import-map-overrides
 
 ---
 
-## Architecture
+## Configure Your AI Client
 
+> Replace `/path/to/spawriter` with your actual clone path. Windows: use `"D:\\dev\\side\\spawriter"`.
+
+Each platform needs two steps: **① MCP config** (tell the client how to start spawriter) + **② AI Instructions** (guide AI on when/how to use spawriter tools).
+
+### Cursor
+
+**① MCP** (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "spawriter": {
+      "command": "node",
+      "args": ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
+    }
+  }
+}
 ```
-AI Agent -> MCP Server (stdio) -> CDP Relay (:19989) -> Chrome Extension -> Browser Tab
+
+**② AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `.cursor/rules/spawriter.mdc`
+
+### Claude Code
+
+**① MCP** (CLI recommended):
+
+```bash
+claude mcp add --scope user --transport stdio spawriter -- \
+  node /path/to/spawriter/mcp/dist/cli.js serve
 ```
 
-Monorepo with two packages managed via **npm workspaces**:
+Or manually in `.mcp.json`:
 
-- **`ext/`** (`spawriter-ext`) — Chrome extension (Manifest V3): DevTools panel, AI Bridge, CDP relay connection
-- **`mcp/`** (`spawriter-mcp`) — MCP server + CDP relay: 30 tools for browser automation
+```json
+{
+  "mcpServers": {
+    "spawriter": {
+      "command": "node",
+      "args": ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
+    }
+  }
+}
+```
 
-Key features:
-- **Zero-touch tab management** — agents create/attach/navigate tabs programmatically
-- **Multi-agent isolation** — Tab Lease System ensures exclusive tab ownership
-- **Persistent connection** — offscreen document survives MV3 service worker restarts
+> `.mcp.json` uses `"mcpServers"` (same as Cursor).
 
----
+**② AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `CLAUDE.md` or `~/.claude/CLAUDE.md`
 
-## Scripts
+### VS Code (GitHub Copilot)
 
-| Command | What It Does |
-|---|---|
-| `npm run setup` | One-liner: install all deps + build ext + build mcp |
-| `npm run build` | Build everything (keeps artifacts) |
-| `npm run build:ext` | Build Chrome extension only |
-| `npm run build:mcp` | Build MCP server only |
-| `npm run release` | Build + package into `release/` + clean intermediates |
-| `npm run mcp:serve` | Build + start MCP server |
-| `npm run mcp:relay` | Build + start CDP relay |
-| `npm test` | Run all tests (1320 tests) |
-| `npm run start:hot` | Hot-reload dev mode (requires pnpm) |
-| `npm run version:bump` | Bump version across all packages |
+**① MCP** (`.vscode/mcp.json`):
 
----
+```json
+{
+  "servers": {
+    "spawriter": {
+      "command": "node",
+      "args": ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
+    }
+  }
+}
+```
 
-## Multi-Agent Setup
+> VS Code uses `"servers"` (not `"mcpServers"`), no `timeout` / `autoApprove` fields.
+
+**② AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `.github/copilot-instructions.md` or `AGENTS.md`
+
+**Recommended**: `"chat.agent.maxRequests": 100` in `settings.json` (reduces interruptions, no extra cost).
+
+### Codex
+
+**① MCP** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.spawriter]
+command = "node"
+args = ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
+```
+
+**② Auto-approve all MCP tools** (optional) — spawriter has 30 tools; to avoid approving each one individually, add to `~/.codex/config.toml`:
+
+```toml
+[profiles.spawriter]
+sandbox = "workspace-write"
+ask_for_approval = "on-request"
+
+[profiles.spawriter.approval_policy.granular]
+mcp_elicitations = "auto-approve"
+```
+
+Then run: `codex --profile spawriter`
+
+**③ AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `AGENTS.md` or `~/.codex/AGENTS.md`
+
+### OpenCode
+
+**① MCP** (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "spawriter": {
+      "type": "local",
+      "command": ["node", "/path/to/spawriter/mcp/dist/cli.js", "serve"],
+      "enabled": true
+    }
+  }
+}
+```
+
+**② AI Instructions**: copy the [AI Instructions Content](#ai-instructions-content) into `.opencode/instructions.md`
+
+### Multi-Agent Setup
+
+For multi-agent isolation, add separate server entries with unique labels (Cursor/Claude Code JSON format shown; adapt for Codex TOML or VS Code):
 
 ```json
 {
@@ -109,83 +175,17 @@ Each agent gets its own client ID and exclusive tab leases. Single-agent setups 
 
 ---
 
-## Cursor & Skill Integration
+## AI Instructions Content
 
-- **Cursor Rules**: copy `mcp/cursor-rules/spawriter.mdc` to `.cursor/rules/` in your workspace
-- **Skills**: copy `mcp/skills/spawriter/SKILL.md` for other AI agent systems
+The same instructions content works across all platforms. Place it in the appropriate file for your client:
 
----
-
-## Claude Code Configuration
-
-**CLI (recommended):**
-
-```bash
-claude mcp add --scope user --transport stdio spawriter -- \
-  node /path/to/spawriter/mcp/dist/cli.js serve
-```
-
-**Or manually in `.mcp.json`:**
-
-```json
-{
-  "mcpServers": {
-    "spawriter": {
-      "command": "node",
-      "args": ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
-    }
-  }
-}
-```
-
-For AI instructions, copy `mcp/cursor-rules/spawriter.mdc` content into `CLAUDE.md` or `~/.claude/CLAUDE.md`.
-
----
-
-## Codex CLI Configuration
-
-Codex uses TOML config at `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.spawriter]
-command = "node"
-args = ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
-```
-
-Multi-agent setup:
-
-```toml
-[mcp_servers.spawriter-agent1]
-command = "node"
-args = ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
-
-[mcp_servers.spawriter-agent1.env]
-SSPA_AGENT_LABEL = "agent-1"
-SSPA_PROJECT_URL = "localhost:8080"
-
-[mcp_servers.spawriter-agent2]
-command = "node"
-args = ["/path/to/spawriter/mcp/dist/cli.js", "serve"]
-
-[mcp_servers.spawriter-agent2.env]
-SSPA_AGENT_LABEL = "agent-2"
-SSPA_PROJECT_URL = "localhost:9090"
-```
-
-For AI instructions, copy the content of `mcp/cursor-rules/spawriter.mdc` into `~/.codex/AGENTS.md` (global) or project-level `AGENTS.md`.
-
----
-
-## AI Instructions (Rules / AGENTS.md)
-
-To get the best results, configure your AI agent with spawriter-specific instructions. The same content works across all platforms:
-
-| Platform | Where to put it |
-|----------|----------------|
+| Platform | File |
+|----------|------|
 | **Cursor** | `.cursor/rules/spawriter.mdc` |
 | **Claude Code** | `CLAUDE.md` or `~/.claude/CLAUDE.md` |
-| **Codex CLI** | `AGENTS.md` or `~/.codex/AGENTS.md` |
 | **VS Code (Copilot)** | `.github/copilot-instructions.md` or `AGENTS.md` |
+| **Codex CLI** | `AGENTS.md` or `~/.codex/AGENTS.md` |
+| **OpenCode** | `.opencode/instructions.md` |
 
 <details>
 <summary>Click to expand full AI instructions content</summary>
@@ -309,6 +309,41 @@ Use `network_intercept` to mock APIs without a backend:
 
 ---
 
+## Architecture
+
+```
+AI Agent -> MCP Server (stdio) -> CDP Relay (:19989) -> Chrome Extension -> Browser Tab
+```
+
+Monorepo with two packages managed via **npm workspaces**:
+
+- **`ext/`** (`spawriter-ext`) — Chrome extension (Manifest V3): DevTools panel, AI Bridge, CDP relay connection
+- **`mcp/`** (`spawriter-mcp`) — MCP server + CDP relay: 30 tools for browser automation
+
+Key features:
+- **Zero-touch tab management** — agents create/attach/navigate tabs programmatically
+- **Multi-agent isolation** — Tab Lease System ensures exclusive tab ownership
+- **Persistent connection** — offscreen document survives MV3 service worker restarts
+
+---
+
+## Scripts
+
+| Command | What It Does |
+|---|---|
+| `npm run setup` | One-liner: install all deps + build ext + build mcp |
+| `npm run build` | Build everything (keeps artifacts) |
+| `npm run build:ext` | Build Chrome extension only |
+| `npm run build:mcp` | Build MCP server only |
+| `npm run release` | Build + package into `release/` + clean intermediates |
+| `npm run mcp:serve` | Build + start MCP server |
+| `npm run mcp:relay` | Build + start CDP relay |
+| `npm test` | Run all tests (1320 tests) |
+| `npm run start:hot` | Hot-reload dev mode (requires pnpm) |
+| `npm run version:bump` | Bump version across all packages |
+
+---
+
 ## Project Structure
 
 ```
@@ -323,9 +358,7 @@ spawriter/
 │   └── manifest.chrome.json # Chrome manifest source
 ├── mcp/                     # MCP Server + CDP Relay (TypeScript)
 │   ├── src/                 # Source (TS)
-│   ├── dist/                # Compiled output (gitignored)
-│   ├── skills/              # AI skill definitions
-│   └── cursor-rules/        # Cursor IDE rule templates
+│   └── dist/                # Compiled output (gitignored)
 ├── scripts/                 # Root build orchestration
 │   ├── package-release.js   # Bundle release artifacts
 │   ├── clean-stale-artifacts.js
@@ -345,31 +378,3 @@ spawriter/
 | webpack OpenSSL error | Build scripts include `--openssl-legacy-provider`. Use Node.js 18+ LTS. |
 | `sharp` install failure | Native binary dependency. Try `npm install` again, or manually convert SVG to PNG. |
 
----
-
-## Requirements
-
-- **Node.js** 18+ LTS (npm 9+)
-- **Chrome** browser
-- Network access for npm packages
-
----
-
-## Documentation
-
-- [Chrome Install & Test Guide](docs/CHROME_INSTALL_TEST_GUIDE.md)
-- [MCP Development Guide](docs/MCP_DEV_GUIDE.md)
-- [Publishing Guide](docs/PUBLISH_GUIDE.md)
-- [Multi-Agent Tab Lease Design](docs/MULTI_AGENT_TAB_LEASE_DESIGN.md)
-- [Tab Lease Audit Report](docs/TAB_LEASE_AUDIT_REPORT.md)
-- [Clone & Use Audit](docs/CLONE_AND_USE_AUDIT.md)
-
----
-
-## Contributing
-
-Contributions welcome — open an issue or submit a PR.
-
-## License
-
-MIT
