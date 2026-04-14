@@ -15,10 +15,16 @@ Buffer.prototype[util.inspect.custom as any] = function () {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function getControlClient(options: { host?: string; token?: string }): ControlClient {
-  const host = options.host || process.env.SSPA_RELAY_HOST || '127.0.0.1';
-  const port = getRelayPort();
+function getControlClient(options: { host?: string; token?: string; port?: number }): ControlClient {
+  let raw = options.host || process.env.SSPA_RELAY_HOST || '';
   const token = options.token || getRelayToken();
+
+  if (raw && /^https?:\/\//.test(raw)) {
+    return new ControlClient(raw.replace(/\/$/, ''), token);
+  }
+
+  const host = raw || '127.0.0.1';
+  const port = options.port || getRelayPort();
   return new ControlClient(`http://${host}:${port}`, token);
 }
 
@@ -69,10 +75,14 @@ async function executeCode(options: {
     process.exit(1);
   }
 
-  const serverHost = host || process.env.SSPA_RELAY_HOST || '127.0.0.1';
-  const port = getRelayPort();
-  const serverUrl = `http://${serverHost}:${port}`;
+  const rawHost = host || process.env.SSPA_RELAY_HOST || '';
   const authToken = token || getRelayToken();
+  let serverUrl: string;
+  if (rawHost && /^https?:\/\//.test(rawHost)) {
+    serverUrl = rawHost.replace(/\/$/, '');
+  } else {
+    serverUrl = `http://${rawHost || '127.0.0.1'}:${getRelayPort()}`;
+  }
 
   if (!host && !process.env.SSPA_RELAY_HOST) {
     await ensureRelayServer();
