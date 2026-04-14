@@ -29,6 +29,21 @@ const usefulGlobals = {
 export interface ExecuteResult {
   text: string;
   isError: boolean;
+  images: Array<{ data: string; mimeType: string }>;
+}
+
+/**
+ * Detect Playwright ChannelOwner objects.
+ * These objects leak process.env when traversed by util.inspect
+ * via _connection._platform.env. Must intercept before serialization.
+ */
+export function isPlaywrightChannelOwner(value: unknown): boolean {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as any)._type === 'string' &&
+    typeof (value as any)._guid === 'string'
+  );
 }
 
 /**
@@ -74,6 +89,11 @@ export class PlaywrightExecutor {
   private userState: Record<string, unknown> = {};
   private isConnected = false;
   private activeAbortController: AbortController | null = null;
+  private customGlobals: Record<string, unknown> = {};
+
+  setGlobals(globals: Record<string, unknown>): void {
+    this.customGlobals = { ...this.customGlobals, ...globals };
+  }
 
   async ensureConnection(): Promise<{ page: Page; context: BrowserContext }> {
     if (this.isConnected && this.browser && this.page && !this.page.isClosed()) {
@@ -169,6 +189,7 @@ export class PlaywrightExecutor {
         state: this.userState,
         console: customConsole,
         ...usefulGlobals,
+        ...this.customGlobals,
       };
 
       const vmContext = vm.createContext(vmContextObj);
@@ -196,7 +217,7 @@ export class PlaywrightExecutor {
 
       let responseText = PlaywrightExecutor.formatConsoleLogs(consoleLogs);
 
-      if (hasExplicitReturn && result !== undefined) {
+      if (hasExplicitReturn && result !== undefined && !isPlaywrightChannelOwner(result)) {
         const formatted = typeof result === 'string'
           ? result
           : util.inspect(result, { depth: 4, colors: false, maxArrayLength: 100, maxStringLength: 1000, breakLength: 80 });
@@ -216,7 +237,7 @@ export class PlaywrightExecutor {
           + `\n\n[Truncated to ${MAX_LENGTH} characters]`;
       }
 
-      return { text: finalText, isError: false };
+      return { text: finalText, isError: false, images: [] };
     } catch (err: unknown) {
       if (timeoutHandle) clearTimeout(timeoutHandle);
 
@@ -256,6 +277,7 @@ export class PlaywrightExecutor {
       return {
         text: `${logsText}\nError executing code: ${errorText}${resetHint}`,
         isError: true,
+        images: [],
       };
     } finally {
       if (this.activeAbortController === abortController) {
@@ -319,10 +341,11 @@ export class ExecutorManager {
     let executor = this.executors.get(sessionId);
     if (!executor) {
       if (this.executors.size >= this.maxSessions) {
-        const oldest = this.executors.keys().next().value as string;
-        const oldExecutor = this.executors.get(oldest)!;
-        oldExecutor.reset().catch(() => {});
-        this.executors.delete(oldest);
+        throw new Error(
+          `Playwright executor limit reached (${this.maxSessions}). ` +
+          `Active sessions: ${Array.from(this.executors.keys()).join(', ')}. ` +
+          `Delete an existing session first.`,
+        );
       }
       executor = new PlaywrightExecutor();
       this.executors.set(sessionId, executor);

@@ -19,6 +19,9 @@ import type {
   LeaseInfo,
 } from './protocol.js';
 import { LEASE_ERROR_CODE } from './protocol.js';
+import { registerControlRoutes } from './runtime/control-routes.js';
+import { SessionStore } from './runtime/session-store.js';
+import { ExecutorManager } from './pw-executor.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -1013,6 +1016,14 @@ function handleCDPMessage(data: Buffer, clientId: string) {
     error('Error parsing CDP message:', e);
   }
 }
+
+const relaySessionStore = new SessionStore();
+const relayExecutorManager = new ExecutorManager();
+
+registerControlRoutes(app, relaySessionStore, relayExecutorManager, async (name, args) => {
+  log(`CLI tool call: ${name}`, JSON.stringify(args).slice(0, 200));
+  return { content: [{ type: 'text', text: `Tool ${name} not yet bridged to relay. Use MCP for full tool access.` }] };
+});
 
 export async function startRelayServer(): Promise<void> {
   const port = getRelayPort();

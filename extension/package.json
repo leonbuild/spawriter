@@ -1,5 +1,5 @@
 {
-  "name": "spawriter-ext",
+  "name": "spawriter-extension",
   "version": "1.0.0",
   "private": true,
   "description": "spawriter Chrome/Firefox extension",

@@ -9,9 +9,9 @@ const releaseBaseDir = path.join(rootDir, "release");
 const currentReleaseName = `${rootPkg.name}-v${rootPkg.version}`;
 
 const intermediateDirs = [
-  path.join(rootDir, "ext", "build"),
-  path.join(rootDir, "ext", "dist-chrome"),
-  path.join(rootDir, "ext", "web-ext-artifacts"),
+  path.join(rootDir, "extension", "build"),
+  path.join(rootDir, "extension", "dist-chrome"),
+  path.join(rootDir, "extension", "web-ext-artifacts"),
 ];
 
 function removeDirIfExists(targetDir) {

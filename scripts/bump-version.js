@@ -7,10 +7,10 @@
  *
  * Files updated:
  *   - package.json
- *   - ext/manifest.json
- *   - ext/manifest.chrome.json
- *   - ext/package.json
- *   - mcp/package.json
+ *   - extension/manifest.json
+ *   - extension/manifest.chrome.json
+ *   - extension/package.json
+ *   - spawriter/package.json
  */
 
 const fs = require("fs");
@@ -20,10 +20,10 @@ const rootDir = path.resolve(__dirname, "..");
 
 const VERSION_FILES = [
   path.join(rootDir, "package.json"),
-  path.join(rootDir, "ext", "manifest.json"),
-  path.join(rootDir, "ext", "manifest.chrome.json"),
-  path.join(rootDir, "ext", "package.json"),
-  path.join(rootDir, "mcp", "package.json"),
+  path.join(rootDir, "extension", "manifest.json"),
+  path.join(rootDir, "extension", "manifest.chrome.json"),
+  path.join(rootDir, "extension", "package.json"),
+  path.join(rootDir, "spawriter", "package.json"),
 ];
 
 function readJson(filePath) {

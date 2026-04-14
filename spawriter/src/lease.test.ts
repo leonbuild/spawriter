@@ -2,7 +2,7 @@
  * Tests for Tab Lease System: relay-level lease management, MCP-level
  * lease negotiation, enforcement, event filtering, and edge cases.
  *
- * Run: npx tsx --test mcp/src/lease.test.ts
+ * Run: npx tsx --test spawriter/src/lease.test.ts
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';

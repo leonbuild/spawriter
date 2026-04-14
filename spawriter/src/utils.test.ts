@@ -1,7 +1,7 @@
 /**
  * Tests for utility functions in utils.ts.
  *
- * Run: npx tsx --test mcp/src/utils.test.ts
+ * Run: npx tsx --test spawriter/src/utils.test.ts
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';

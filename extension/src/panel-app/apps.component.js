@@ -482,13 +482,16 @@ export default function Apps(props) {
                           setEditValues({ ...editValues, [app.name]: e.target.value });
                         }}
                         onClick={() => {
-                          // 当 input 为空时，点击 input 进入 edit 模式
                           if (!editingApps[app.name] && !getDisplayUrl(app.name)) {
                             startEdit(app.name);
                           }
                         }}
+                        onDoubleClick={() => {
+                          if (!editingApps[app.name]) {
+                            startEdit(app.name);
+                          }
+                        }}
                         onKeyDown={(e) => {
-                          // 在编辑模式下按 Enter 键触发保存
                           if (e.key === "Enter" && editingApps[app.name]) {
                             e.preventDefault();
                             handleSaveAndRefresh(app.name);
@@ -920,7 +923,7 @@ body.dark & .app-name {
 
 & .import-override:read-only {
   background-color: #f5f5f5;
-  cursor: default;
+  cursor: pointer;
 }
 
 & .import-override.editing {

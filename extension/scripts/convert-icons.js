@@ -2,7 +2,7 @@
  * Converts SVG icons to PNG files for Chrome extension manifest compatibility.
  * Chrome Manifest V3 requires PNG icons — SVG is not supported.
  *
- * Run: node ext/scripts/convert-icons.js
+ * Run: node extension/scripts/convert-icons.js
  */
 
 const fs = require('fs');

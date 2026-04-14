@@ -2,7 +2,7 @@
  * Tests for relay.ts logic: HTTP routes, lease management, target listing,
  * extension validation, CDP event routing, and download behavior.
  *
- * Run: npx tsx --test mcp/src/relay.test.ts
+ * Run: npx tsx --test spawriter/src/relay.test.ts
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';

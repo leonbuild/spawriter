@@ -1,12 +1,16 @@
 {
-  "name": "spawriter-mcp",
+  "name": "spawriter",
   "version": "1.0.0",
   "type": "module",
-  "description": "spawriter MCP server + CDP relay — AI-assisted browser automation with zero-touch tab management, multi-agent isolation (Tab Lease System), and 27 MCP tools for Chrome DevTools Protocol access",
+  "description": "spawriter MCP server + CDP relay — AI-assisted browser automation for single-spa micro-frontends with 4 core MCP tools and CLI code execution",
   "main": "dist/cli.js",
   "bin": {
     "spawriter": "./bin.js"
   },
+  "files": [
+    "dist",
+    "bin.js"
+  ],
   "scripts": {
     "build": "node -e \"const fs=require('fs');if(fs.existsSync('dist'))fs.rmSync('dist',{recursive:true,force:true})\" && tsc",
     "watch": "tsc -w",
@@ -26,9 +30,12 @@
     "@hono/node-server": "^1.19.6",
     "@hono/node-ws": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.21.1",
+    "goke": "^6.8.0",
     "hono": "^4.10.6",
+    "picocolors": "^1.1.1",
     "playwright-core": "^1.56.1",
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

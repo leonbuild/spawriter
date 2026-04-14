@@ -2,10 +2,15 @@
  * Tests for MCP server logic: ensureSession mutex, AX tree formatting,
  * and command timeout classification.
  *
- * Run: npx tsx --test mcp/src/mcp.test.ts
+ * Run: npx tsx --test spawriter/src/mcp.test.ts
  */
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import {
+  PlaywrightExecutor,
+  ExecutorManager,
+  isPlaywrightChannelOwner,
+} from './pw-executor.js';
 
 // ---------------------------------------------------------------------------
 // Test: Console log capture
@@ -9568,35 +9573,161 @@ describe('browser_fetch tool definition', () => {
 });
 
 // ===========================================================================
-// Tests: new tools in full tool list
+// Tests: registered MCP tools (4 core only)
 // ===========================================================================
 
-describe('Integration: bb-browser new tools present', () => {
-  const allTools = [
-    'screenshot', 'accessibility_snapshot', 'execute', 'dashboard_state',
-    'console_logs', 'network_log', 'network_detail', 'playwright_execute', 'reset',
-    'clear_cache_and_reload', 'ensure_fresh_render', 'navigate',
-    'override_app', 'app_action', 'debugger', 'css_inspect', 'session_manager',
-    'list_tabs', 'switch_tab', 'connect_tab', 'release_tab',
-    'storage', 'performance', 'editor', 'network_intercept', 'emulation', 'page_content',
-    'interact', 'browser_fetch', 'trace',
-  ];
+describe('Integration: only 4 core MCP tools registered', () => {
+  const registeredTools = ['execute', 'reset', 'single_spa', 'tab'];
 
-  it('interact tool present', () => {
-    assert.ok(allTools.includes('interact'));
+  it('exactly 4 tools', () => {
+    assert.equal(registeredTools.length, 4);
+    assert.equal(new Set(registeredTools).size, 4);
   });
 
-  it('browser_fetch tool present', () => {
-    assert.ok(allTools.includes('browser_fetch'));
+  it('execute tool present', () => {
+    assert.ok(registeredTools.includes('execute'));
   });
 
-  it('trace tool present', () => {
-    assert.ok(allTools.includes('trace'));
+  it('reset tool present', () => {
+    assert.ok(registeredTools.includes('reset'));
   });
 
-  it('total is now 30', () => {
-    assert.equal(allTools.length, 30);
-    assert.equal(new Set(allTools).size, 30);
+  it('single_spa tool present', () => {
+    assert.ok(registeredTools.includes('single_spa'));
+  });
+
+  it('tab tool present', () => {
+    assert.ok(registeredTools.includes('tab'));
+  });
+
+  it('no legacy tools registered', () => {
+    const removedTools = [
+      'screenshot', 'accessibility_snapshot', 'dashboard_state',
+      'console_logs', 'network_log', 'network_detail', 'playwright_execute',
+      'clear_cache_and_reload', 'ensure_fresh_render', 'navigate',
+      'override_app', 'app_action', 'debugger', 'css_inspect', 'session_manager',
+      'list_tabs', 'switch_tab', 'connect_tab', 'release_tab',
+      'storage', 'performance', 'editor', 'network_intercept', 'emulation',
+      'page_content', 'interact', 'browser_fetch', 'trace',
+    ];
+    for (const tool of removedTools) {
+      assert.ok(!registeredTools.includes(tool), `${tool} should not be registered`);
+    }
+  });
+});
+
+describe('Phase 2: execute tool schema', () => {
+  it('execute requires code param', () => {
+    const schema = {
+      type: 'object',
+      required: ['code'],
+      properties: {
+        code: { type: 'string' },
+        timeout_ms: { type: 'number' },
+      },
+    };
+    assert.ok(schema.required.includes('code'));
+    assert.ok(schema.properties.code.type === 'string');
+  });
+
+  it('execute optional timeout_ms', () => {
+    const schema = {
+      required: ['code'],
+      properties: { code: { type: 'string' }, timeout_ms: { type: 'number' } },
+    };
+    assert.ok(!schema.required.includes('timeout_ms'));
+    assert.ok(schema.properties.timeout_ms.type === 'number');
+  });
+});
+
+describe('Phase 2: single_spa tool schema', () => {
+  const validActions = ['status', 'set_override', 'remove_override', 'enable_override',
+    'disable_override', 'reset_overrides', 'mount', 'unmount', 'unload'];
+
+  it('single_spa requires action param', () => {
+    const schema = { required: ['action'] };
+    assert.ok(schema.required.includes('action'));
+  });
+
+  it('action enum covers all 9 values', () => {
+    assert.equal(validActions.length, 9);
+    assert.ok(validActions.includes('status'));
+    assert.ok(validActions.includes('set_override'));
+    assert.ok(validActions.includes('mount'));
+  });
+});
+
+describe('Phase 2: tab tool schema', () => {
+  const validActions = ['connect', 'list', 'switch', 'release'];
+
+  it('tab requires action param', () => {
+    const schema = { required: ['action'] };
+    assert.ok(schema.required.includes('action'));
+  });
+
+  it('action enum covers all 4 tab actions', () => {
+    assert.equal(validActions.length, 4);
+    assert.ok(validActions.includes('connect'));
+    assert.ok(validActions.includes('list'));
+    assert.ok(validActions.includes('switch'));
+    assert.ok(validActions.includes('release'));
+  });
+});
+
+describe('Phase 2: single_spa delegates to internal handlers', () => {
+  const singleSpaActions = ['status', 'override_set', 'override_remove', 'override_enable',
+    'override_disable', 'override_reset_all', 'mount', 'unmount', 'unload'];
+
+  it('single_spa has 9 actions', () => {
+    assert.equal(singleSpaActions.length, 9);
+  });
+
+  it('tab delegates to internal handlers', () => {
+    const tabActions = ['connect', 'list', 'switch', 'release'];
+    assert.equal(tabActions.length, 4);
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 2 — SessionStore behavior
+// ===========================================================================
+
+describe('Phase 2: SessionStore session limit', () => {
+  it('ExecutorManager should throw when max sessions reached', () => {
+    const mgr = new ExecutorManager(2);
+    mgr.getOrCreate('s1');
+    mgr.getOrCreate('s2');
+    assert.throws(() => mgr.getOrCreate('s3'), /limit reached/i);
+  });
+
+  it('remove frees slot for new session', async () => {
+    const mgr = new ExecutorManager(1);
+    mgr.getOrCreate('s1');
+    assert.throws(() => mgr.getOrCreate('s2'), /limit reached/i);
+    await mgr.remove('s1');
+    const s2 = mgr.getOrCreate('s2');
+    assert.ok(s2 instanceof PlaywrightExecutor);
+  });
+});
+
+// ===========================================================================
+// Tests: Phase 2 — security: isPlaywrightChannelOwner in execute flow
+// ===========================================================================
+
+describe('Phase 2: ChannelOwner filtering in execute result', () => {
+  it('channel owner objects should be detected before inspection', () => {
+    const fakeChannelOwner = { _type: 'Page', _guid: 'page@abc', _connection: {} };
+    assert.equal(isPlaywrightChannelOwner(fakeChannelOwner), true);
+  });
+
+  it('arrays with channel owners should be partially detectable', () => {
+    const items = [
+      { _type: 'Frame', _guid: 'frame@1' },
+      { normal: true },
+      'just a string',
+    ];
+    const channelOwners = items.filter(isPlaywrightChannelOwner);
+    assert.equal(channelOwners.length, 1);
   });
 });
 

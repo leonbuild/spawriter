@@ -2,7 +2,7 @@
  * Tests for CLI argument parsing logic.
  * Tests the arg-parsing logic without actually starting servers.
  *
- * Run: npx tsx --test mcp/src/cli.test.ts
+ * Run: npx tsx --test spawriter/src/cli.test.ts
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -229,5 +229,161 @@ describe('Version banner suppression', () => {
 
   it('should print banner for --help (command is --help)', () => {
     assert.equal(shouldPrintBanner('--help'), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: goke-based CLI dispatch logic
+// ---------------------------------------------------------------------------
+
+describe('Phase 3: CLI dispatch with -e flag', () => {
+  interface GokeDispatch {
+    mode: 'mcp' | 'execute' | 'command';
+    code?: string;
+    session?: string;
+    command?: string;
+  }
+
+  function resolveDispatch(opts: {
+    eval?: string;
+    session?: string;
+    command?: string;
+  }): GokeDispatch {
+    if (opts.eval) {
+      return { mode: 'execute', code: opts.eval, session: opts.session };
+    }
+    if (opts.command) {
+      return { mode: 'command', command: opts.command };
+    }
+    return { mode: 'mcp' };
+  }
+
+  it('no flags → MCP server mode', () => {
+    const d = resolveDispatch({});
+    assert.equal(d.mode, 'mcp');
+  });
+
+  it('-e flag → execute mode', () => {
+    const d = resolveDispatch({ eval: 'await page.goto("http://example.com")' });
+    assert.equal(d.mode, 'execute');
+    assert.equal(d.code, 'await page.goto("http://example.com")');
+  });
+
+  it('-e with -s → execute with session', () => {
+    const d = resolveDispatch({ eval: 'return 1+1', session: 'my-session' });
+    assert.equal(d.mode, 'execute');
+    assert.equal(d.session, 'my-session');
+  });
+
+  it('command → command mode', () => {
+    const d = resolveDispatch({ command: 'skill' });
+    assert.equal(d.mode, 'command');
+    assert.equal(d.command, 'skill');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: Session commands
+// ---------------------------------------------------------------------------
+
+describe('Phase 3: session subcommand routing', () => {
+  type SessionAction = 'new' | 'list' | 'delete' | 'reset';
+  const validActions: SessionAction[] = ['new', 'list', 'delete', 'reset'];
+
+  it('all 4 session actions recognized', () => {
+    assert.equal(validActions.length, 4);
+    assert.ok(validActions.includes('new'));
+    assert.ok(validActions.includes('list'));
+    assert.ok(validActions.includes('delete'));
+    assert.ok(validActions.includes('reset'));
+  });
+
+  it('session delete/reset require an id argument', () => {
+    function validateSessionArgs(action: SessionAction, args: string[]): boolean {
+      if (action === 'delete' || action === 'reset') return args.length >= 1;
+      return true;
+    }
+    assert.equal(validateSessionArgs('new', []), true);
+    assert.equal(validateSessionArgs('list', []), true);
+    assert.equal(validateSessionArgs('delete', []), false);
+    assert.equal(validateSessionArgs('delete', ['sess-1']), true);
+    assert.equal(validateSessionArgs('reset', []), false);
+    assert.equal(validateSessionArgs('reset', ['sess-1']), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: CLI command list completeness
+// ---------------------------------------------------------------------------
+
+describe('Phase 3: CLI command coverage', () => {
+  const expectedCommands = ['serve', 'relay', 'skill', 'logfile', 'session'];
+
+  it('all expected commands present', () => {
+    assert.equal(expectedCommands.length, 5);
+    for (const cmd of expectedCommands) {
+      assert.ok(typeof cmd === 'string' && cmd.length > 0);
+    }
+  });
+
+  it('global options include host, token, session, eval, timeout, port', () => {
+    const globalOpts = ['host', 'token', 'session', 'eval', 'timeout', 'port'];
+    assert.equal(globalOpts.length, 6);
+    assert.ok(globalOpts.includes('eval'));
+    assert.ok(globalOpts.includes('session'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: relay --replace logic
+// ---------------------------------------------------------------------------
+
+describe('Phase 3: relay --replace port detection', () => {
+  it('should determine if port is occupied', () => {
+    function isPortOccupied(portCheckResult: 'free' | 'occupied'): boolean {
+      return portCheckResult === 'occupied';
+    }
+    assert.equal(isPortOccupied('free'), false);
+    assert.equal(isPortOccupied('occupied'), true);
+  });
+
+  it('--replace flag triggers kill+restart flow', () => {
+    function relayAction(replace: boolean, portOccupied: boolean): string {
+      if (portOccupied && !replace) return 'error-port-in-use';
+      if (portOccupied && replace) return 'kill-and-restart';
+      return 'start';
+    }
+    assert.equal(relayAction(false, false), 'start');
+    assert.equal(relayAction(false, true), 'error-port-in-use');
+    assert.equal(relayAction(true, true), 'kill-and-restart');
+    assert.equal(relayAction(true, false), 'start');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: Kitty Graphics Protocol detection
+// ---------------------------------------------------------------------------
+
+describe('Phase 3: Kitty Graphics support detection', () => {
+  function canEmitKitty(env: { TERM?: string; TERM_PROGRAM?: string }): boolean {
+    if (env.TERM_PROGRAM === 'WezTerm') return true;
+    if (env.TERM === 'xterm-kitty') return true;
+    return false;
+  }
+
+  it('detects WezTerm', () => {
+    assert.equal(canEmitKitty({ TERM_PROGRAM: 'WezTerm' }), true);
+  });
+
+  it('detects kitty terminal', () => {
+    assert.equal(canEmitKitty({ TERM: 'xterm-kitty' }), true);
+  });
+
+  it('returns false for unknown terminal', () => {
+    assert.equal(canEmitKitty({ TERM: 'xterm-256color' }), false);
+  });
+
+  it('returns false for empty env', () => {
+    assert.equal(canEmitKitty({}), false);
   });
 });

@@ -2,7 +2,9 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import WebSocket from 'ws';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   getRelayPort,
   getCdpUrl,
@@ -17,6 +19,21 @@ import {
 } from './utils.js';
 import type { LeaseInfo } from './protocol.js';
 import { PlaywrightExecutor, ExecutorManager } from './pw-executor.js';
+import { injectSpawriterGlobals, type ToolContext } from './runtime/cli-globals.js';
+
+const __mcpDirname = path.dirname(fileURLToPath(import.meta.url));
+
+function loadPromptContent(): string {
+  const repoRoot = path.join(__mcpDirname, '..', '..');
+  const agentsPath = path.join(repoRoot, 'AGENTS.md');
+  try {
+    return fs.readFileSync(agentsPath, 'utf-8');
+  } catch {
+    return 'spawriter: AI-assisted browser automation for single-spa micro-frontends. Execute Playwright JS code with spawriter extensions.';
+  }
+}
+
+const promptContent = loadPromptContent();
 
 let relayServerProcess: ReturnType<typeof import('child_process').spawn> | null = null;
 
@@ -1288,483 +1305,81 @@ function mcpLog(level: 'debug' | 'info' | 'warning' | 'error', data: string): vo
 
 const tools = [
   {
-    name: 'screenshot',
-    description: `Take a screenshot of the current page. Output is always ≤5MB (auto-compressed for LLM API compatibility).
-With labels=true, overlays numbered labels on interactive elements.
-quality: "high" (PNG, auto-downgrades if >5MB), "medium" (WebP q80, default), "low" (WebP <1MB).
-model: optional hint (e.g. "gpt-5.4") to optimize quality for your LLM's specific limits.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        labels: { type: 'boolean', description: 'Overlay numbered labels on interactive elements (buttons, links, inputs, etc.)' },
-        quality: {
-          type: 'string',
-          enum: ['high', 'medium', 'low'],
-          description: 'Quality tier. Default: "medium". high=PNG lossless (auto-compressed if >5MB), medium=WebP q80, low=compact WebP <1MB',
-        },
-        model: {
-          type: 'string',
-          description: 'Optional: LLM model name (e.g. "claude-sonnet-4.6", "gpt-5.4", "gpt-5.3-codex") for optimized quality/size targeting',
-        },
-      },
-    },
-  },
-  {
-    name: 'accessibility_snapshot',
-    description: 'Get accessibility snapshot of the page. Supports search to find specific elements, diff to see changes, and interactive_only to list only interactive elements.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        search: { type: 'string', description: 'Search for elements matching this text (case-insensitive). Returns matching lines with context.' },
-        diff: { type: 'boolean', description: 'Show diff against the previous snapshot (default: true when no search)' },
-        interactive_only: { type: 'boolean', description: 'If true, only show interactive elements (buttons, links, inputs, etc.) with @ref numbers. Takes priority over search and diff.' },
-      },
-    },
-  },
-  {
     name: 'execute',
-    description: 'Execute JavaScript code in the page context',
-    inputSchema: {
-      type: 'object' as const,
-      properties: { code: { type: 'string', description: 'JavaScript code to execute' } },
-      required: ['code'],
-    },
-  },
-  {
-    name: 'dashboard_state',
-    description: 'Get single-spa Inspector dashboard state, app statuses, and override effective state',
-    inputSchema: {
-      type: 'object' as const,
-      properties: { appName: { type: 'string', description: 'Optional app name to highlight one app state' } },
-    },
-  },
-  {
-    name: 'console_logs',
-    description: 'Get captured browser console logs (log, warn, error, info, debug). Logs are captured in real-time from Runtime.consoleAPICalled and Runtime.exceptionThrown CDP events.',
+    description: promptContent,
     inputSchema: {
       type: 'object' as const,
       properties: {
-        count: { type: 'number', description: 'Number of recent logs to return (default: 50, max: 1000)' },
-        level: { type: 'string', enum: ['log', 'info', 'warn', 'error', 'debug', 'all'], description: 'Filter by log level (default: all)' },
-        search: { type: 'string', description: 'Filter logs containing this text' },
-        clear: { type: 'boolean', description: 'Clear log buffer after returning results' },
-      },
-    },
-  },
-  {
-    name: 'network_log',
-    description: 'Get captured network requests. Shows URL, method, status, timing, size, and errors. Captured from Network CDP events in real-time.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        count: { type: 'number', description: 'Number of recent entries to return (default: 50, max: 500)' },
-        url_filter: { type: 'string', description: 'Filter by URL substring' },
-        status_filter: { type: 'string', enum: ['all', 'ok', 'error', '4xx', '5xx'], description: 'Filter by response status category (default: all)' },
-        clear: { type: 'boolean', description: 'Clear network buffer after returning results' },
-      },
-    },
-  },
-  {
-    name: 'network_detail',
-    description: `Get full details of a network request including headers and body content.
-Use network_log first to find the requestId, then use this tool to inspect details.
-Can retrieve: request headers, request body (POST data), response headers, response body.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        requestId: { type: 'string', description: 'Request ID from network_log output (required)' },
-        include: {
+        code: {
           type: 'string',
-          description: 'Comma-separated list of sections to include: request_headers, request_body, response_headers, response_body, all (default: all)',
+          description: 'Playwright JS code. Globals: {page, context, state, singleSpa, tab, consoleLogs, networkLog, networkDetail, cssInspect, labeledScreenshot, accessibilitySnapshot, networkIntercept, dbg, browserFetch, storage, emulation, performance}. Use ; for multiple statements.',
         },
-        max_body_size: { type: 'number', description: 'Max response body size in chars to return (default: 10000). Use 0 for headers only.' },
-      },
-      required: ['requestId'],
-    },
-  },
-  {
-    name: 'playwright_execute',
-    description: `Execute code in a Node.js VM sandbox with full Playwright API access.
-Available variables: page (Playwright Page), context (BrowserContext), state (persistent object across calls).
-Use for: any browser interaction that needs real input events or Playwright's auto-waiting.
-
-Supported page/locator actions (all trigger real browser input events via CDP):
-- Mouse: click, dblclick, hover, dragTo, dispatchEvent
-- Forms: fill, clear, check, uncheck, setChecked, selectOption, setInputFiles
-- Keyboard: press, pressSequentially, type (via page.keyboard)
-- Touch: tap (requires hasTouch context)
-- Focus: focus, blur
-- Scroll: scrollIntoViewIfNeeded, mouse.wheel
-- Wait: waitForSelector, waitForLoadState, waitForURL, waitForEvent, waitForFunction
-- Query: textContent, innerText, innerHTML, inputValue, getAttribute, isVisible, isChecked, isDisabled, boundingBox, count
-- Navigation: goto, goBack, goForward, reload
-- Locators: getByRole, getByText, getByLabel, getByPlaceholder, getByTestId, getByAltText, getByTitle, locator, frameLocator
-
-Low-level mouse (page.mouse): move, down, up, click, dblclick, wheel
-Low-level keyboard (page.keyboard): down, up, press, type, insertText
-
-Examples: page.hover('.menu'), page.getByRole('button').click(), page.keyboard.press('Enter'), page.mouse.wheel(0, 500)
-
-For simple/fast JS in page context (DOM reads, API calls), use the 'execute' tool instead.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        code: { type: 'string', description: 'JavaScript code to execute. Has access to page, context, state, and standard globals.' },
-        timeout: { type: 'number', description: 'Execution timeout in ms (default: 30000)' },
+        timeout: {
+          type: 'number',
+          description: 'Execution timeout in ms (default: 30000)',
+        },
       },
       required: ['code'],
     },
   },
   {
     name: 'reset',
-    description: 'Reset the CDP connection, Playwright executor, and clear all captured console logs and network entries',
-    inputSchema: { type: 'object' as const, properties: {} },
-  },
-  {
-    name: 'clear_cache_and_reload',
-    description: `Clear cache/storage for the current tab/origin and optionally reload. All operations are tab/origin-scoped — never affects other tabs.
-"cache" bypasses HTTP cache via ignoreCache reload (current tab only). "cookies" deletes only cookies matching the current origin.
-"local_storage", "session_storage", "cache_storage", "indexeddb", "service_workers" cleared via Storage.clearDataForOrigin.
-"all" = cache + cookies + local_storage + session_storage + cache_storage + indexeddb + service_workers.
-Note: "cache" forces a reload even if reload=false, since cache bypass requires it.`,
+    description: 'Recreates CDP connection and resets page/context/state. Also clears spawriter extensions state (console logs, intercept rules, debugger, snapshots, leases, agent sessions).',
     inputSchema: {
       type: 'object' as const,
-      properties: {
-        clear: {
-          type: 'string',
-          description: 'Comma-separated: cache, cookies, local_storage, session_storage, cache_storage, indexeddb, service_workers, all. All are tab/origin-scoped.',
-        },
-        origin: {
-          type: 'string',
-          description: 'Scope storage/cookie clearing to this origin. Default: current page origin.',
-        },
-        reload: { type: 'boolean', description: 'Reload page after clearing. Default: true. Note: if "cache" is specified, reload is forced regardless.' },
-        mode: { type: 'string', enum: ['light', 'aggressive'], description: '(Deprecated) Use "clear" parameter instead.' },
-      },
+      properties: {},
     },
   },
   {
-    name: 'ensure_fresh_render',
-    description: 'Ensure the page is freshly rendered (clear cache if needed)',
-    inputSchema: { type: 'object' as const, properties: {} },
-  },
-  {
-    name: 'navigate',
-    description: 'Navigate to a URL',
-    inputSchema: {
-      type: 'object' as const,
-      properties: { url: { type: 'string', description: 'URL to navigate to' } },
-      required: ['url'],
-    },
-  },
-  {
-    name: 'override_app',
-    description: 'Manage import-map-overrides for single-spa apps: set a localhost override, remove it, toggle enable/disable, or reset all overrides',
+    name: 'single_spa',
+    description: `Manage single-spa micro-frontend applications. This tool is spawriter-specific.
+
+Actions:
+- status: Get all app statuses + active import-map-overrides
+- override_set: Point an app to a local dev server URL
+- override_remove: Remove an override
+- override_enable / override_disable: Toggle an override without deleting
+- override_reset_all: Clear all overrides
+- mount / unmount / unload: Force lifecycle action on an app
+
+After setting an override, reload the page to see changes.`,
     inputSchema: {
       type: 'object' as const,
       properties: {
-        action: { type: 'string', enum: ['set', 'remove', 'enable', 'disable', 'reset_all'], description: 'Action to perform on the override' },
-        appName: { type: 'string', description: 'Module specifier (e.g. @cnic/main). Required for set/remove/enable/disable.' },
-        url: { type: 'string', description: 'Override URL (e.g. http://localhost:9100/app.js). Required for "set" action.' },
+        action: {
+          type: 'string',
+          enum: ['status', 'override_set', 'override_remove', 'override_enable', 'override_disable', 'override_reset_all', 'mount', 'unmount', 'unload'],
+          description: 'Action to perform',
+        },
+        appName: { type: 'string', description: 'App name (e.g. @org/navbar). Required for app-specific actions.' },
+        url: { type: 'string', description: 'Override URL (e.g. http://localhost:8080/main.js). Required for override_set.' },
       },
       required: ['action'],
     },
   },
   {
-    name: 'app_action',
-    description: 'Control single-spa application lifecycle: mount, unmount, or unload an app. After the action, triggers reroute to apply changes.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: { type: 'string', enum: ['mount', 'unmount', 'unload'], description: 'Lifecycle action to perform' },
-        appName: { type: 'string', description: 'Application name (e.g. @cnic/main)' },
-      },
-      required: ['action', 'appName'],
-    },
-  },
-  {
-    name: 'debugger',
-    description: `Control the JavaScript debugger via CDP. Set breakpoints, step through code, inspect variables.
-Actions: enable, set_breakpoint, remove_breakpoint, list_breakpoints, resume, step_over, step_into, step_out, inspect_variables, evaluate, list_scripts, pause_on_exceptions.`,
+    name: 'tab',
+    description: `Manage browser tabs via spawriter's Tab Lease System.
+Provides safe multi-agent tab sharing with explicit connect/release semantics.
+
+Actions:
+- connect: Connect to a tab by URL (create if not found with create=true)
+- list: List all available tabs with lease status
+- switch: Switch to a tab by targetId
+- release: Release the currently held tab`,
     inputSchema: {
       type: 'object' as const,
       properties: {
         action: {
           type: 'string',
-          enum: ['enable', 'set_breakpoint', 'remove_breakpoint', 'list_breakpoints', 'resume', 'step_over', 'step_into', 'step_out', 'inspect_variables', 'evaluate', 'list_scripts', 'pause_on_exceptions'],
-          description: 'Debugger action to perform',
+          enum: ['connect', 'list', 'switch', 'release'],
+          description: 'Tab action to perform',
         },
-        file: { type: 'string', description: 'Script URL for set_breakpoint (use list_scripts to find URLs)' },
-        line: { type: 'number', description: '1-based line number for set_breakpoint' },
-        condition: { type: 'string', description: 'Conditional expression for set_breakpoint (only pause when true)' },
-        breakpointId: { type: 'string', description: 'Breakpoint ID for remove_breakpoint' },
-        expression: { type: 'string', description: 'JS expression for evaluate (accesses local scope when paused)' },
-        search: { type: 'string', description: 'URL substring filter for list_scripts' },
-        state: { type: 'string', enum: ['none', 'uncaught', 'all'], description: 'Exception pause mode for pause_on_exceptions' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'css_inspect',
-    description: 'Get computed CSS styles for an element identified by a CSS selector. Returns key visual properties.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        selector: { type: 'string', description: 'CSS selector to identify the element (e.g. "#header", ".btn-primary")' },
-        properties: { type: 'string', description: 'Comma-separated list of specific CSS properties to inspect (default: common visual properties)' },
-      },
-      required: ['selector'],
-    },
-  },
-  {
-    name: 'session_manager',
-    description: `Manage Playwright executor sessions. Each session has its own browser connection and persistent state.\nActions: list, create, switch, remove, remove_all.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['list', 'create', 'switch', 'remove', 'remove_all'],
-          description: 'Session management action',
-        },
-        sessionId: { type: 'string', description: 'Session identifier for create/switch/remove (e.g. "feature-xyz", "debug-session")' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'list_tabs',
-    description: 'List all Chrome tabs currently attached to spawriter. Shows session ID, tab ID, title, URL, which tab is active, and lease status (MINE / LEASED by X / AVAILABLE). In multi-agent setups, tabs are isolated via leases. Pass session_id to scope lease ownership to this session.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        session_id: { type: 'string', description: 'Unique session identifier for per-session tab isolation. When multiple Cursor chat sessions share the same MCP process, each session should pass a stable unique ID (e.g. "session-1", "finetune-debug") to ensure tab leases are scoped to this specific session.' },
-      },
-    },
-  },
-  {
-    name: 'switch_tab',
-    description: 'Switch the MCP session to a different attached Chrome tab. Cannot switch to a tab leased by another agent. Acquires lease on the new tab if available. Cleared on switch: console logs, network entries, intercept rules, debugger state, snapshot baseline. Preserved: Playwright sessions and leases on other tabs.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        targetId: { type: 'string', description: 'Session ID of the target tab (from list_tabs output)' },
-        session_id: { type: 'string', description: 'Unique session identifier for per-session tab isolation.' },
-      },
-      required: ['targetId'],
-    },
-  },
-  {
-    name: 'connect_tab',
-    description: 'Request the extension to find and attach a Chrome tab by URL pattern or tab ID. Can optionally create a new tab if none matches. After connecting, use switch_tab to activate it, or it will be auto-selected on next tool call. Pass session_id for per-session tab isolation.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        url: { type: 'string', description: 'URL substring to match against open Chrome tabs (e.g., "localhost:9100", "example.com/dashboard")' },
-        tabId: { type: 'number', description: 'Exact Chrome tab ID to attach' },
-        create: { type: 'boolean', description: 'If true and no matching tab found, create a new tab with the given URL and attach it' },
-        session_id: { type: 'string', description: 'Unique session identifier for per-session tab isolation. When multiple Cursor chat sessions share the same MCP process, each session should pass a stable unique ID (e.g. "session-1", "finetune-debug") to ensure tab leases are scoped to this specific session.' },
-      },
-    },
-  },
-  {
-    name: 'release_tab',
-    description: 'Release your lease on a tab, making it available to other agents. If no targetId specified, releases the currently active tab.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        targetId: { type: 'string', description: 'Session ID of the tab to release. Omit to release the active tab.' },
-        session_id: { type: 'string', description: 'Unique session identifier for per-session tab isolation.' },
-      },
-    },
-  },
-  {
-    name: 'storage',
-    description: `Manage browser storage: cookies, localStorage, sessionStorage, cache.
-Actions: get_cookies, set_cookie, delete_cookie, get_local_storage, set_local_storage, remove_local_storage, get_session_storage, clear_storage, get_storage_usage.
-clear_storage requires explicit storage_types parameter to prevent accidental full wipe.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['get_cookies', 'set_cookie', 'delete_cookie', 'get_local_storage', 'set_local_storage', 'remove_local_storage', 'get_session_storage', 'clear_storage', 'get_storage_usage'],
-          description: 'Storage action',
-        },
-        key: { type: 'string', description: 'Storage key for get/set/remove localStorage/sessionStorage' },
-        value: { type: 'string', description: 'Value for set operations' },
-        name: { type: 'string', description: 'Cookie name for set/delete' },
-        domain: { type: 'string', description: 'Cookie domain' },
-        url: { type: 'string', description: 'URL for cookie operations' },
-        path: { type: 'string', description: 'Cookie path' },
-        secure: { type: 'boolean', description: 'Cookie secure flag' },
-        httpOnly: { type: 'boolean', description: 'Cookie httpOnly flag' },
-        sameSite: { type: 'string', enum: ['Strict', 'Lax', 'None'], description: 'Cookie sameSite attribute' },
-        expires: { type: 'number', description: 'Cookie expiry (Unix timestamp)' },
-        origin: { type: 'string', description: 'Origin for clear/usage operations' },
-        storage_types: { type: 'string', description: 'REQUIRED for clear_storage. Comma-separated: cookies,local_storage,session_storage,cache_storage,indexeddb,service_workers' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'performance',
-    description: `Monitor page performance: runtime metrics, Web Vitals (LCP/CLS/INP/TTFB), memory usage, resource timing.
-Actions: get_metrics, get_web_vitals, get_memory, get_resource_timing.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['get_metrics', 'get_web_vitals', 'get_memory', 'get_resource_timing'],
-          description: 'Performance action',
-        },
-        count: { type: 'number', description: 'Number of resource entries to return (default: 20, for get_resource_timing)' },
-        type_filter: { type: 'string', description: 'Filter resource entries by type (e.g. script, css, img, fetch, xmlhttprequest)' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'editor',
-    description: `View and edit page JavaScript and CSS sources in real-time. Supports hot-reload.
-Actions: list_sources, get_source, edit_source, search_source, list_stylesheets, get_stylesheet, edit_stylesheet.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['list_sources', 'get_source', 'edit_source', 'search_source', 'list_stylesheets', 'get_stylesheet', 'edit_stylesheet'],
-          description: 'Editor action',
-        },
-        scriptId: { type: 'string', description: 'Script ID from list_sources' },
-        styleSheetId: { type: 'string', description: 'Stylesheet ID from list_stylesheets' },
-        search: { type: 'string', description: 'Search string for filtering/searching' },
-        content: { type: 'string', description: 'New content for edit operations' },
-        line_start: { type: 'number', description: 'Start line for partial source view (1-based)' },
-        line_end: { type: 'number', description: 'End line for partial source view (1-based)' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'network_intercept',
-    description: `Intercept and modify network requests. Mock API responses, block requests, modify headers.
-Actions: enable, disable, list_rules, add_rule, remove_rule.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['enable', 'disable', 'list_rules', 'add_rule', 'remove_rule'],
-          description: 'Intercept action',
-        },
-        rule_id: { type: 'string', description: 'Rule ID for remove_rule' },
-        url_pattern: { type: 'string', description: 'URL pattern to match (glob: * for any)' },
-        resource_type: { type: 'string', description: 'Resource type filter (XHR, Fetch, Document, Script, Stylesheet, Image, Font, Other)' },
-        mock_status: { type: 'number', description: 'HTTP status code for mock response' },
-        mock_headers: { type: 'string', description: 'JSON string of response headers for mock' },
-        mock_body: { type: 'string', description: 'Response body for mock' },
-        block: { type: 'boolean', description: 'Block matching requests (respond with 404)' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'emulation',
-    description: `Emulate devices, network conditions, geolocation, timezone, color scheme, and media features.
-Actions: set_device, set_user_agent, set_geolocation, set_timezone, set_locale, set_network_conditions, set_media, clear_all.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['set_device', 'set_user_agent', 'set_geolocation', 'set_timezone', 'set_locale', 'set_network_conditions', 'set_media', 'clear_all'],
-          description: 'Emulation action',
-        },
-        width: { type: 'number', description: 'Viewport width (for set_device)' },
-        height: { type: 'number', description: 'Viewport height (for set_device)' },
-        device_scale_factor: { type: 'number', description: 'Device pixel ratio (for set_device, default: 1)' },
-        mobile: { type: 'boolean', description: 'Mobile mode (for set_device)' },
-        user_agent: { type: 'string', description: 'User agent string (for set_user_agent)' },
-        latitude: { type: 'number', description: 'Latitude (for set_geolocation)' },
-        longitude: { type: 'number', description: 'Longitude (for set_geolocation)' },
-        accuracy: { type: 'number', description: 'Accuracy in meters (for set_geolocation, default: 1)' },
-        timezone_id: { type: 'string', description: 'IANA timezone (for set_timezone, e.g. America/New_York)' },
-        locale: { type: 'string', description: 'Locale string (for set_locale, e.g. en-US)' },
-        preset: { type: 'string', enum: ['offline', 'slow-3g', 'fast-3g', '4g', 'wifi'], description: 'Network condition preset' },
-        download: { type: 'number', description: 'Download throughput bytes/sec (custom network)' },
-        upload: { type: 'number', description: 'Upload throughput bytes/sec (custom network)' },
-        latency: { type: 'number', description: 'Latency in ms (custom network)' },
-        features: { type: 'string', description: 'Comma-separated media features (e.g. prefers-color-scheme:dark,prefers-reduced-motion:reduce)' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'page_content',
-    description: `Get structured page content: clean HTML, text, metadata, or search the DOM.
-Actions: get_html, get_text, get_metadata, search_dom.`,
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['get_html', 'get_text', 'get_metadata', 'search_dom'],
-          description: 'Content action',
-        },
-        selector: { type: 'string', description: 'CSS selector to scope content (default: body)' },
-        search: { type: 'string', description: 'Search string for search_dom' },
-        max_length: { type: 'number', description: 'Max output length in chars (default: 50000)' },
-        include_styles: { type: 'boolean', description: 'Include inline styles in HTML output (default: false)' },
-      },
-      required: ['action'],
-    },
-  },
-  {
-    name: 'interact',
-    description: 'Interact with a page element by @ref number from accessibility_snapshot. Lightweight alternative to playwright_execute for single-step actions.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        ref: { type: 'number', description: '@ref number from the most recent accessibility_snapshot' },
-        action: {
-          type: 'string',
-          enum: ['click', 'hover', 'fill', 'focus', 'check', 'uncheck', 'select'],
-          description: 'Action to perform on the element',
-        },
-        value: { type: 'string', description: 'Value for fill/select actions' },
-      },
-      required: ['ref', 'action'],
-    },
-  },
-  {
-    name: 'browser_fetch',
-    description: "Make HTTP requests in the browser context with the user's cookies and session. Automatically includes credentials.",
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        url: { type: 'string', description: 'URL to fetch (absolute or relative to current page)' },
-        method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'], description: 'HTTP method (default: GET)' },
-        headers: { type: 'string', description: 'JSON string of custom headers' },
-        body: { type: 'string', description: 'Request body (for POST/PUT/PATCH)' },
-        max_body_size: { type: 'number', description: 'Max response body size in chars (default: 10000, max: 100000)' },
-      },
-      required: ['url'],
-    },
-  },
-  {
-    name: 'trace',
-    description: 'Record user interactions on the page. Start recording, stop to get events, or check status.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        action: {
-          type: 'string',
-          enum: ['start', 'stop', 'status'],
-          description: 'start: begin recording user interactions, stop: end recording and return events, status: check recording state',
-        },
+        url: { type: 'string', description: 'Tab URL (for connect)' },
+        create: { type: 'boolean', description: 'Create new tab if not found (for connect)' },
+        targetId: { type: 'string', description: 'Target session ID (for switch)' },
+        tabId: { type: 'number', description: 'Chrome tab ID (for connect)' },
+        session_id: { type: 'string', description: 'Session ID for per-session tab isolation' },
       },
       required: ['action'],
     },
@@ -1793,6 +1408,120 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
   const handleToolCall = async () => {
+
+  // === NEW 4-TOOL HANDLERS ===
+
+  if (name === 'execute') {
+    const code = args.code as string;
+    const timeout = (args.timeout as number) || 30000;
+    if (!code) {
+      return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter: code' }) }], isError: true };
+    }
+
+    await ensureRelayServer();
+    const session = await ensureSession();
+
+    const toolCtx: ToolContext = {
+      executeTool: async (toolName: string, toolArgs: Record<string, unknown>) => {
+        return _legacyDispatch(toolName, toolArgs);
+      },
+    };
+
+    const executor = executorManager.getOrCreate('mcp-default');
+    injectSpawriterGlobals(executor, 'mcp-default', toolCtx);
+
+    const result = await executor.execute(code, timeout);
+
+    const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+    if (result.text) {
+      content.push({ type: 'text', text: result.text });
+    }
+    for (const img of result.images) {
+      content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+    }
+    if (content.length === 0) {
+      content.push({ type: 'text', text: 'Code executed successfully (no output)' });
+    }
+
+    return { content, isError: result.isError };
+  }
+
+  if (name === 'reset') {
+    if (cdpSession) {
+      await releaseAllMyLeases(cdpSession);
+      cdpSession.ws.close();
+      cdpSession = null;
+    }
+    for (const [id, agent] of agentSessions) {
+      if (agent.cdpSession) {
+        await releaseAllMyLeases(agent.cdpSession, id).catch(() => {});
+        agent.cdpSession.ws.close();
+      }
+    }
+    agentSessions.clear();
+    activeAgentId = null;
+    preferredTargetId = null;
+    clearConsoleLogs();
+    clearNetworkLog();
+    clearInterceptState();
+    lastSnapshot = null;
+    refCacheByTab.clear();
+    await pwExecutor.reset();
+    debuggerEnabled = false;
+    breakpoints.clear();
+    debuggerPaused = false;
+    currentCallFrameId = null;
+    knownScripts.clear();
+    await executorManager.resetAll();
+    return { content: [{ type: 'text', text: 'Connection reset. All state cleared (console logs, network entries, Playwright state, debugger, leases, agent sessions, executor sessions).' }] };
+  }
+
+  if (name === 'single_spa') {
+    const action = args.action as string;
+    const appName = args.appName as string | undefined;
+    const url = args.url as string | undefined;
+
+    switch (action) {
+      case 'status':
+        return _legacyDispatch('dashboard_state', { appName });
+      case 'override_set':
+        return _legacyDispatch('override_app', { action: 'set', appName, url });
+      case 'override_remove':
+        return _legacyDispatch('override_app', { action: 'remove', appName });
+      case 'override_enable':
+        return _legacyDispatch('override_app', { action: 'enable', appName });
+      case 'override_disable':
+        return _legacyDispatch('override_app', { action: 'disable', appName });
+      case 'override_reset_all':
+        return _legacyDispatch('override_app', { action: 'reset_all' });
+      case 'mount':
+      case 'unmount':
+      case 'unload':
+        return _legacyDispatch('app_action', { action, appName });
+      default:
+        return { content: [{ type: 'text', text: formatError({ error: `Unknown single_spa action: ${action}`, hint: 'Valid actions: status, override_set, override_remove, override_enable, override_disable, override_reset_all, mount, unmount, unload' }) }], isError: true };
+    }
+  }
+
+  if (name === 'tab') {
+    const action = args.action as string;
+    switch (action) {
+      case 'connect':
+        return _legacyDispatch('connect_tab', { url: args.url, tabId: args.tabId, create: args.create, session_id: args.session_id });
+      case 'list':
+        return _legacyDispatch('list_tabs', { session_id: args.session_id });
+      case 'switch':
+        return _legacyDispatch('switch_tab', { targetId: args.targetId, session_id: args.session_id });
+      case 'release':
+        return _legacyDispatch('release_tab', { targetId: args.targetId, session_id: args.session_id });
+      default:
+        return { content: [{ type: 'text', text: formatError({ error: `Unknown tab action: ${action}`, hint: 'Valid actions: connect, list, switch, release' }) }], isError: true };
+    }
+  }
+
+  return { content: [{ type: 'text', text: formatError({ error: `Unknown tool: ${name}`, hint: 'Available tools: execute, reset, single_spa, tab' }) }], isError: true };
+
+  async function _legacyDispatch(name: string, args: Record<string, unknown> = {}): Promise<any> {
 
   if (name === 'reset') {
     if (cdpSession) {
@@ -2248,7 +1977,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: fullText }] };
       }
 
-      case 'execute': {
+      case 'execute_js': {
         const code = args.code as string;
         const value = await evaluateJs(session, code);
         const textResult = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
@@ -3430,6 +3159,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
+
+  } // end _legacyDispatch
 
   }; // end handleToolCall
 
