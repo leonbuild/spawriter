@@ -1,13 +1,11 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import WebSocket from 'ws';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   getRelayPort,
-  getCdpUrl,
   getRelayToken,
   getAgentLabel,
   getProjectUrl,
@@ -17,9 +15,22 @@ import {
   sleep,
   VERSION,
 } from './utils.js';
-import type { LeaseInfo } from './protocol.js';
-import { PlaywrightExecutor, ExecutorManager } from './pw-executor.js';
-import { injectSpawriterGlobals, type ToolContext } from './runtime/cli-globals.js';
+import {
+  PlaywrightExecutor,
+  ExecutorManager,
+  formatError,
+  withTimeout,
+  type ExecuteResult,
+} from './pw-executor.js';
+import {
+  buildDashboardStateCode,
+  buildOverrideCode,
+  buildAppActionCode,
+} from './runtime/spa-helpers.js';
+
+// ---------------------------------------------------------------------------
+// Prompt loading
+// ---------------------------------------------------------------------------
 
 const __mcpDirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,438 +46,11 @@ function loadPromptContent(): string {
 
 const promptContent = loadPromptContent();
 
+// ---------------------------------------------------------------------------
+// Relay auto-start
+// ---------------------------------------------------------------------------
+
 let relayServerProcess: ReturnType<typeof import('child_process').spawn> | null = null;
-
-interface CdpSession {
-  ws: WebSocket;
-  sessionId: string;
-  nextId: number;
-  pendingRequests: Map<number, { resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }>;
-}
-
-let cdpSession: CdpSession | null = null;
-let sessionPromise: Promise<CdpSession> | null = null;
-let preferredTargetId: string | null = null;
-
-interface ImageProfile {
-  maxBytes: number;
-  maxLongEdge: number;
-  format: 'png' | 'webp' | 'jpeg';
-  quality: number;
-}
-
-const MODEL_PROFILES: Record<string, ImageProfile> = {
-  'claude-opus-4.6':    { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
-  'claude-sonnet-4.6':  { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
-  'claude-opus':        { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
-  'claude-sonnet':      { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
-  'claude':             { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 },
-  'gpt-5.4':            { maxBytes: 20_000_000, maxLongEdge: 2048, format: 'webp', quality: 85 },
-  'gpt-5.4-mini':       { maxBytes: 20_000_000, maxLongEdge: 2048, format: 'webp', quality: 85 },
-  'gpt-5.3-codex':      { maxBytes: 20_000_000, maxLongEdge: 1200, format: 'webp', quality: 80 },
-  'codex':              { maxBytes: 20_000_000, maxLongEdge: 1200, format: 'webp', quality: 80 },
-  'gemini-3':           { maxBytes: 15_000_000, maxLongEdge: 1024, format: 'webp', quality: 75 },
-  'gemini':             { maxBytes: 15_000_000, maxLongEdge: 1024, format: 'webp', quality: 75 },
-};
-
-const DEFAULT_IMAGE_PROFILE: ImageProfile = { maxBytes: 5_000_000, maxLongEdge: 1568, format: 'webp', quality: 80 };
-
-const TIER_LIMITS = { high: 5_000_000, medium: 5_000_000, low: 1_000_000 } as const;
-
-function resolveImageProfile(tier: string, modelHint?: string): ImageProfile & { effectiveLimit: number } {
-  const tierLimit = TIER_LIMITS[tier as keyof typeof TIER_LIMITS] ?? TIER_LIMITS.medium;
-
-  if (modelHint) {
-    const key = modelHint.toLowerCase().trim();
-    const profile = MODEL_PROFILES[key]
-      ?? Object.entries(MODEL_PROFILES).find(([k]) => key.includes(k))?.[1];
-    if (profile) {
-      return { ...profile, effectiveLimit: Math.min(profile.maxBytes, tierLimit) };
-    }
-  }
-
-  switch (tier) {
-    case 'high':
-      return { ...DEFAULT_IMAGE_PROFILE, format: 'png', quality: 100, effectiveLimit: tierLimit };
-    case 'low':
-      return { maxBytes: 1_000_000, maxLongEdge: 1280, format: 'webp', quality: 40, effectiveLimit: tierLimit };
-    default:
-      return { ...DEFAULT_IMAGE_PROFILE, effectiveLimit: tierLimit };
-  }
-}
-
-const MAX_COMPRESS_RETRIES = 3;
-
-async function captureWithSizeGuarantee(
-  session: CdpSession,
-  profile: ImageProfile & { effectiveLimit: number },
-): Promise<{ data: string; mimeType: string; originalSize: number; finalSize: number; compressed: boolean }> {
-  const timeout = getCommandTimeout('Page.captureScreenshot');
-  const captureParams: Record<string, unknown> = { format: profile.format };
-  if (profile.format !== 'png') {
-    captureParams.quality = profile.quality;
-  }
-
-  let result = await sendCdpCommand(session, 'Page.captureScreenshot', captureParams, timeout) as { data: string };
-  const originalSize = Math.ceil(result.data.length * 3 / 4);
-
-  if (originalSize <= profile.effectiveLimit) {
-    return {
-      data: result.data,
-      mimeType: profile.format === 'png' ? 'image/png' : 'image/webp',
-      originalSize,
-      finalSize: originalSize,
-      compressed: false,
-    };
-  }
-
-  let quality = profile.format === 'png'
-    ? Math.min(90, Math.floor(80 * (profile.effectiveLimit / originalSize) * 0.8))
-    : Math.floor(profile.quality * (profile.effectiveLimit / originalSize) * 0.8);
-  quality = Math.max(10, quality);
-
-  for (let i = 0; i < MAX_COMPRESS_RETRIES; i++) {
-    result = await sendCdpCommand(session, 'Page.captureScreenshot',
-      { format: 'webp', quality, optimizeForSpeed: true }, timeout) as { data: string };
-    const size = Math.ceil(result.data.length * 3 / 4);
-
-    if (size <= profile.effectiveLimit) {
-      return { data: result.data, mimeType: 'image/webp', originalSize, finalSize: size, compressed: true };
-    }
-    quality = Math.max(10, Math.floor(quality * 0.5));
-  }
-
-  result = await sendCdpCommand(session, 'Page.captureScreenshot',
-    { format: 'webp', quality: 10, optimizeForSpeed: true }, timeout) as { data: string };
-  return {
-    data: result.data,
-    mimeType: 'image/webp',
-    originalSize,
-    finalSize: Math.ceil(result.data.length * 3 / 4),
-    compressed: true,
-  };
-}
-
-const MCP_CLIENT_ID = generateMcpClientId();
-const agentLabel = getAgentLabel();
-const projectUrl = getProjectUrl();
-
-// ---------------------------------------------------------------------------
-// Per-agent session isolation
-// ---------------------------------------------------------------------------
-// Cursor spawns one MCP server process per workspace and shares it across all
-// chat sessions.  The Tab Lease System uses the CDP WebSocket clientId (derived
-// from MCP_CLIENT_ID which is PID-based) to enforce ownership.  Since every
-// chat session in the same workspace shares the PID, they all get the same
-// clientId and can freely access each other's tabs.
-//
-// To fix this, we maintain a registry of per-agent CDP connections keyed by a
-// caller-supplied `agent_id`.  Each agent_id gets its own clientId
-// (`${MCP_CLIENT_ID}::${agent_id}`) and therefore its own lease scope.
-//
-// When no agent_id is provided, the legacy behaviour (global MCP_CLIENT_ID) is
-// preserved for backward compatibility.
-// ---------------------------------------------------------------------------
-
-interface AgentSession {
-  agentId: string;
-  clientId: string;
-  cdpSession: CdpSession | null;
-  sessionPromise: Promise<CdpSession> | null;
-  preferredTargetId: string | null;
-}
-
-const agentSessions = new Map<string, AgentSession>();
-
-function getEffectiveClientId(agentId?: string): string {
-  if (!agentId) return MCP_CLIENT_ID;
-  return `${MCP_CLIENT_ID}::${agentId}`;
-}
-
-function getAgentSession(agentId: string): AgentSession {
-  let session = agentSessions.get(agentId);
-  if (!session) {
-    session = {
-      agentId,
-      clientId: getEffectiveClientId(agentId),
-      cdpSession: null,
-      sessionPromise: null,
-      preferredTargetId: null,
-    };
-    agentSessions.set(agentId, session);
-  }
-  return session;
-}
-
-// Tracks which agent session was last activated via connect_tab/switch_tab with
-// session_id.  All subsequent tool calls (without explicit session_id) route to
-// this agent's CDP connection.  This makes "session stickiness" work over the
-// sequential stdio MCP transport — the last session_id caller "owns" the MCP
-// server until another session_id appears.
-let activeAgentId: string | null = null;
-
-/** Resolve the active CdpSession — agent-scoped if agentId provided, else the sticky session, else global. */
-function resolveActiveSession(agentId?: string): CdpSession | null {
-  const effectiveId = agentId || activeAgentId;
-  if (effectiveId) {
-    const agent = agentSessions.get(effectiveId);
-    return agent?.cdpSession ?? null;
-  }
-  return cdpSession;
-}
-
-const pwExecutor = new PlaywrightExecutor();
-const executorManager = new ExecutorManager();
-
-// ---------------------------------------------------------------------------
-// Console log capture (CDP Runtime.consoleAPICalled / Runtime.exceptionThrown)
-// ---------------------------------------------------------------------------
-
-interface ConsoleLogEntry {
-  level: string;
-  text: string;
-  timestamp: number;
-  url?: string;
-  lineNumber?: number;
-}
-
-const MAX_CONSOLE_LOGS = 1000;
-const consoleLogs: ConsoleLogEntry[] = [];
-
-function addConsoleLog(entry: ConsoleLogEntry) {
-  consoleLogs.push(entry);
-  if (consoleLogs.length > MAX_CONSOLE_LOGS) {
-    consoleLogs.splice(0, consoleLogs.length - MAX_CONSOLE_LOGS);
-  }
-}
-
-function clearConsoleLogs() {
-  consoleLogs.length = 0;
-}
-
-function getConsoleLogs(options: { count?: number; level?: string; search?: string } = {}): ConsoleLogEntry[] {
-  const count = Math.min(Math.max(options.count || 50, 1), MAX_CONSOLE_LOGS);
-  const level = options.level || 'all';
-  const search = (options.search || '').toLowerCase();
-
-  let filtered = consoleLogs;
-  if (level !== 'all') filtered = filtered.filter(log => log.level === level);
-  if (search) filtered = filtered.filter(log => log.text.toLowerCase().includes(search));
-  return filtered.slice(-count);
-}
-
-function formatConsoleLogs(logs: ConsoleLogEntry[], totalCount: number): string {
-  if (logs.length === 0) return `No console logs captured (${totalCount} total in buffer)`;
-  const lines = logs.map(log => {
-    const time = new Date(log.timestamp).toISOString().slice(11, 23);
-    const loc = log.url ? ` (${log.url}${log.lineNumber !== undefined ? ':' + log.lineNumber : ''})` : '';
-    return `[${time}] [${log.level.toUpperCase().padEnd(5)}] ${log.text}${loc}`;
-  });
-  return `Console logs (${logs.length}/${totalCount} total):\n${lines.join('\n')}`;
-}
-
-// ---------------------------------------------------------------------------
-// Network request monitoring (CDP Network.*)
-// ---------------------------------------------------------------------------
-
-interface NetworkEntry {
-  requestId: string;
-  url: string;
-  method: string;
-  status?: number;
-  statusText?: string;
-  mimeType?: string;
-  startTime: number;
-  endTime?: number;
-  error?: string;
-  size?: number;
-  requestHeaders?: Record<string, string>;
-  responseHeaders?: Record<string, string>;
-  postData?: string;
-  hasPostData?: boolean;
-  resourceType?: string;
-}
-
-const MAX_NETWORK_ENTRIES = 500;
-const networkLog: Map<string, NetworkEntry> = new Map();
-
-// ---------------------------------------------------------------------------
-// Network interception state (Fetch domain)
-// ---------------------------------------------------------------------------
-
-interface InterceptRule {
-  id: string;
-  urlPattern: string;
-  resourceType?: string;
-  mockStatus?: number;
-  mockHeaders?: Record<string, string>;
-  mockBody?: string;
-  block?: boolean;
-}
-
-let interceptEnabled = false;
-const interceptRules: Map<string, InterceptRule> = new Map();
-let interceptNextId = 1;
-
-function clearInterceptState() {
-  interceptEnabled = false;
-  interceptRules.clear();
-  interceptNextId = 1;
-}
-
-async function handleFetchPaused(session: CdpSession, params: Record<string, unknown>) {
-  const reqId = params.requestId as string;
-  const requestUrl = ((params.request as Record<string, unknown>)?.url as string) || '';
-  const reqResourceType = (params.resourceType as string) || '';
-
-  for (const rule of interceptRules.values()) {
-    const urlMatch = !rule.urlPattern || requestUrl.includes(rule.urlPattern) ||
-      new RegExp(rule.urlPattern.replace(/\*/g, '.*')).test(requestUrl);
-    const typeMatch = !rule.resourceType || reqResourceType.toLowerCase() === rule.resourceType.toLowerCase();
-    if (!urlMatch || !typeMatch) continue;
-
-    if (rule.block) {
-      await sendCdpCommand(session, 'Fetch.failRequest', { requestId: reqId, errorReason: 'BlockedByClient' });
-      return;
-    }
-    if (rule.mockStatus !== undefined) {
-      const responseHeaders = Object.entries(rule.mockHeaders || { 'Content-Type': 'application/json' })
-        .map(([n, v]) => ({ name: n, value: v }));
-      const body = rule.mockBody ? Buffer.from(rule.mockBody).toString('base64') : '';
-      await sendCdpCommand(session, 'Fetch.fulfillRequest', {
-        requestId: reqId,
-        responseCode: rule.mockStatus,
-        responseHeaders,
-        body,
-      });
-      return;
-    }
-  }
-  await sendCdpCommand(session, 'Fetch.continueRequest', { requestId: reqId });
-}
-
-function clearNetworkLog() {
-  networkLog.clear();
-}
-
-function getNetworkEntries(options: { count?: number; urlFilter?: string; statusFilter?: string } = {}): NetworkEntry[] {
-  const count = Math.min(Math.max(options.count || 50, 1), MAX_NETWORK_ENTRIES);
-  const urlFilter = (options.urlFilter || '').toLowerCase();
-  const statusFilter = options.statusFilter || 'all';
-
-  let entries = Array.from(networkLog.values());
-  if (urlFilter) entries = entries.filter(e => e.url.toLowerCase().includes(urlFilter));
-  if (statusFilter !== 'all') {
-    entries = entries.filter(e => {
-      if (statusFilter === 'ok') return e.status !== undefined && e.status >= 200 && e.status < 400;
-      if (statusFilter === 'error') return !!e.error || (e.status !== undefined && e.status >= 400);
-      if (statusFilter === '4xx') return e.status !== undefined && e.status >= 400 && e.status < 500;
-      if (statusFilter === '5xx') return e.status !== undefined && e.status >= 500;
-      return true;
-    });
-  }
-  return entries.slice(-count);
-}
-
-function formatNetworkEntries(entries: NetworkEntry[], totalCount: number): string {
-  if (entries.length === 0) return `No network entries captured (${totalCount} total in buffer)`;
-  const lines = entries.map(e => {
-    const st = e.error ? `ERR:${e.error}` : (e.status !== undefined ? `${e.status}` : '...');
-    const dur = e.endTime && e.startTime ? `${e.endTime - e.startTime}ms` : '...';
-    const sz = e.size ? ` ${(e.size / 1024).toFixed(1)}KB` : '';
-    return `[${e.requestId}] ${e.method.padEnd(6)} ${st.padEnd(15)} ${dur.padStart(7)}${sz}  ${e.url}`;
-  });
-  return `Network (${entries.length}/${totalCount} total):\n${lines.join('\n')}\n\nUse network_detail { requestId: "..." } to inspect headers and body.`;
-}
-
-// ---------------------------------------------------------------------------
-// CDP event dispatch
-// ---------------------------------------------------------------------------
-
-function handleCdpEvent(method: string, params: Record<string, unknown>) {
-  switch (method) {
-    case 'Runtime.consoleAPICalled': {
-      const type = (params.type as string) || 'log';
-      const args = (params.args as Array<{ type: string; value?: unknown; description?: string }>) || [];
-      const text = args.map(arg => {
-        if (arg.value !== undefined) return String(arg.value);
-        if (arg.description) return arg.description;
-        return `[${arg.type}]`;
-      }).join(' ');
-      const stackTrace = params.stackTrace as { callFrames?: Array<{ url?: string; lineNumber?: number }> } | undefined;
-      const topFrame = stackTrace?.callFrames?.[0];
-      addConsoleLog({
-        level: type, text, timestamp: Date.now(),
-        url: topFrame?.url, lineNumber: topFrame?.lineNumber,
-      });
-      break;
-    }
-    case 'Runtime.exceptionThrown': {
-      const details = params.exceptionDetails as { text?: string; exception?: { description?: string }; url?: string; lineNumber?: number } | undefined;
-      addConsoleLog({
-        level: 'error',
-        text: details?.exception?.description || details?.text || 'Unknown exception',
-        timestamp: Date.now(), url: details?.url, lineNumber: details?.lineNumber,
-      });
-      break;
-    }
-    case 'Network.requestWillBeSent': {
-      const requestId = params.requestId as string;
-      const request = params.request as {
-        url: string; method: string; headers?: Record<string, string>;
-        postData?: string; hasPostData?: boolean;
-      };
-      if (requestId && request) {
-        networkLog.set(requestId, {
-          requestId, url: request.url, method: request.method, startTime: Date.now(),
-          requestHeaders: request.headers,
-          postData: request.postData,
-          hasPostData: request.hasPostData,
-          resourceType: params.type as string | undefined,
-        });
-        if (networkLog.size > MAX_NETWORK_ENTRIES) {
-          const firstKey = networkLog.keys().next().value;
-          if (firstKey) networkLog.delete(firstKey);
-        }
-      }
-      break;
-    }
-    case 'Network.responseReceived': {
-      const entry = networkLog.get(params.requestId as string);
-      if (entry) {
-        const r = params.response as {
-          status?: number; statusText?: string; mimeType?: string;
-          headers?: Record<string, string>;
-        } | undefined;
-        if (r) {
-          entry.status = r.status;
-          entry.statusText = r.statusText;
-          entry.mimeType = r.mimeType;
-          entry.responseHeaders = r.headers;
-        }
-        entry.endTime = Date.now();
-      }
-      break;
-    }
-    case 'Network.loadingFinished': {
-      const entry = networkLog.get(params.requestId as string);
-      if (entry) {
-        entry.endTime = entry.endTime || Date.now();
-        if (typeof params.encodedDataLength === 'number') entry.size = params.encodedDataLength;
-      }
-      break;
-    }
-    case 'Network.loadingFailed': {
-      const entry = networkLog.get(params.requestId as string);
-      if (entry) {
-        entry.error = (params.errorText as string) || 'Failed';
-        entry.endTime = Date.now();
-      }
-      break;
-    }
-  }
-}
-
 let relayStartPromise: Promise<void> | null = null;
 
 async function ensureRelayServer(): Promise<void> {
@@ -474,16 +58,10 @@ async function ensureRelayServer(): Promise<void> {
     const response = await fetch(`http://localhost:${getRelayPort()}/version`, {
       signal: AbortSignal.timeout(2000),
     });
-    if (response.ok) {
-      return;
-    }
-  } catch {
-    // relay not reachable, needs start
-  }
+    if (response.ok) return;
+  } catch { /* relay not reachable */ }
 
-  if (relayStartPromise) {
-    return relayStartPromise;
-  }
+  if (relayStartPromise) return relayStartPromise;
   relayStartPromise = doStartRelay();
   try {
     return await relayStartPromise;
@@ -496,32 +74,20 @@ async function doStartRelay(): Promise<void> {
   log('Relay server not running, attempting to start...');
   try {
     const { spawn } = await import('child_process');
-    const path = await import('path');
-    const { fileURLToPath } = await import('url');
-
-    const __dirname = path.dirname(fileURLToPath(import.meta.url));
-    const relayPath = path.join(__dirname, 'relay.js');
-
-    relayServerProcess = spawn('node', [relayPath], {
-      stdio: 'ignore',
-      detached: true,
-    });
-
+    const relayPath = path.join(__mcpDirname, 'relay.js');
+    relayServerProcess = spawn('node', [relayPath], { stdio: 'ignore', detached: true });
     relayServerProcess.unref();
 
     for (let i = 0; i < 10; i++) {
       await sleep(1000);
       try {
-        await fetch(`http://localhost:${getRelayPort()}/version`, {
-          signal: AbortSignal.timeout(1000),
-        });
+        await fetch(`http://localhost:${getRelayPort()}/version`, { signal: AbortSignal.timeout(1000) });
         log('Relay server started successfully');
         return;
       } catch {
         log('Waiting for relay server...');
       }
     }
-
     throw new Error('Failed to start relay server after 10 attempts');
   } catch (e) {
     error('Error starting relay server:', e);
@@ -529,20 +95,164 @@ async function doStartRelay(): Promise<void> {
   }
 }
 
-async function requestExtensionAttachTab(): Promise<boolean> {
+// ---------------------------------------------------------------------------
+// Agent session management
+// ---------------------------------------------------------------------------
+
+const MCP_CLIENT_ID = generateMcpClientId();
+const agentLabel = getAgentLabel();
+const projectUrl = getProjectUrl();
+
+interface AgentSession {
+  agentId: string;
+  clientId: string;
+  executorSessionId: string;
+}
+
+const agentSessions = new Map<string, AgentSession>();
+let activeAgentId: string | null = null;
+
+function getEffectiveClientId(agentId?: string): string {
+  if (!agentId) return MCP_CLIENT_ID;
+  return `${MCP_CLIENT_ID}::${agentId}`;
+}
+
+function getAgentSession(agentId: string): AgentSession {
+  let session = agentSessions.get(agentId);
+  if (!session) {
+    session = {
+      agentId,
+      clientId: getEffectiveClientId(agentId),
+      executorSessionId: `mcp-${agentId}`,
+    };
+    agentSessions.set(agentId, session);
+  }
+  return session;
+}
+
+// ---------------------------------------------------------------------------
+// Executor management
+// ---------------------------------------------------------------------------
+
+const executorManager = new ExecutorManager({ maxSessions: 10 });
+
+async function getOrCreateExecutor(agentId?: string): Promise<PlaywrightExecutor> {
+  const effectiveId = agentId || activeAgentId;
+  const sessionId = effectiveId ? `mcp-${effectiveId}` : 'mcp-default';
+  return executorManager.getOrCreate(sessionId);
+}
+
+// ---------------------------------------------------------------------------
+// MCP result formatting
+// ---------------------------------------------------------------------------
+
+function formatMcpResult(result: ExecuteResult): {
+  content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  isError?: boolean;
+} {
+  const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+
+  if (result.text) {
+    content.push({ type: 'text', text: result.text });
+  }
+  for (const img of result.images) {
+    content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+  }
+  if (content.length === 0) {
+    content.push({ type: 'text', text: 'Code executed successfully (no output)' });
+  }
+
+  return { content, isError: result.isError || undefined };
+}
+
+// ---------------------------------------------------------------------------
+// Tab management (relay HTTP API — stays in MCP, not in executor)
+// ---------------------------------------------------------------------------
+
+async function handleTabAction(
+  action: string,
+  args: Record<string, unknown>,
+): Promise<{ content: Array<{ type: string; text?: string }>; isError?: boolean }> {
   const port = getRelayPort();
-  try {
-    const response = await fetch(`http://localhost:${port}/connect-active-tab`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-      signal: AbortSignal.timeout(15000),
-    });
-    const result = await response.json() as { success?: boolean };
-    return !!result.success;
-  } catch (e) {
-    error('Failed to request extension to attach tab:', e);
-    return false;
+  const sessionId = args.session_id as string | undefined;
+  if (sessionId) activeAgentId = sessionId;
+  const effectiveClientId = getEffectiveClientId(sessionId);
+
+  switch (action) {
+    case 'list': {
+      await ensureRelayServer();
+      const targets = await getTargets(port);
+      if (targets.length === 0) {
+        return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab, or use tab { action: "connect", url: "..." } to attach one.' }] };
+      }
+      const lines = targets.map((t, i) => {
+        const markers: string[] = [];
+        if (t.lease?.clientId === effectiveClientId) markers.push('MINE');
+        else if (t.lease) markers.push(`LEASED by ${t.lease.label || t.lease.clientId}`);
+        else markers.push('AVAILABLE');
+        const tabLabel = t.tabId != null ? ` (tabId: ${t.tabId})` : '';
+        return `${i + 1}. [${t.id}]${tabLabel} ← ${markers.join(', ')}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
+      });
+      const myTabs = targets.filter(t => t.lease?.clientId === effectiveClientId);
+      const otherTabs = targets.filter(t => t.lease && t.lease.clientId !== effectiveClientId);
+      const availableTabs = targets.filter(t => !t.lease);
+      const summary = `${targets.length} tab(s), ${myTabs.length} mine, ${otherTabs.length} leased by others, ${availableTabs.length} available`;
+      return { content: [{ type: 'text', text: `${summary}\n\n${lines.join('\n\n')}` }] };
+    }
+
+    case 'connect': {
+      await ensureRelayServer();
+      const url = args.url as string | undefined;
+      const tabId = args.tabId as number | undefined;
+      const create = args.create as boolean | undefined;
+      if (!url && tabId === undefined) {
+        return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter', hint: 'Provide either url or tabId to identify the tab to connect' }) }], isError: true };
+      }
+      let result = await requestConnectTab(port, { url, tabId, create });
+      if (!result.success && (result as any).error === 'Extension not connected') {
+        for (let retry = 0; retry < 6; retry++) {
+          await sleep(2000);
+          result = await requestConnectTab(port, { url, tabId, create });
+          if (result.success || (result as any).error !== 'Extension not connected') break;
+        }
+      }
+      if (!result.success) {
+        return { content: [{ type: 'text', text: formatError({ error: `Failed to connect tab: ${(result as any).error || 'Unknown error'}`, recovery: 'reset' }) }], isError: true };
+      }
+      await sleep(500);
+      const targets = await getTargets(port);
+      const newTarget = targets.find(t => t.tabId === result.tabId);
+      const created = result.created ? ' (newly created)' : '';
+      const info = newTarget
+        ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}`
+        : `Tab attached${created} (tabId: ${result.tabId}). Use tab { action: "list" } to see it.`;
+      return { content: [{ type: 'text', text: info }] };
+    }
+
+    case 'switch': {
+      const targetId = args.targetId as string;
+      if (!targetId) {
+        return { content: [{ type: 'text', text: formatError({ error: 'targetId is required', hint: 'Use tab { action: "list" } to see available targets' }) }], isError: true };
+      }
+      await ensureRelayServer();
+      const targets = await getTargets(port);
+      const target = targets.find(t => t.id === targetId);
+      if (!target) {
+        const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
+        return { content: [{ type: 'text', text: formatError({ error: `Target "${targetId}" not found`, hint: `Available targets:\n${available}` }) }], isError: true };
+      }
+      if (target.lease && target.lease.clientId !== effectiveClientId) {
+        return { content: [{ type: 'text', text: formatError({ error: 'Tab leased by another agent', hint: `Tab ${targetId} is owned by "${target.lease.label || target.lease.clientId}"` }) }], isError: true };
+      }
+      return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}` }] };
+    }
+
+    case 'release': {
+      return { content: [{ type: 'text', text: 'Tab released.' }] };
+    }
+
+    default:
+      return { content: [{ type: 'text', text: formatError({ error: `Unknown tab action: ${action}`, hint: 'Valid actions: connect, list, switch, release' }) }], isError: true };
   }
 }
 
@@ -552,205 +262,19 @@ interface TargetListItem {
   type: string;
   title: string;
   url: string;
-  webSocketDebuggerUrl: string;
-  lease?: LeaseInfo | null;
+  lease?: { clientId: string; label?: string } | null;
 }
 
-async function getTargets(): Promise<TargetListItem[]> {
-  const port = getRelayPort();
+async function getTargets(port: number): Promise<TargetListItem[]> {
   try {
-    const response = await fetch(`http://localhost:${port}/json/list`, {
-      signal: AbortSignal.timeout(2000),
-    });
+    const response = await fetch(`http://localhost:${port}/json/list`, { signal: AbortSignal.timeout(2000) });
     return await response.json() as TargetListItem[];
   } catch {
     return [];
   }
 }
 
-function connectCdp(sessionId: string, clientIdOverride?: string): Promise<CdpSession> {
-  const port = getRelayPort();
-  const token = getRelayToken();
-  const effectiveId = clientIdOverride || MCP_CLIENT_ID;
-  const baseUrl = `ws://127.0.0.1:${port}/cdp/${effectiveId}`;
-  const wsUrl = token ? `${baseUrl}?token=${token}` : baseUrl;
-
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl);
-    const timeout = setTimeout(() => {
-      ws.close();
-      reject(new Error('CDP WebSocket connection timeout'));
-    }, 10000);
-
-    ws.on('open', () => {
-      clearTimeout(timeout);
-      const session: CdpSession = {
-        ws,
-        sessionId,
-        nextId: 1,
-        pendingRequests: new Map(),
-      };
-
-      // Heartbeat: detect silent disconnects
-      let pongReceived = true;
-      const heartbeat = setInterval(() => {
-        if (!pongReceived) {
-          log('CDP heartbeat timeout, closing connection');
-          clearInterval(heartbeat);
-          ws.terminate();
-          return;
-        }
-        pongReceived = false;
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.ping();
-        }
-      }, 30000);
-
-      ws.on('pong', () => {
-        pongReceived = true;
-      });
-
-      ws.on('message', (data: Buffer) => {
-        try {
-          const msg = JSON.parse(data.toString()) as { id?: number; method?: string; params?: Record<string, unknown>; result?: unknown; error?: { message: string } };
-          if (msg.id !== undefined) {
-            const pending = session.pendingRequests.get(msg.id);
-            if (pending) {
-              session.pendingRequests.delete(msg.id);
-              clearTimeout(pending.timer);
-              if (msg.error) {
-                pending.reject(new Error(msg.error.message));
-              } else {
-                pending.resolve(msg.result);
-              }
-            }
-            return;
-          }
-
-          if (msg.method && msg.params) {
-            handleCdpEvent(msg.method, msg.params);
-            handleDebuggerEvent(msg.method, msg.params);
-            handleLeaseEvent(msg.method, msg.params);
-            if (msg.method === 'Fetch.requestPaused' && interceptEnabled) {
-              handleFetchPaused(session, msg.params).catch(() => {});
-            }
-          }
-        } catch {
-          // ignore parse errors
-        }
-      });
-
-      ws.on('close', () => {
-        clearInterval(heartbeat);
-        for (const pending of session.pendingRequests.values()) {
-          clearTimeout(pending.timer);
-          pending.reject(new Error('CDP connection closed'));
-        }
-        session.pendingRequests.clear();
-        if (cdpSession === session) {
-          cdpSession = null;
-        }
-      });
-
-      ws.on('error', (err) => {
-        error('CDP WebSocket error:', err.message);
-      });
-
-      resolve(session);
-    });
-
-    ws.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(new Error(`CDP connection failed: ${err.message}`));
-    });
-  });
-}
-
-function sendCdpCommand(session: CdpSession, method: string, params?: Record<string, unknown>, commandTimeout = 30000): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    if (session.ws.readyState !== WebSocket.OPEN) {
-      reject(new Error('CDP connection not open'));
-      return;
-    }
-    const id = session.nextId++;
-    const timer = setTimeout(() => {
-      session.pendingRequests.delete(id);
-      reject(new Error(`CDP command timeout: ${method}`));
-    }, commandTimeout);
-
-    session.pendingRequests.set(id, { resolve, reject, timer });
-
-    const message: Record<string, unknown> = { id, method };
-    if (session.sessionId) {
-      message.sessionId = session.sessionId;
-    }
-    if (params) {
-      message.params = params;
-    }
-    session.ws.send(JSON.stringify(message));
-  });
-}
-
-let leaseSupported: boolean | null = null;
-
-async function acquireLease(session: CdpSession, targetSessionId: string): Promise<boolean> {
-  if (leaseSupported === false) return true;
-  try {
-    const result = await sendCdpCommand(session, 'Target.acquireLease', {
-      sessionId: targetSessionId,
-      label: agentLabel,
-    }) as { granted?: boolean };
-    leaseSupported = true;
-    return !!result?.granted;
-  } catch (e) {
-    log(`Lease acquisition failed for ${targetSessionId}: ${e}`);
-    if (leaseSupported === null) {
-      log('Lease commands not supported by relay — running without isolation');
-      leaseSupported = false;
-      return true;
-    }
-    return false;
-  }
-}
-
-async function releaseLease(session: CdpSession, targetSessionId: string): Promise<void> {
-  try {
-    const result = await sendCdpCommand(session, 'Target.releaseLease', { sessionId: targetSessionId });
-    log(`releaseLease result for ${targetSessionId}:`, JSON.stringify(result));
-  } catch (e) {
-    error(`releaseLease failed for ${targetSessionId}:`, e);
-  }
-}
-
-async function releaseAllMyLeases(session: CdpSession, agentId?: string): Promise<void> {
-  const effectiveClientId = getEffectiveClientId(agentId);
-  try {
-    const targets = await getTargets();
-    for (const t of targets) {
-      if (t.lease?.clientId === effectiveClientId) {
-        await releaseLease(session, t.id);
-      }
-    }
-  } catch {
-    // Best effort
-  }
-}
-
-async function enableDomains(session: CdpSession): Promise<void> {
-  try {
-    await sendCdpCommand(session, 'Network.enable', {
-      maxTotalBufferSize: 10 * 1024 * 1024,
-      maxResourceBufferSize: 5 * 1024 * 1024,
-      maxPostDataSize: 65536,
-    });
-    await sendCdpCommand(session, 'Runtime.enable');
-  } catch {
-    log('Domain enable failed (may already be enabled by relay)');
-  }
-}
-
-async function requestConnectTab(params: { url?: string; tabId?: number; create?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
-  const port = getRelayPort();
+async function requestConnectTab(port: number, params: { url?: string; tabId?: number; create?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
   try {
     const response = await fetch(`http://localhost:${port}/connect-tab`, {
       method: 'POST',
@@ -765,537 +289,13 @@ async function requestConnectTab(params: { url?: string; tabId?: number; create?
   }
 }
 
-async function ensureSession(agentId?: string): Promise<CdpSession> {
-  // Use the explicit agentId, or fall back to the sticky active agent session
-  const effectiveId = agentId || activeAgentId;
-
-  if (effectiveId) {
-    const agent = getAgentSession(effectiveId);
-    if (agent.cdpSession?.ws.readyState === WebSocket.OPEN) {
-      return agent.cdpSession;
-    }
-    if (agent.sessionPromise) return agent.sessionPromise;
-    agent.sessionPromise = doEnsureSession(effectiveId);
-    try {
-      return await agent.sessionPromise;
-    } finally {
-      agent.sessionPromise = null;
-    }
-  }
-
-  if (cdpSession?.ws.readyState === WebSocket.OPEN) {
-    return cdpSession;
-  }
-  // Mutex: if another call is already establishing a session, piggyback on it
-  if (sessionPromise) {
-    return sessionPromise;
-  }
-  sessionPromise = doEnsureSession();
-  try {
-    return await sessionPromise;
-  } finally {
-    sessionPromise = null;
-  }
-}
-
-async function doEnsureSession(agentId?: string): Promise<CdpSession> {
-  const effectiveClientId = getEffectiveClientId(agentId);
-  const agent = agentId ? getAgentSession(agentId) : null;
-  const currentPreferredTarget = agent ? agent.preferredTargetId : preferredTargetId;
-
-  if (agent) {
-    agent.cdpSession = null;
-  } else {
-    cdpSession = null;
-  }
-
-  await ensureRelayServer();
-
-  let targets = await getTargets();
-
-  function setSession(s: CdpSession, targetId: string): CdpSession {
-    if (agent) {
-      agent.cdpSession = s;
-      agent.preferredTargetId = targetId;
-    } else {
-      cdpSession = s;
-      preferredTargetId = targetId;
-    }
-    return s;
-  }
-
-  // Phase 1: Reconnect to my existing lease
-  const myLeased = targets.find(t => t.lease?.clientId === effectiveClientId);
-  if (myLeased) {
-    log(`Reconnecting to previously leased tab: ${myLeased.url} (clientId: ${effectiveClientId})`);
-    const s = await connectCdp(myLeased.id, agentId ? effectiveClientId : undefined);
-    await enableDomains(s);
-    await setTabTitlePrefix(s, '🟢 ');
-    return setSession(s, myLeased.id);
-  }
-
-  // Phase 2: Find an unleased tab
-  let unleased = targets.filter(t => !t.lease);
-
-  if (projectUrl && unleased.length > 1) {
-    const matching = unleased.filter(t => t.url?.includes(projectUrl));
-    if (matching.length > 0) {
-      unleased = [...matching, ...unleased.filter(t => !t.url?.includes(projectUrl))];
-    }
-  }
-
-  if (currentPreferredTarget) {
-    const preferred = unleased.find(t => t.id === currentPreferredTarget);
-    if (preferred) {
-      unleased = [preferred, ...unleased.filter(t => t.id !== currentPreferredTarget)];
-    }
-  }
-
-  for (const candidate of unleased) {
-    let s: CdpSession | null = null;
-    try {
-      s = await connectCdp(candidate.id, agentId ? effectiveClientId : undefined);
-      const leased = await acquireLease(s, candidate.id);
-      if (leased) {
-        log(`Acquired lease on tab: ${candidate.url} (clientId: ${effectiveClientId})`);
-        await enableDomains(s);
-        await setTabTitlePrefix(s, '🟢 ');
-        return setSession(s, candidate.id);
-      }
-      s.ws.close();
-    } catch (e) {
-      log(`Failed to connect to candidate ${candidate.id}: ${e}`);
-      if (s) s.ws.close();
-    }
-  }
-
-  // Phase 3: Auto-attach by project URL
-  if (projectUrl) {
-    log(`No unleased tabs, attempting auto-attach by URL: ${projectUrl}`);
-    const attached = await requestConnectTab({ url: projectUrl });
-    if (attached.success) {
-      await sleep(1000);
-      targets = await getTargets();
-      const newTarget = targets.find(t => !t.lease || t.lease.clientId === effectiveClientId);
-      if (newTarget) {
-        const s = await connectCdp(newTarget.id, agentId ? effectiveClientId : undefined);
-        await acquireLease(s, newTarget.id);
-        await enableDomains(s);
-        await setTabTitlePrefix(s, '🟢 ');
-        return setSession(s, newTarget.id);
-      }
-    }
-  }
-
-  // Phase 4: Fallback — request active tab
-  if (targets.length === 0) {
-    log('No targets at all, requesting extension to attach active tab...');
-    await requestExtensionAttachTab();
-    for (let i = 0; i < 10; i++) {
-      await sleep(1000);
-      targets = await getTargets();
-      const available = targets.find(t => !t.lease);
-      if (available) {
-        const s = await connectCdp(available.id, agentId ? effectiveClientId : undefined);
-        await acquireLease(s, available.id);
-        await enableDomains(s);
-        await setTabTitlePrefix(s, '🟢 ');
-        return setSession(s, available.id);
-      }
-      if (targets.length > 0) break;
-    }
-  }
-
-  // Phase 5: All tabs leased by others
-  const leasedCount = targets.filter(t => t.lease).length;
-  if (targets.length > 0 && leasedCount === targets.length) {
-    const holders = targets.map(t => {
-      const l = t.lease!;
-      return `  • ${t.url || '(no url)'} — leased by ${l.label || l.clientId}`;
-    }).join('\n');
-    throw new Error(
-      `All ${targets.length} attached tab(s) are leased by other agents:\n${holders}\n\n` +
-      `To get a tab for this agent:\n` +
-      `  1. Use connect_tab { url: "your-app-url", session_id: "my-session" } to auto-attach a matching Chrome tab\n` +
-      `  2. Open a Chrome tab and click the spawriter toolbar icon\n` +
-      `  3. Use connect_tab { url: "your-url", create: true, session_id: "my-session" } to create and attach a new tab`
-    );
-  }
-
-  throw new Error(
-    'No browser tab attached. Click the extension toolbar icon on a web page tab to attach it, or use connect_tab to attach one.'
-  );
-}
-
-const SLOW_CDP_COMMANDS = new Set([
-  'Accessibility.getFullAXTree',
-  'Page.captureScreenshot',
-  'Page.reload',
-  'Page.navigate',
-]);
-
-function getCommandTimeout(method: string): number {
-  return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
-}
-
-async function evaluateJs(session: CdpSession, expression: string, evalTimeout = 30000): Promise<unknown> {
-  const result = await sendCdpCommand(session, 'Runtime.evaluate', {
-    expression,
-    returnByValue: true,
-    awaitPromise: true,
-    timeout: evalTimeout,
-  }, evalTimeout + 5000) as { result?: { value?: unknown; type?: string; description?: string }; exceptionDetails?: { text?: string } };
-
-  if (result.exceptionDetails) {
-    throw new Error(`JS error: ${result.exceptionDetails.text}`);
-  }
-  return result.result?.value;
-}
-
 // ---------------------------------------------------------------------------
-// Structured error formatting
+// MCP Server setup — 4 tools
 // ---------------------------------------------------------------------------
-
-interface StructuredError {
-  error: string;
-  hint?: string;
-  recovery?: string;
-}
-
-function formatError(err: StructuredError): string {
-  const parts = [`Error: ${err.error}`];
-  if (err.hint) parts.push(`Hint: ${err.hint}`);
-  if (err.recovery) parts.push(`Recovery: call "${err.recovery}" tool`);
-  return parts.join('\n');
-}
-
-interface AXNode {
-  nodeId: string;
-  parentId?: string;
-  backendDOMNodeId?: number;
-  role?: { type: string; value: string };
-  name?: { type: string; value: string };
-  properties?: Array<{ name: string; value: { type: string; value: unknown } }>;
-  childIds?: string[];
-  ignored?: boolean;
-}
-
-function formatAXTreeAsText(nodes: AXNode[], assignRefs: boolean = false, targetId?: string): string {
-  const refCache = (assignRefs && targetId) ? getRefCache(targetId) : new Map<number, RefInfo>();
-  if (assignRefs) refCache.clear();
-
-  const interactiveNodeIds = assignRefs ? new Set(
-    getInteractiveElements(nodes).map(e => e.backendDOMNodeId)
-  ) : new Set<number>();
-
-  const nodeMap = new Map<string, AXNode>();
-  for (const node of nodes) {
-    nodeMap.set(node.nodeId, node);
-  }
-
-  const lines: string[] = [];
-  let refIdx = 1;
-
-  function walk(nodeId: string, depth: number) {
-    const node = nodeMap.get(nodeId);
-    if (!node) return;
-    if (node.ignored) {
-      for (const childId of node.childIds ?? []) {
-        walk(childId, depth);
-      }
-      return;
-    }
-
-    const role = node.role?.value ?? '';
-    const name = node.name?.value ?? '';
-
-    const props: string[] = [];
-    for (const prop of node.properties ?? []) {
-      const v = prop.value?.value;
-      if (v === undefined || v === false || v === '') continue;
-      if (prop.name === 'focusable') continue;
-      props.push(`${prop.name}=${typeof v === 'string' ? v : JSON.stringify(v)}`);
-    }
-
-    const indent = '  '.repeat(depth);
-    const nameStr = name ? ` "${name}"` : '';
-    const propsStr = props.length > 0 ? ` [${props.join(', ')}]` : '';
-
-    const isInteractive = assignRefs && node.backendDOMNodeId && interactiveNodeIds.has(node.backendDOMNodeId);
-    let refPrefix = '';
-    if (isInteractive && node.backendDOMNodeId) {
-      refPrefix = `@${refIdx} `;
-      refCache.set(refIdx, {
-        backendDOMNodeId: node.backendDOMNodeId,
-        role,
-        name,
-      });
-      refIdx++;
-    }
-
-    if (role || name) {
-      lines.push(`${indent}${refPrefix}${role}${nameStr}${propsStr}`);
-    }
-
-    for (const childId of node.childIds ?? []) {
-      walk(childId, depth + 1);
-    }
-  }
-
-  const rootNode = nodes.find((n) => !n.parentId);
-  if (rootNode) {
-    walk(rootNode.nodeId, 0);
-  }
-
-  return lines.join('\n') || '(empty accessibility tree)';
-}
-
-// ---------------------------------------------------------------------------
-// Accessibility snapshot diff & search
-// ---------------------------------------------------------------------------
-
-let lastSnapshot: string | null = null;
-
-// ---------------------------------------------------------------------------
-// Ref cache: maps @ref numbers to backendDOMNodeId (per-tab isolation)
-// ---------------------------------------------------------------------------
-
-interface RefInfo { backendDOMNodeId: number; role: string; name: string }
-
-const refCacheByTab: Map<string, Map<number, RefInfo>> = new Map();
-
-function getRefCache(targetId: string): Map<number, RefInfo> {
-  if (!refCacheByTab.has(targetId)) {
-    refCacheByTab.set(targetId, new Map());
-  }
-  return refCacheByTab.get(targetId)!;
-}
-
-// ---------------------------------------------------------------------------
-// Tab title prefix — update via CDP to reflect lease state
-// ---------------------------------------------------------------------------
-
-const TITLE_PREFIX_RE = /^(?:🟢 |🟡 |🔴 |🔵 )+/;
-
-async function setTabTitlePrefix(session: CdpSession, prefix: string | null) {
-  const reSrc = '^(?:🟢 |🟡 |🔴 |🔵 )+';
-  const code = prefix
-    ? `(() => { document.title = ${JSON.stringify(prefix)} + document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`
-    : `(() => { document.title = document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`;
-  await evaluateJs(session, code).catch(() => {});
-}
-
-// ---------------------------------------------------------------------------
-// Debugger state
-// ---------------------------------------------------------------------------
-
-let debuggerEnabled = false;
-const breakpoints = new Map<string, { id: string; file: string; line: number }>();
-let debuggerPaused = false;
-let currentCallFrameId: string | null = null;
-const knownScripts = new Map<string, { scriptId: string; url: string }>();
-
-function handleDebuggerEvent(method: string, params: Record<string, unknown>) {
-  switch (method) {
-    case 'Debugger.paused': {
-      debuggerPaused = true;
-      const callFrames = params.callFrames as Array<{ callFrameId: string }> | undefined;
-      currentCallFrameId = callFrames?.[0]?.callFrameId ?? null;
-      break;
-    }
-    case 'Debugger.resumed':
-      debuggerPaused = false;
-      currentCallFrameId = null;
-      break;
-    case 'Debugger.scriptParsed': {
-      const url = params.url as string | undefined;
-      const scriptId = params.scriptId as string | undefined;
-      if (url && scriptId && !url.startsWith('chrome') && !url.startsWith('devtools')) {
-        knownScripts.set(scriptId, { scriptId, url });
-      }
-      break;
-    }
-  }
-}
-
-function invalidateSessionByTargetId(targetSessionId: string) {
-  if (cdpSession?.sessionId === targetSessionId) {
-    log(`Invalidating global cdpSession (sessionId: ${targetSessionId})`);
-    cdpSession = null;
-  }
-  for (const [agentId, agent] of agentSessions) {
-    if (agent.cdpSession?.sessionId === targetSessionId) {
-      log(`Invalidating agent session ${agentId} (sessionId: ${targetSessionId})`);
-      agent.cdpSession = null;
-    }
-  }
-}
-
-function handleLeaseEvent(method: string, params: Record<string, unknown>) {
-  if (method === 'Target.leaseLost') {
-    const lostSessionId = params.sessionId as string | undefined;
-    const reason = params.reason as string | undefined;
-    log(`Lease lost for tab ${lostSessionId}: ${reason}`);
-    if (lostSessionId) invalidateSessionByTargetId(lostSessionId);
-  }
-  if (method === 'Target.detachedFromTarget') {
-    const detachedSessionId = params.sessionId as string | undefined;
-    const reason = params.reason as string | undefined;
-    log(`Target detached: ${detachedSessionId} (${reason})`);
-    if (detachedSessionId) invalidateSessionByTargetId(detachedSessionId);
-  }
-  if (method === 'Target.tabAvailable') {
-    const info = params.targetInfo as { url?: string } | undefined;
-    log(`New tab available: ${info?.url || '(unknown)'} (${params.totalAvailable} total available)`);
-  }
-  if (method === 'Target.leaseReleased') {
-    log(`Tab lease released: ${params.sessionId} (${params.reason})`);
-  }
-}
-
-function stripRefPrefixes(text: string): string {
-  return text.replace(/^(\s*)@\d+ /gm, '$1');
-}
-
-function computeSnapshotDiff(oldSnap: string, newSnap: string): string {
-  const oldLines = stripRefPrefixes(oldSnap).split('\n');
-  const newLines = stripRefPrefixes(newSnap).split('\n');
-  const oldSet = new Set(oldLines);
-  const newSet = new Set(newLines);
-
-  const added = newLines.filter(l => !oldSet.has(l));
-  const removed = oldLines.filter(l => !newSet.has(l));
-
-  if (added.length === 0 && removed.length === 0) {
-    return 'No changes since last snapshot.';
-  }
-
-  const parts: string[] = [];
-  if (removed.length > 0) {
-    parts.push(`Removed (${removed.length}):\n${removed.map(l => `- ${l}`).join('\n')}`);
-  }
-  if (added.length > 0) {
-    parts.push(`Added (${added.length}):\n${added.map(l => `+ ${l}`).join('\n')}`);
-  }
-  return parts.join('\n\n');
-}
-
-function searchSnapshot(snapshot: string, query: string): string {
-  const lines = snapshot.split('\n');
-  const lowerQuery = query.toLowerCase();
-  const matchIndices: number[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].toLowerCase().includes(lowerQuery)) {
-      matchIndices.push(i);
-      if (matchIndices.length >= 20) break;
-    }
-  }
-
-  if (matchIndices.length === 0) return 'No matches found';
-
-  const CONTEXT_LINES = 3;
-  const included = new Set<number>();
-  for (const idx of matchIndices) {
-    for (let i = Math.max(0, idx - CONTEXT_LINES); i <= Math.min(lines.length - 1, idx + CONTEXT_LINES); i++) {
-      included.add(i);
-    }
-  }
-
-  const sorted = [...included].sort((a, b) => a - b);
-  const result: string[] = [];
-  for (let i = 0; i < sorted.length; i++) {
-    if (i > 0 && sorted[i - 1] !== sorted[i] - 1) result.push('---');
-    const line = lines[sorted[i]];
-    const isMatch = line.toLowerCase().includes(lowerQuery);
-    result.push(isMatch ? `>>> ${line}` : `    ${line}`);
-  }
-
-  return `Search results for "${query}" (${matchIndices.length} matches):\n${result.join('\n')}`;
-}
-
-// ---------------------------------------------------------------------------
-// Labeled screenshot: inject numbered overlays on interactive elements
-// ---------------------------------------------------------------------------
-
-const INTERACTIVE_ROLES = new Set([
-  'button', 'link', 'textbox', 'searchbox', 'combobox', 'listbox',
-  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option',
-  'checkbox', 'radio', 'switch', 'slider', 'spinbutton',
-  'tab', 'treeitem', 'row',
-]);
-
-interface LabeledElement {
-  index: number;
-  role: string;
-  name: string;
-  backendDOMNodeId: number;
-}
-
-function getInteractiveElements(nodes: AXNode[]): LabeledElement[] {
-  const elements: LabeledElement[] = [];
-  let idx = 1;
-  for (const node of nodes) {
-    if (node.ignored) continue;
-    const role = node.role?.value;
-    if (!role || !INTERACTIVE_ROLES.has(role)) continue;
-    if (!node.backendDOMNodeId) continue;
-    elements.push({
-      index: idx++,
-      role,
-      name: node.name?.value ?? '',
-      backendDOMNodeId: node.backendDOMNodeId,
-    });
-  }
-  return elements;
-}
-
-function formatInteractiveSnapshot(elements: LabeledElement[]): string {
-  if (elements.length === 0) return 'No interactive elements found.';
-  const lines = elements.map(e =>
-    `@${e.index} [${e.role}]${e.name ? ` "${e.name}"` : ''}`
-  );
-  return `Interactive elements (${elements.length}):\n${lines.join('\n')}\n\n(Note: @ref numbers are display-only in this mode. Use accessibility_snapshot without interactive_only for full tree with actionable refs.)`;
-}
-
-function buildLabelInjectionScript(labels: Array<{ index: number; x: number; y: number; width: number; height: number }>): string {
-  return `(function() {
-    var container = document.createElement('div');
-    container.id = '__spawriter_labels__';
-    container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;';
-    ${labels.map(l => `
-    (function(){
-      var d=document.createElement('div');
-      d.textContent='${l.index}';
-      d.style.cssText='position:absolute;left:${l.x}px;top:${l.y}px;width:${Math.max(l.width, 14)}px;height:${Math.max(l.height, 14)}px;border:2px solid #e11d48;border-radius:3px;font-size:10px;font-weight:bold;color:#fff;background:rgba(225,29,72,0.85);display:flex;align-items:center;justify-content:center;line-height:1;pointer-events:none;';
-      container.appendChild(d);
-    })();`).join('')}
-    document.body.appendChild(container);
-  })()`;
-}
-
-const REMOVE_LABELS_SCRIPT = `(function() {
-  var el = document.getElementById('__spawriter_labels__');
-  if (el) el.remove();
-})()`;
-
-function formatLabelLegend(elements: LabeledElement[]): string {
-  if (elements.length === 0) return 'No interactive elements found.';
-  const lines = elements.map(e => `[${e.index}] ${e.role}${e.name ? ` "${e.name}"` : ''}`);
-  return `Interactive elements (${elements.length}):\n${lines.join('\n')}`;
-}
 
 const server = new Server(
-  {
-    name: 'spawriter',
-    version: VERSION,
-  },
-  {
-    capabilities: {
-      tools: {},
-      logging: {},
-    },
-  }
+  { name: 'spawriter', version: VERSION },
+  { capabilities: { tools: {}, logging: {} } },
 );
 
 function mcpLog(level: 'debug' | 'info' | 'warning' | 'error', data: string): void {
@@ -1312,7 +312,7 @@ const tools = [
       properties: {
         code: {
           type: 'string',
-          description: 'Playwright JS code. Globals: {page, context, state, singleSpa, tab, consoleLogs, networkLog, networkDetail, cssInspect, labeledScreenshot, accessibilitySnapshot, networkIntercept, dbg, browserFetch, storage, emulation, performance}. Use ; for multiple statements.',
+          description: 'Playwright JS code. Globals: {page, context, browser, state, singleSpa, snapshot, screenshotWithLabels, screenshot, consoleLogs, networkLog, networkDetail, networkIntercept, cssInspect, dbg, browserFetch, storage, emulation, performance, editor, pageContent, interact, clearCacheAndReload, navigate, ensureFreshRender, resetPlaywright, getCDPSession, getLatestLogs, clearAllLogs, clearNetworkLog, refToLocator}. Use ; for multiple statements.',
         },
         timeout: {
           type: 'number',
@@ -1324,25 +324,20 @@ const tools = [
   },
   {
     name: 'reset',
-    description: 'Recreates CDP connection and resets page/context/state. Also clears spawriter extensions state (console logs, intercept rules, debugger, snapshots, leases, agent sessions).',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {},
-    },
+    description: 'Reset Playwright connection and all state (console logs, network entries, debugger, intercept rules, snapshots, sessions).',
+    inputSchema: { type: 'object' as const, properties: {} },
   },
   {
     name: 'single_spa',
-    description: `Manage single-spa micro-frontend applications. This tool is spawriter-specific.
+    description: `Manage single-spa micro-frontend applications.
 
 Actions:
 - status: Get all app statuses + active import-map-overrides
 - override_set: Point an app to a local dev server URL
 - override_remove: Remove an override
-- override_enable / override_disable: Toggle an override without deleting
+- override_enable / override_disable: Toggle an override
 - override_reset_all: Clear all overrides
-- mount / unmount / unload: Force lifecycle action on an app
-
-After setting an override, reload the page to see changes.`,
+- mount / unmount / unload: Force lifecycle action on an app`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -1351,16 +346,15 @@ After setting an override, reload the page to see changes.`,
           enum: ['status', 'override_set', 'override_remove', 'override_enable', 'override_disable', 'override_reset_all', 'mount', 'unmount', 'unload'],
           description: 'Action to perform',
         },
-        appName: { type: 'string', description: 'App name (e.g. @org/navbar). Required for app-specific actions.' },
-        url: { type: 'string', description: 'Override URL (e.g. http://localhost:8080/main.js). Required for override_set.' },
+        appName: { type: 'string', description: 'App name (e.g. @org/navbar)' },
+        url: { type: 'string', description: 'Override URL (e.g. http://localhost:8080/main.js)' },
       },
       required: ['action'],
     },
   },
   {
     name: 'tab',
-    description: `Manage browser tabs via spawriter's Tab Lease System.
-Provides safe multi-agent tab sharing with explicit connect/release semantics.
+    description: `Manage browser tabs via the Tab Lease System.
 
 Actions:
 - connect: Connect to a tab by URL (create if not found with create=true)
@@ -1370,11 +364,7 @@ Actions:
     inputSchema: {
       type: 'object' as const,
       properties: {
-        action: {
-          type: 'string',
-          enum: ['connect', 'list', 'switch', 'release'],
-          description: 'Tab action to perform',
-        },
+        action: { type: 'string', enum: ['connect', 'list', 'switch', 'release'], description: 'Tab action' },
         url: { type: 'string', description: 'Tab URL (for connect)' },
         create: { type: 'boolean', description: 'Create new tab if not found (for connect)' },
         targetId: { type: 'string', description: 'Target session ID (for switch)' },
@@ -1386,1783 +376,81 @@ Actions:
   },
 ];
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools };
-});
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
-const MCP_REQUEST_TIMEOUT = 120000; // 2 minutes hard cap for any tool call
-
-function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        reject(new Error(`Tool "${toolName}" timed out after ${ms / 1000}s. The browser may be busy or unreachable. Try again or call reset.`));
-      }, ms);
-    }),
-  ]).finally(() => clearTimeout(timer));
-}
+const MCP_REQUEST_TIMEOUT = 120000;
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
   const handleToolCall = async () => {
-
-  // === NEW 4-TOOL HANDLERS ===
-
-  if (name === 'execute') {
-    const code = args.code as string;
-    const timeout = (args.timeout as number) || 30000;
-    if (!code) {
-      return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter: code' }) }], isError: true };
-    }
-
-    await ensureRelayServer();
-    const session = await ensureSession();
-
-    const toolCtx: ToolContext = {
-      executeTool: async (toolName: string, toolArgs: Record<string, unknown>) => {
-        return _legacyDispatch(toolName, toolArgs);
-      },
-    };
-
-    const executor = executorManager.getOrCreate('mcp-default');
-    injectSpawriterGlobals(executor, 'mcp-default', toolCtx);
-
-    const result = await executor.execute(code, timeout);
-
-    const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
-    if (result.text) {
-      content.push({ type: 'text', text: result.text });
-    }
-    for (const img of result.images) {
-      content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
-    }
-    if (content.length === 0) {
-      content.push({ type: 'text', text: 'Code executed successfully (no output)' });
-    }
-
-    return { content, isError: result.isError };
-  }
-
-  if (name === 'reset') {
-    if (cdpSession) {
-      await releaseAllMyLeases(cdpSession);
-      cdpSession.ws.close();
-      cdpSession = null;
-    }
-    for (const [id, agent] of agentSessions) {
-      if (agent.cdpSession) {
-        await releaseAllMyLeases(agent.cdpSession, id).catch(() => {});
-        agent.cdpSession.ws.close();
-      }
-    }
-    agentSessions.clear();
-    activeAgentId = null;
-    preferredTargetId = null;
-    clearConsoleLogs();
-    clearNetworkLog();
-    clearInterceptState();
-    lastSnapshot = null;
-    refCacheByTab.clear();
-    await pwExecutor.reset();
-    debuggerEnabled = false;
-    breakpoints.clear();
-    debuggerPaused = false;
-    currentCallFrameId = null;
-    knownScripts.clear();
-    await executorManager.resetAll();
-    return { content: [{ type: 'text', text: 'Connection reset. All state cleared (console logs, network entries, Playwright state, debugger, leases, agent sessions, executor sessions).' }] };
-  }
-
-  if (name === 'single_spa') {
-    const action = args.action as string;
-    const appName = args.appName as string | undefined;
-    const url = args.url as string | undefined;
-
-    switch (action) {
-      case 'status':
-        return _legacyDispatch('dashboard_state', { appName });
-      case 'override_set':
-        return _legacyDispatch('override_app', { action: 'set', appName, url });
-      case 'override_remove':
-        return _legacyDispatch('override_app', { action: 'remove', appName });
-      case 'override_enable':
-        return _legacyDispatch('override_app', { action: 'enable', appName });
-      case 'override_disable':
-        return _legacyDispatch('override_app', { action: 'disable', appName });
-      case 'override_reset_all':
-        return _legacyDispatch('override_app', { action: 'reset_all' });
-      case 'mount':
-      case 'unmount':
-      case 'unload':
-        return _legacyDispatch('app_action', { action, appName });
-      default:
-        return { content: [{ type: 'text', text: formatError({ error: `Unknown single_spa action: ${action}`, hint: 'Valid actions: status, override_set, override_remove, override_enable, override_disable, override_reset_all, mount, unmount, unload' }) }], isError: true };
-    }
-  }
-
-  if (name === 'tab') {
-    const action = args.action as string;
-    switch (action) {
-      case 'connect':
-        return _legacyDispatch('connect_tab', { url: args.url, tabId: args.tabId, create: args.create, session_id: args.session_id });
-      case 'list':
-        return _legacyDispatch('list_tabs', { session_id: args.session_id });
-      case 'switch':
-        return _legacyDispatch('switch_tab', { targetId: args.targetId, session_id: args.session_id });
-      case 'release':
-        return _legacyDispatch('release_tab', { targetId: args.targetId, session_id: args.session_id });
-      default:
-        return { content: [{ type: 'text', text: formatError({ error: `Unknown tab action: ${action}`, hint: 'Valid actions: connect, list, switch, release' }) }], isError: true };
-    }
-  }
-
-  return { content: [{ type: 'text', text: formatError({ error: `Unknown tool: ${name}`, hint: 'Available tools: execute, reset, single_spa, tab' }) }], isError: true };
-
-  async function _legacyDispatch(name: string, args: Record<string, unknown> = {}): Promise<any> {
-
-  if (name === 'reset') {
-    if (cdpSession) {
-      await releaseAllMyLeases(cdpSession);
-      cdpSession.ws.close();
-      cdpSession = null;
-    }
-    // Clean up all per-agent sessions
-    for (const [id, agent] of agentSessions) {
-      if (agent.cdpSession) {
-        await releaseAllMyLeases(agent.cdpSession, id).catch(() => {});
-        agent.cdpSession.ws.close();
-      }
-    }
-    agentSessions.clear();
-    activeAgentId = null;
-    preferredTargetId = null;
-    clearConsoleLogs();
-    clearNetworkLog();
-    clearInterceptState();
-    lastSnapshot = null;
-    refCacheByTab.clear();
-    await pwExecutor.reset();
-    debuggerEnabled = false;
-    breakpoints.clear();
-    debuggerPaused = false;
-    currentCallFrameId = null;
-    knownScripts.clear();
-    await executorManager.resetAll();
-    return { content: [{ type: 'text', text: 'Connection reset. Console logs, network entries, Playwright state, debugger state, leases, agent sessions, and sessions cleared.' }] };
-  }
-
-  if (name === 'list_tabs') {
-    await ensureRelayServer();
-    const targets = await getTargets();
-    const listSessionId = args.session_id as string | undefined;
-    if (listSessionId) activeAgentId = listSessionId;
-    const effectiveClientId = getEffectiveClientId(listSessionId);
-    if (targets.length === 0) {
-      return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab, or use connect_tab to attach one.' }] };
-    }
-    const activeSession = resolveActiveSession(listSessionId);
-    const activeSessionId = activeSession?.sessionId ?? null;
-    const myTabs = targets.filter(t => t.lease?.clientId === effectiveClientId);
-    const otherTabs = targets.filter(t => t.lease && t.lease.clientId !== effectiveClientId);
-    const availableTabs = targets.filter(t => !t.lease);
-
-    const lines = targets.map((t, i) => {
-      const markers: string[] = [];
-      if (t.id === activeSessionId) markers.push('ACTIVE');
-      if (t.lease?.clientId === effectiveClientId) {
-        markers.push('MINE');
-      } else if (t.lease) {
-        markers.push(`LEASED by ${t.lease.label || t.lease.clientId}`);
-      } else {
-        markers.push('AVAILABLE');
-      }
-      const markerStr = markers.join(', ');
-      const tabLabel = t.tabId != null ? ` (tabId: ${t.tabId})` : '';
-      return `${i + 1}. [${t.id}]${tabLabel} ← ${markerStr}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
-    });
-
-    const summary = [
-      `${targets.length} tab(s) attached`,
-      `${myTabs.length} mine`,
-      `${otherTabs.length} leased by others`,
-      `${availableTabs.length} available`,
-    ].join(', ');
-
-    return { content: [{ type: 'text', text: `${summary}\n\n${lines.join('\n\n')}` }] };
-  }
-
-  if (name === 'switch_tab') {
-    const targetId = args.targetId as string;
-    const switchSessionId = args.session_id as string | undefined;
-    const effectiveClientId = getEffectiveClientId(switchSessionId);
-    if (!targetId) {
-      return { content: [{ type: 'text', text: formatError({ error: 'targetId is required', hint: 'Use list_tabs to see available targets', recovery: 'list_tabs' }) }], isError: true };
-    }
-
-    await ensureRelayServer();
-    const targets = await getTargets();
-    const target = targets.find(t => t.id === targetId);
-    if (!target) {
-      const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
-      return { content: [{ type: 'text', text: formatError({ error: `Target "${targetId}" not found`, hint: `Available targets:\n${available}` }) }], isError: true };
-    }
-
-    if (target.lease && target.lease.clientId !== effectiveClientId) {
-      const holder = target.lease.label || target.lease.clientId;
-      return {
-        content: [{ type: 'text', text: formatError({ error: `Tab leased by another agent`, hint: `Tab ${targetId} is owned by "${holder}". Use list_tabs to find available tabs.`, recovery: 'list_tabs' }) }],
-        isError: true,
-      };
-    }
-
-    const currentSession = resolveActiveSession(switchSessionId);
-    if (currentSession?.sessionId === targetId && currentSession.ws.readyState === WebSocket.OPEN) {
-      activeAgentId = switchSessionId || null;
-      return { content: [{ type: 'text', text: `Already connected to this tab: ${target.title || target.url || '(no title)'}` }] };
-    }
-
-    activeAgentId = switchSessionId || null;
-
-    if (currentSession) {
-      currentSession.ws.close();
-    }
-    if (switchSessionId) {
-      const agent = getAgentSession(switchSessionId);
-      agent.cdpSession = null;
-    } else {
-      cdpSession = null;
-    }
-    clearConsoleLogs();
-    clearNetworkLog();
-    clearInterceptState();
-    lastSnapshot = null;
-    debuggerEnabled = false;
-    breakpoints.clear();
-    debuggerPaused = false;
-    currentCallFrameId = null;
-    knownScripts.clear();
-
-    let newSession: CdpSession;
-    try {
-      newSession = await connectCdp(targetId, switchSessionId ? effectiveClientId : undefined);
-    } catch (e) {
-      if (switchSessionId) {
-        getAgentSession(switchSessionId).preferredTargetId = null;
-      } else {
-        preferredTargetId = null;
-      }
-      return { content: [{ type: 'text', text: formatError({ error: 'CDP connection failed', hint: `Failed to connect to tab "${targetId}". The tab may have been closed or the relay may be unreachable.\nDetail: ${String(e)}`, recovery: 'reset' }) }], isError: true };
-    }
-
-    if (switchSessionId) {
-      const agent = getAgentSession(switchSessionId);
-      agent.cdpSession = newSession;
-      agent.preferredTargetId = targetId;
-      activeAgentId = switchSessionId;
-    } else {
-      cdpSession = newSession;
-      preferredTargetId = targetId;
-    }
-
-    if (!target.lease || target.lease.clientId !== effectiveClientId) {
-      const leased = await acquireLease(newSession, targetId);
-      if (!leased) {
-        return { content: [{ type: 'text', text: formatError({ error: 'Lease acquisition failed', hint: 'Another agent may have just claimed this tab', recovery: 'list_tabs' }) }], isError: true };
-      }
-    }
-
-    await enableDomains(newSession);
-    await setTabTitlePrefix(newSession, '🟢 ');
-
-    return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}\nSession: ${targetId}\n\nCleared: console logs, network entries, intercept rules, debugger state, snapshot baseline.\nPreserved: Playwright sessions, leases on other tabs.` }] };
-  }
-
-  if (name === 'connect_tab') {
-    await ensureRelayServer();
-    const url = args.url as string | undefined;
-    const tabId = args.tabId as number | undefined;
-    const create = args.create as boolean | undefined;
-    const connectSessionId = args.session_id as string | undefined;
-    const effectiveClientId = getEffectiveClientId(connectSessionId);
-
-    if (!url && tabId === undefined) {
-      return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter', hint: 'Provide either url or tabId to identify the tab to connect' }) }], isError: true };
-    }
-
-    let result = await requestConnectTab({ url, tabId, create });
-
-    if (!result.success && (result as { error?: string }).error === 'Extension not connected') {
-      log('Extension not connected, retrying connect_tab (waiting for extension service worker)...');
-      for (let retry = 0; retry < 6; retry++) {
-        await sleep(2000);
-        result = await requestConnectTab({ url, tabId, create });
-        if (result.success || (result as { error?: string }).error !== 'Extension not connected') break;
-        log(`connect_tab retry ${retry + 1}/6...`);
-      }
-    }
-
-    if (!result.success) {
-      return { content: [{ type: 'text', text: formatError({ error: `Failed to connect tab: ${(result as { error?: string }).error || 'Unknown error'}`, hint: 'Chrome tab may not be available or extension may not be loaded', recovery: 'reset' }) }], isError: true };
-    }
-
-    await sleep(500);
-    const targets = await getTargets();
-    const newTarget = targets.find(t => t.tabId === result.tabId);
-    const created = result.created ? ' (newly created)' : '';
-
-    activeAgentId = connectSessionId || null;
-
-    // Auto-acquire lease for the agent on the new tab
-    if (connectSessionId && newTarget) {
-      try {
-        const agent = getAgentSession(connectSessionId);
-        if (!agent.cdpSession || agent.cdpSession.ws.readyState !== WebSocket.OPEN) {
-          agent.cdpSession = await connectCdp(newTarget.id, effectiveClientId);
-          await enableDomains(agent.cdpSession);
-        }
-        await acquireLease(agent.cdpSession, newTarget.id);
-        await setTabTitlePrefix(agent.cdpSession, '🟢 ');
-        agent.preferredTargetId = newTarget.id;
-        activeAgentId = connectSessionId;
-        log(`Session "${connectSessionId}" acquired lease on tab: ${newTarget.url} (clientId: ${effectiveClientId})`);
-      } catch (e) {
-        log(`Session "${connectSessionId}" failed to acquire lease on new tab: ${e}`);
-      }
-    }
-
-    const info = newTarget
-      ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}\n${connectSessionId ? `  session_id: ${connectSessionId} (clientId: ${effectiveClientId})\n` : ''}\nUse switch_tab with targetId "${newTarget.id}" to activate it, or it will be auto-selected on the next tool call.`
-      : `Tab attached${created} (tabId: ${result.tabId}). Use list_tabs to see it.`;
-
-    return { content: [{ type: 'text', text: info }] };
-  }
-
-  if (name === 'release_tab') {
-    const releaseSessionId = args.session_id as string | undefined;
-    if (releaseSessionId) activeAgentId = releaseSessionId;
-    const activeSession = resolveActiveSession(releaseSessionId);
-    const targetId = (args.targetId as string | undefined) || activeSession?.sessionId;
-    if (!targetId) {
-      return { content: [{ type: 'text', text: formatError({ error: 'No tab connected', hint: 'No active tab to release. Specify targetId or ensure a session is active.', recovery: 'connect_tab' }) }], isError: true };
-    }
-
-    try {
-      const session = await ensureSession(releaseSessionId);
-      await setTabTitlePrefix(session, '🔵 ');
-      await releaseLease(session, targetId);
-      if (releaseSessionId) {
-        const agent = agentSessions.get(releaseSessionId);
-        if (agent && targetId === agent.cdpSession?.sessionId) {
-          agent.cdpSession = null;
-        }
-      } else if (targetId === cdpSession?.sessionId) {
-        cdpSession = null;
-      }
-      return { content: [{ type: 'text', text: `Released lease on tab ${targetId}. It is now available to other agents.` }] };
-    } catch (e) {
-      return { content: [{ type: 'text', text: formatError({ error: `Failed to release lease: ${e}`, hint: 'The CDP connection may have been lost', recovery: 'reset' }) }], isError: true };
-    }
-  }
-
-  if (name === 'playwright_execute') {
-    try {
-      await ensureRelayServer();
+    if (name === 'execute') {
       const code = args.code as string;
       const timeout = (args.timeout as number) || 30000;
-      const result = await pwExecutor.execute(code, timeout);
-      return {
-        content: [{ type: 'text', text: result.text }],
-        isError: result.isError || undefined,
-      };
-    } catch (e) {
-      error('Error in playwright_execute:', e);
-      return {
-        content: [{ type: 'text', text: formatError({ error: `Playwright execution failed: ${String(e)}`, hint: 'Relay server may not be running or CDP connection lost', recovery: 'reset' }) }],
-        isError: true,
-      };
-    }
-  }
-
-  if (name === 'console_logs') {
-    const logs = getConsoleLogs({
-      count: args.count as number | undefined,
-      level: args.level as string | undefined,
-      search: args.search as string | undefined,
-    });
-    const text = formatConsoleLogs(logs, consoleLogs.length);
-    if (args.clear) clearConsoleLogs();
-    return { content: [{ type: 'text', text }] };
-  }
-
-  if (name === 'network_log') {
-    const entries = getNetworkEntries({
-      count: args.count as number | undefined,
-      urlFilter: args.url_filter as string | undefined,
-      statusFilter: args.status_filter as string | undefined,
-    });
-    const text = formatNetworkEntries(entries, networkLog.size);
-    if (args.clear) clearNetworkLog();
-    return { content: [{ type: 'text', text }] };
-  }
-
-  if (name === 'network_detail') {
-    const requestId = args.requestId as string;
-    const entry = networkLog.get(requestId);
-    if (!entry) return { content: [{ type: 'text', text: `Request "${requestId}" not found. Use network_log to list available requests.` }] };
-
-    const includeStr = ((args.include as string) || 'all').toLowerCase();
-    const sections = includeStr === 'all'
-      ? ['request_headers', 'request_body', 'response_headers', 'response_body']
-      : includeStr.split(',').map(s => s.trim());
-    const maxBodySize = (args.max_body_size as number) ?? 10000;
-
-    const parts: string[] = [];
-    const dur = entry.endTime && entry.startTime ? `${entry.endTime - entry.startTime}ms` : 'pending';
-    parts.push(`Request: ${entry.method} ${entry.url}`);
-    parts.push(`Status: ${entry.status ?? '(pending)'} ${entry.statusText || ''}`);
-    parts.push(`Type: ${entry.resourceType || 'unknown'} | MIME: ${entry.mimeType || 'unknown'} | Duration: ${dur} | Size: ${entry.size ? `${(entry.size / 1024).toFixed(1)}KB` : 'unknown'}`);
-    if (entry.error) parts.push(`Error: ${entry.error}`);
-
-    if (sections.includes('request_headers') && entry.requestHeaders) {
-      const hdrs = Object.entries(entry.requestHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
-      parts.push(`\nRequest Headers:\n${hdrs}`);
+      if (!code) {
+        return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter: code' }) }], isError: true };
+      }
+      await ensureRelayServer();
+      const executor = await getOrCreateExecutor();
+      const result = await executor.execute(code, timeout);
+      return formatMcpResult(result);
     }
 
-    if (sections.includes('request_body')) {
-      if (entry.postData) {
-        let bodyText = entry.postData;
-        if (bodyText.length > maxBodySize && maxBodySize > 0) bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
-        parts.push(`\nRequest Body:\n${bodyText}`);
-      } else if (entry.hasPostData) {
-        try {
-          const session = await ensureSession();
-          const result = await sendCdpCommand(session, 'Network.getRequestPostData', { requestId }) as { postData?: string; base64Encoded?: boolean };
-          if (result?.postData) {
-            let bodyText = result.base64Encoded ? Buffer.from(result.postData, 'base64').toString('utf-8') : result.postData;
-            if (bodyText.length > maxBodySize && maxBodySize > 0) bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
-            parts.push(`\nRequest Body:\n${bodyText}`);
-          } else {
-            parts.push('\nRequest Body: (not available)');
-          }
-        } catch {
-          parts.push('\nRequest Body: (not available - request may have been evicted from buffer)');
-        }
-      } else {
-        parts.push('\nRequest Body: (none - GET or no body)');
-      }
+    if (name === 'reset') {
+      await executorManager.resetAll();
+      agentSessions.clear();
+      activeAgentId = null;
+      return { content: [{ type: 'text', text: 'Connection reset. All state cleared (console logs, network entries, Playwright state, debugger, intercept rules, snapshots, sessions).' }] };
     }
 
-    if (sections.includes('response_headers') && entry.responseHeaders) {
-      const hdrs = Object.entries(entry.responseHeaders).map(([k, v]) => `  ${k}: ${v}`).join('\n');
-      parts.push(`\nResponse Headers:\n${hdrs}`);
+    if (name === 'single_spa') {
+      const action = args.action as string;
+      const appName = args.appName as string | undefined;
+      const url = args.url as string | undefined;
+
+      await ensureRelayServer();
+      const executor = await getOrCreateExecutor();
+
+      let code: string;
+      switch (action) {
+        case 'status':
+          code = `await singleSpa.status(${appName ? JSON.stringify(appName) : ''})`;
+          break;
+        case 'override_set':
+          code = `await singleSpa.override('set', ${JSON.stringify(appName)}, ${JSON.stringify(url)})`;
+          break;
+        case 'override_remove':
+          code = `await singleSpa.override('remove', ${JSON.stringify(appName)})`;
+          break;
+        case 'override_enable':
+          code = `await singleSpa.override('enable', ${JSON.stringify(appName)})`;
+          break;
+        case 'override_disable':
+          code = `await singleSpa.override('disable', ${JSON.stringify(appName)})`;
+          break;
+        case 'override_reset_all':
+          code = `await singleSpa.override('reset_all')`;
+          break;
+        case 'mount':
+        case 'unmount':
+        case 'unload':
+          code = `await singleSpa.${action}(${JSON.stringify(appName)})`;
+          break;
+        default:
+          return { content: [{ type: 'text', text: formatError({ error: `Unknown single_spa action: ${action}`, hint: 'Valid: status, override_set, override_remove, override_enable, override_disable, override_reset_all, mount, unmount, unload' }) }], isError: true };
+      }
+
+      const result = await executor.execute(code);
+      return formatMcpResult(result);
     }
 
-    if (sections.includes('response_body') && maxBodySize > 0) {
-      try {
-        const session = await ensureSession();
-        const result = await sendCdpCommand(session, 'Network.getResponseBody', { requestId }) as { body?: string; base64Encoded?: boolean };
-        if (result?.body !== undefined) {
-          let bodyText = result.base64Encoded ? Buffer.from(result.body, 'base64').toString('utf-8') : result.body;
-          if (bodyText.length > maxBodySize) bodyText = bodyText.slice(0, maxBodySize) + `\n[Truncated to ${maxBodySize} chars]`;
-          parts.push(`\nResponse Body:\n${bodyText}`);
-        } else {
-          parts.push('\nResponse Body: (empty)');
-        }
-      } catch {
-        parts.push('\nResponse Body: (not available - may have been evicted from browser buffer. Try requesting sooner after the network call.)');
-      }
+    if (name === 'tab') {
+      const action = args.action as string;
+      return handleTabAction(action, args);
     }
 
-    return { content: [{ type: 'text', text: parts.join('\n') }] };
-  }
-
-  try {
-    const session = await ensureSession();
-
-    switch (name) {
-      case 'screenshot': {
-        const withLabels = args.labels as boolean | undefined;
-        const tier = (args.quality as string) || 'medium';
-        const modelHint = args.model as string | undefined;
-        const profile = resolveImageProfile(tier, modelHint);
-
-        if (!withLabels) {
-          const capture = await captureWithSizeGuarantee(session, profile);
-          return {
-            content: [
-              { type: 'image', data: capture.data, mimeType: capture.mimeType },
-              ...(capture.compressed ? [{ type: 'text' as const, text: `Screenshot auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit (${(capture.originalSize / 1024).toFixed(0)}KB → ${(capture.finalSize / 1024).toFixed(0)}KB)` }] : []),
-            ],
-          };
-        }
-
-        await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
-        await sendCdpCommand(session, 'DOM.enable', undefined, getCommandTimeout('DOM.enable'));
-        const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
-        const interactive = getInteractiveElements(axResult.nodes ?? []);
-
-        const labelPositions: Array<{ index: number; x: number; y: number; width: number; height: number }> = [];
-        for (const el of interactive) {
-          try {
-            const boxModel = await sendCdpCommand(session, 'DOM.getBoxModel', { backendNodeId: el.backendDOMNodeId }) as {
-              model?: { content: number[]; border: number[] };
-            };
-            if (boxModel?.model) {
-              const b = boxModel.model.border;
-              const x = Math.min(b[0], b[2], b[4], b[6]);
-              const y = Math.min(b[1], b[3], b[5], b[7]);
-              const maxX = Math.max(b[0], b[2], b[4], b[6]);
-              const maxY = Math.max(b[1], b[3], b[5], b[7]);
-              labelPositions.push({ index: el.index, x, y, width: maxX - x, height: maxY - y });
-            }
-          } catch {
-            // Element might not be visible
-          }
-        }
-
-        if (labelPositions.length > 0) {
-          await evaluateJs(session, buildLabelInjectionScript(labelPositions));
-        }
-
-        const capture = await captureWithSizeGuarantee(session, profile);
-
-        if (labelPositions.length > 0) {
-          await evaluateJs(session, REMOVE_LABELS_SCRIPT).catch(() => {});
-        }
-
-        const legend = formatLabelLegend(interactive);
-        return {
-          content: [
-            { type: 'image', data: capture.data, mimeType: capture.mimeType },
-            { type: 'text', text: legend },
-            ...(capture.compressed ? [{ type: 'text' as const, text: `(auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit)` }] : []),
-          ],
-        };
-      }
-
-      case 'accessibility_snapshot': {
-        await sendCdpCommand(session, 'Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
-        const axResult = await sendCdpCommand(session, 'Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as { nodes: AXNode[] };
-        const axNodes = axResult.nodes ?? [];
-
-        const interactiveOnly = args.interactive_only as boolean | undefined;
-        if (interactiveOnly) {
-          const interactive = getInteractiveElements(axNodes);
-          const text = formatInteractiveSnapshot(interactive);
-          lastSnapshot = text;
-          return { content: [{ type: 'text', text }] };
-        }
-
-        const fullText = formatAXTreeAsText(axNodes, true, session.sessionId);
-
-        const searchQuery = args.search as string | undefined;
-        const showDiff = args.diff as boolean | undefined;
-
-        if (searchQuery) {
-          lastSnapshot = fullText;
-          return { content: [{ type: 'text', text: searchSnapshot(fullText, searchQuery) }] };
-        }
-
-        const shouldDiff = showDiff !== false && lastSnapshot !== null;
-        if (shouldDiff && lastSnapshot) {
-          const diffText = computeSnapshotDiff(lastSnapshot, fullText);
-          lastSnapshot = fullText;
-          return { content: [{ type: 'text', text: diffText }] };
-        }
-
-        lastSnapshot = fullText;
-        return { content: [{ type: 'text', text: fullText }] };
-      }
-
-      case 'execute_js': {
-        const code = args.code as string;
-        const value = await evaluateJs(session, code);
-        const textResult = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
-        return {
-          content: [{ type: 'text', text: textResult ?? 'undefined' }],
-        };
-      }
-
-      case 'dashboard_state': {
-        const targetAppName = typeof args.appName === 'string' && args.appName.trim().length > 0
-          ? JSON.stringify(args.appName.trim())
-          : 'null';
-
-        const dashboardCode = `(function(requestedAppName) {
-          var devtools = window.__SINGLE_SPA_DEVTOOLS__;
-          var exposedMethods = devtools && devtools.exposedMethods;
-          var hasSingleSpaDevtools = !!(exposedMethods && typeof exposedMethods.getRawAppData === 'function');
-          var rawApps = hasSingleSpaDevtools ? (exposedMethods.getRawAppData() || []) : [];
-          var imo = window.importMapOverrides;
-          var overrideMap = imo && typeof imo.getOverrideMap === 'function' ? imo.getOverrideMap() : null;
-          var overrides = overrideMap && overrideMap.imports ? overrideMap.imports : {};
-          var apps = Array.isArray(rawApps) ? rawApps.map(function(app) {
-            var ad = app.devtools || {};
-            var name = app.name || '';
-            var overrideUrl = overrides[name] || null;
-            return { name: name, status: app.status || 'UNKNOWN', overrideUrl: overrideUrl, activeWhenForced: ad.activeWhenForced || null, hasOverlays: !!ad.overlays };
-          }) : [];
-          var activeOverrides = {};
-          for (var key in overrides) { activeOverrides[key] = overrides[key]; }
-          return JSON.stringify({
-            pageUrl: location.href,
-            hasSingleSpaDevtools: hasSingleSpaDevtools,
-            hasImportMapOverrides: !!imo,
-            appCount: apps.length,
-            activeOverrides: activeOverrides,
-            apps: apps
-          });
-        })(${targetAppName})`;
-
-        const value = await evaluateJs(session, dashboardCode);
-        return {
-          content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
-        };
-      }
-
-      case 'clear_cache_and_reload': {
-        const legacyMode = args.mode as string | undefined;
-        const clearArg = args.clear as string | undefined;
-        const shouldReload = args.reload !== false;
-
-        let clearTypes: Set<string>;
-        if (clearArg) {
-          const raw = clearArg.toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-          clearTypes = new Set(raw.includes('all')
-            ? ['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']
-            : raw);
-        } else if (legacyMode === 'aggressive') {
-          clearTypes = new Set(['cache', 'cookies']);
-        } else {
-          clearTypes = new Set<string>();
-        }
-
-        const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
-        const cleared: string[] = [];
-        let needsIgnoreCache = false;
-
-        if (clearTypes.has('cache')) {
-          needsIgnoreCache = true;
-          cleared.push('cache (per-tab bypass via ignoreCache reload)');
-        }
-        if (clearTypes.has('cookies')) {
-          const cookieResult = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<{ name: string; domain: string }> };
-          const originHost = new URL(origin).hostname;
-          const matching = (cookieResult?.cookies || []).filter(c => {
-            const isDotPrefixed = c.domain.startsWith('.');
-            const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
-            if (isDotPrefixed && !originHost.includes('.')) return false;
-            return originHost === cd || originHost.endsWith('.' + cd);
-          });
-          for (const c of matching) {
-            await sendCdpCommand(session, 'Network.deleteCookies', { name: c.name, domain: c.domain });
-          }
-          cleared.push(`cookies (${origin}, ${matching.length} removed)`);
-        }
-
-        const storageTypeParts: string[] = [];
-        if (clearTypes.has('local_storage')) storageTypeParts.push('local_storage');
-        if (clearTypes.has('session_storage')) storageTypeParts.push('session_storage');
-        if (clearTypes.has('cache_storage')) storageTypeParts.push('cache_storage');
-        if (clearTypes.has('indexeddb')) storageTypeParts.push('indexeddb');
-        if (clearTypes.has('service_workers')) storageTypeParts.push('service_workers');
-
-        if (storageTypeParts.length > 0) {
-          await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: storageTypeParts.join(',') });
-          cleared.push(`${storageTypeParts.join(', ')} (${origin})`);
-        }
-
-        if (shouldReload || needsIgnoreCache) {
-          await sendCdpCommand(session, 'Page.reload', { ignoreCache: needsIgnoreCache }, getCommandTimeout('Page.reload'));
-          await sleep(2000);
-          cleared.push(needsIgnoreCache ? 'page reloaded (cache bypassed for this tab)' : 'page reloaded');
-        }
-
-        const summary = cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'No storage cleared';
-        return {
-          content: [{ type: 'text', text: summary }],
-        };
-      }
-
-      case 'ensure_fresh_render': {
-        await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
-        await sleep(2000);
-        return {
-          content: [{ type: 'text', text: 'Page reloaded with fresh cache' }],
-        };
-      }
-
-      case 'navigate': {
-        await sendCdpCommand(session, 'Page.navigate', { url: args.url as string }, getCommandTimeout('Page.navigate'));
-        await sleep(2000);
-        return {
-          content: [{ type: 'text', text: `Navigated to ${args.url}` }],
-        };
-      }
-
-      case 'override_app': {
-        const action = args.action as string;
-        const appName = args.appName as string | undefined;
-        const overrideUrl = args.url as string | undefined;
-
-        let code: string;
-        switch (action) {
-          case 'set':
-            if (!appName || !overrideUrl) {
-              return { content: [{ type: 'text', text: 'Error: "set" requires both appName and url' }] };
-            }
-            code = `(function() {
-              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
-              window.importMapOverrides.addOverride(${JSON.stringify(appName)}, ${JSON.stringify(overrideUrl)});
-              return JSON.stringify({ success: true, action: 'set', appName: ${JSON.stringify(appName)}, url: ${JSON.stringify(overrideUrl)} });
-            })()`;
-            break;
-          case 'remove':
-            if (!appName) {
-              return { content: [{ type: 'text', text: 'Error: "remove" requires appName' }] };
-            }
-            code = `(function() {
-              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
-              window.importMapOverrides.removeOverride(${JSON.stringify(appName)});
-              return JSON.stringify({ success: true, action: 'remove', appName: ${JSON.stringify(appName)} });
-            })()`;
-            break;
-          case 'enable':
-            if (!appName) {
-              return { content: [{ type: 'text', text: 'Error: "enable" requires appName' }] };
-            }
-            code = `(function() {
-              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
-              window.importMapOverrides.enableOverride(${JSON.stringify(appName)});
-              return JSON.stringify({ success: true, action: 'enable', appName: ${JSON.stringify(appName)} });
-            })()`;
-            break;
-          case 'disable':
-            if (!appName) {
-              return { content: [{ type: 'text', text: 'Error: "disable" requires appName' }] };
-            }
-            code = `(function() {
-              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
-              window.importMapOverrides.disableOverride(${JSON.stringify(appName)});
-              return JSON.stringify({ success: true, action: 'disable', appName: ${JSON.stringify(appName)} });
-            })()`;
-            break;
-          case 'reset_all':
-            code = `(function() {
-              if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
-              window.importMapOverrides.resetOverrides();
-              return JSON.stringify({ success: true, action: 'reset_all' });
-            })()`;
-            break;
-          default:
-            return { content: [{ type: 'text', text: 'Error: unknown action "' + action + '". Use: set, remove, enable, disable, reset_all' }] };
-        }
-
-        const value = await evaluateJs(session, code);
-        const resultText = typeof value === 'string' ? value : JSON.stringify(value);
-
-        // Auto-reload so the page reflects the new override state (matches DevTools panel behavior)
-        let reloaded = false;
-        try {
-          const parsed = typeof value === 'string' ? JSON.parse(value) : value;
-          if (parsed && parsed.success) {
-            await sendCdpCommand(session, 'Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
-            await sleep(2000);
-            reloaded = true;
-          }
-        } catch { /* parse failed – skip reload */ }
-
-        return {
-          content: [{ type: 'text', text: reloaded ? resultText + ' (page reloaded)' : resultText }],
-        };
-      }
-
-      case 'app_action': {
-        const action = args.action as string;
-        const appName = args.appName as string;
-
-        const actionCode = `(async function() {
-          var singleSpa = window.__SINGLE_SPA_DEVTOOLS__;
-          var exposedMethods = singleSpa && singleSpa.exposedMethods;
-          if (!exposedMethods) return JSON.stringify({ success: false, error: 'single-spa devtools not available' });
-
-          var rawApps = exposedMethods.getRawAppData() || [];
-          var app = rawApps.find(function(a) { return a.name === ${JSON.stringify(appName)}; });
-          if (!app) return JSON.stringify({ success: false, error: 'App not found: ${appName.replace(/'/g, "\\'")}' });
-
-          var action = ${JSON.stringify(action)};
-          try {
-            if (action === 'mount') {
-              if (typeof app.devtools?.activeWhenForced === 'function') {
-                app.devtools.activeWhenForced(true);
-              }
-              await exposedMethods.reroute();
-            } else if (action === 'unmount') {
-              if (typeof app.devtools?.activeWhenForced === 'function') {
-                app.devtools.activeWhenForced(false);
-              }
-              await exposedMethods.reroute();
-            } else if (action === 'unload') {
-              if (typeof exposedMethods.toLoadPromise === 'function') {
-                await exposedMethods.unregisterApplication(${JSON.stringify(appName)});
-              }
-              await exposedMethods.reroute();
-            }
-            var updatedApps = exposedMethods.getRawAppData() || [];
-            var updatedApp = updatedApps.find(function(a) { return a.name === ${JSON.stringify(appName)}; });
-            return JSON.stringify({ success: true, action: action, appName: ${JSON.stringify(appName)}, newStatus: updatedApp ? updatedApp.status : 'UNKNOWN' });
-          } catch (e) {
-            return JSON.stringify({ success: false, error: e.message || String(e) });
-          }
-        })()`;
-
-        const value = await evaluateJs(session, actionCode);
-        return {
-          content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
-        };
-      }
-
-      case 'debugger': {
-        const action = args.action as string;
-
-        switch (action) {
-          case 'enable': {
-            await sendCdpCommand(session, 'Debugger.enable');
-            await sendCdpCommand(session, 'Runtime.enable');
-            debuggerEnabled = true;
-            return { content: [{ type: 'text', text: 'Debugger enabled. Scripts will be parsed and breakpoints can be set.' }] };
-          }
-          case 'set_breakpoint': {
-            const file = args.file as string;
-            const line = args.line as number;
-            const condition = args.condition as string | undefined;
-            if (!file || !line) return { content: [{ type: 'text', text: 'Error: set_breakpoint requires file and line' }] };
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); await sendCdpCommand(session, 'Runtime.enable'); debuggerEnabled = true; }
-            const result = await sendCdpCommand(session, 'Debugger.setBreakpointByUrl', {
-              lineNumber: line - 1,
-              urlRegex: file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
-              columnNumber: 0,
-              ...(condition ? { condition } : {}),
-            }) as { breakpointId: string };
-            breakpoints.set(result.breakpointId, { id: result.breakpointId, file, line });
-            return { content: [{ type: 'text', text: `Breakpoint set: ${result.breakpointId} at ${file}:${line}${condition ? ` (condition: ${condition})` : ''}` }] };
-          }
-          case 'remove_breakpoint': {
-            const bpId = args.breakpointId as string;
-            if (!bpId) return { content: [{ type: 'text', text: 'Error: remove_breakpoint requires breakpointId' }] };
-            await sendCdpCommand(session, 'Debugger.removeBreakpoint', { breakpointId: bpId });
-            breakpoints.delete(bpId);
-            return { content: [{ type: 'text', text: `Breakpoint removed: ${bpId}` }] };
-          }
-          case 'list_breakpoints': {
-            const bps = Array.from(breakpoints.values());
-            if (bps.length === 0) return { content: [{ type: 'text', text: 'No active breakpoints.' }] };
-            const lines = bps.map(bp => `${bp.id}: ${bp.file}:${bp.line}`);
-            return { content: [{ type: 'text', text: `Active breakpoints (${bps.length}):\n${lines.join('\n')}` }] };
-          }
-          case 'resume': {
-            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-            await sendCdpCommand(session, 'Debugger.resume');
-            return { content: [{ type: 'text', text: 'Resumed execution.' }] };
-          }
-          case 'step_over': {
-            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-            await sendCdpCommand(session, 'Debugger.stepOver');
-            return { content: [{ type: 'text', text: 'Stepped over.' }] };
-          }
-          case 'step_into': {
-            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-            await sendCdpCommand(session, 'Debugger.stepInto');
-            return { content: [{ type: 'text', text: 'Stepped into.' }] };
-          }
-          case 'step_out': {
-            if (!debuggerPaused) return { content: [{ type: 'text', text: 'Debugger is not paused.' }] };
-            await sendCdpCommand(session, 'Debugger.stepOut');
-            return { content: [{ type: 'text', text: 'Stepped out.' }] };
-          }
-          case 'inspect_variables': {
-            if (!debuggerPaused || !currentCallFrameId) return { content: [{ type: 'text', text: 'Debugger is not paused at a breakpoint.' }] };
-            const evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
-              callFrameId: currentCallFrameId,
-              expression: '(function(){ var __r = {}; try { var __s = arguments.callee.caller; } catch(e) {} return JSON.stringify(__r); })()',
-              returnByValue: true,
-            }) as { result?: { value?: string } };
-            return { content: [{ type: 'text', text: evalResult?.result?.value ?? 'Unable to inspect variables (try using evaluate action instead)' }] };
-          }
-          case 'evaluate': {
-            const expression = args.expression as string;
-            if (!expression) return { content: [{ type: 'text', text: 'Error: evaluate requires expression' }] };
-            let evalResult;
-            if (debuggerPaused && currentCallFrameId) {
-              evalResult = await sendCdpCommand(session, 'Debugger.evaluateOnCallFrame', {
-                callFrameId: currentCallFrameId,
-                expression,
-                returnByValue: true,
-                generatePreview: true,
-              }) as { result?: { value?: unknown; type?: string; description?: string } };
-            } else {
-              evalResult = await sendCdpCommand(session, 'Runtime.evaluate', {
-                expression,
-                returnByValue: true,
-                awaitPromise: true,
-              }) as { result?: { value?: unknown; type?: string; description?: string } };
-            }
-            const val = evalResult?.result?.value;
-            const text = val !== undefined ? (typeof val === 'string' ? val : JSON.stringify(val, null, 2)) : (evalResult?.result?.description || 'undefined');
-            return { content: [{ type: 'text', text }] };
-          }
-          case 'list_scripts': {
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); await sendCdpCommand(session, 'Runtime.enable'); debuggerEnabled = true; await new Promise(r => setTimeout(r, 200)); }
-            const searchStr = (args.search as string || '').toLowerCase();
-            let scripts = Array.from(knownScripts.values());
-            if (searchStr) scripts = scripts.filter(s => s.url.toLowerCase().includes(searchStr));
-            scripts = scripts.slice(0, 30);
-            if (scripts.length === 0) return { content: [{ type: 'text', text: 'No scripts found.' }] };
-            const scriptLines = scripts.map(s => `${s.scriptId}: ${s.url}`);
-            return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${scriptLines.join('\n')}` }] };
-          }
-          case 'pause_on_exceptions': {
-            const state = (args.state as string) || 'none';
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; }
-            await sendCdpCommand(session, 'Debugger.setPauseOnExceptions', { state });
-            return { content: [{ type: 'text', text: `Pause on exceptions: ${state}` }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown debugger action: ${action}` }] };
-        }
-      }
-
-      case 'css_inspect': {
-        const selector = args.selector as string;
-        const requestedProps = (args.properties as string || '').split(',').map(p => p.trim()).filter(Boolean);
-
-        const defaultProps = [
-          'display', 'position', 'width', 'height', 'margin', 'padding',
-          'color', 'background-color', 'font-size', 'font-weight', 'font-family',
-          'border', 'border-radius', 'opacity', 'visibility', 'overflow',
-          'flex-direction', 'justify-content', 'align-items', 'gap',
-          'z-index', 'box-shadow', 'text-align',
-        ];
-        const propsToGet = requestedProps.length > 0 ? requestedProps : defaultProps;
-
-        const code = `(function() {
-          var el = document.querySelector(${JSON.stringify(selector)});
-          if (!el) return JSON.stringify({ error: 'Element not found: ' + ${JSON.stringify(selector)} });
-          var cs = getComputedStyle(el);
-          var result = {};
-          ${JSON.stringify(propsToGet)}.forEach(function(p) { result[p] = cs.getPropertyValue(p); });
-          result.__tagName = el.tagName.toLowerCase();
-          result.__className = el.className || '';
-          result.__id = el.id || '';
-          var rect = el.getBoundingClientRect();
-          result.__bounds = { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
-          return JSON.stringify(result);
-        })()`;
-
-        const value = await evaluateJs(session, code);
-        const parsed = typeof value === 'string' ? JSON.parse(value) : value;
-        if (parsed?.error) return { content: [{ type: 'text', text: parsed.error }] };
-
-        const tag = parsed.__tagName;
-        const id = parsed.__id ? `#${parsed.__id}` : '';
-        const cls = parsed.__className ? `.${parsed.__className.split(' ').join('.')}` : '';
-        const bounds = parsed.__bounds;
-        const header = `Element: <${tag}${id}${cls}> (${bounds.width}x${bounds.height} at ${bounds.x},${bounds.y})`;
-
-        delete parsed.__tagName; delete parsed.__className; delete parsed.__id; delete parsed.__bounds;
-        const propLines = Object.entries(parsed)
-          .filter(([, v]) => v !== '' && v !== 'none' && v !== 'normal' && v !== 'auto' && v !== 'visible' && v !== '0px')
-          .map(([k, v]) => `  ${k}: ${v}`);
-
-        return { content: [{ type: 'text', text: `${header}\n\nComputed styles:\n${propLines.join('\n') || '  (no non-default styles)'}` }] };
-      }
-
-      case 'session_manager': {
-        const action = args.action as string;
-        const sessionId = args.sessionId as string | undefined;
-
-        switch (action) {
-          case 'list': {
-            const sessions = executorManager.listSessions();
-            if (sessions.length === 0) return { content: [{ type: 'text', text: 'No active sessions.' }] };
-            const lines = sessions.map(s =>
-              `${s.id}: connected=${s.connected}, stateKeys=[${s.stateKeys.join(', ')}]`
-            );
-            return { content: [{ type: 'text', text: `Sessions (${sessions.length}):\n${lines.join('\n')}` }] };
-          }
-          case 'create': {
-            if (!sessionId) return { content: [{ type: 'text', text: 'Error: create requires sessionId' }] };
-            const existing = executorManager.get(sessionId);
-            if (existing) return { content: [{ type: 'text', text: `Session "${sessionId}" already exists.` }] };
-            executorManager.getOrCreate(sessionId);
-            return { content: [{ type: 'text', text: `Session "${sessionId}" created.` }] };
-          }
-          case 'switch': {
-            if (!sessionId) return { content: [{ type: 'text', text: 'Error: switch requires sessionId' }] };
-            const executor = executorManager.get(sessionId);
-            if (!executor) return { content: [{ type: 'text', text: `Session "${sessionId}" not found. Use "create" first.` }] };
-            return { content: [{ type: 'text', text: `Switched to session "${sessionId}". Use playwright_execute with this session context.` }] };
-          }
-          case 'remove': {
-            if (!sessionId) return { content: [{ type: 'text', text: 'Error: remove requires sessionId' }] };
-            const removed = await executorManager.remove(sessionId);
-            return { content: [{ type: 'text', text: removed ? `Session "${sessionId}" removed.` : `Session "${sessionId}" not found.` }] };
-          }
-          case 'remove_all': {
-            const count = executorManager.size;
-            await executorManager.resetAll();
-            return { content: [{ type: 'text', text: `All ${count} sessions removed.` }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown session action: ${action}. Use: list, create, switch, remove, remove_all` }] };
-        }
-      }
-
-      case 'storage': {
-        const action = args.action as string;
-        switch (action) {
-          case 'get_cookies': {
-            const result = await sendCdpCommand(session, 'Network.getCookies') as { cookies: Array<Record<string, unknown>> };
-            const cookies = result?.cookies || [];
-            if (cookies.length === 0) return { content: [{ type: 'text', text: 'No cookies found.' }] };
-            const lines = cookies.map(c =>
-              `${c.name}=${String(c.value).slice(0, 80)}${String(c.value).length > 80 ? '...' : ''} (domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'})`
-            );
-            return { content: [{ type: 'text', text: `Cookies (${cookies.length}):\n${lines.join('\n')}` }] };
-          }
-          case 'set_cookie': {
-            const cookieName = args.name as string;
-            const cookieValue = args.value as string;
-            if (!cookieName || cookieValue === undefined) return { content: [{ type: 'text', text: 'Error: set_cookie requires name and value' }] };
-            const cookieParams: Record<string, unknown> = { name: cookieName, value: cookieValue };
-            if (args.domain) cookieParams.domain = args.domain;
-            if (args.url) cookieParams.url = args.url;
-            if (args.path) cookieParams.path = args.path;
-            if (args.secure !== undefined) cookieParams.secure = args.secure;
-            if (args.httpOnly !== undefined) cookieParams.httpOnly = args.httpOnly;
-            if (args.sameSite) cookieParams.sameSite = args.sameSite;
-            if (args.expires) cookieParams.expires = args.expires;
-            if (!cookieParams.url && !cookieParams.domain) {
-              const pageUrl = await evaluateJs(session, 'window.location.href');
-              cookieParams.url = pageUrl;
-            }
-            const result = await sendCdpCommand(session, 'Network.setCookie', cookieParams) as { success: boolean };
-            return { content: [{ type: 'text', text: result?.success ? `Cookie "${cookieName}" set.` : `Failed to set cookie "${cookieName}".` }] };
-          }
-          case 'delete_cookie': {
-            const cookieName = args.name as string;
-            if (!cookieName) return { content: [{ type: 'text', text: 'Error: delete_cookie requires name' }] };
-            const delParams: Record<string, unknown> = { name: cookieName };
-            if (args.domain) delParams.domain = args.domain;
-            if (args.url) delParams.url = args.url;
-            if (args.path) delParams.path = args.path;
-            if (!delParams.url && !delParams.domain) {
-              const pageUrl = await evaluateJs(session, 'window.location.href');
-              delParams.url = pageUrl;
-            }
-            await sendCdpCommand(session, 'Network.deleteCookies', delParams);
-            return { content: [{ type: 'text', text: `Cookie "${cookieName}" deleted.` }] };
-          }
-          case 'get_local_storage':
-          case 'get_session_storage': {
-            const isLocal = action === 'get_local_storage';
-            const storageType = isLocal ? 'localStorage' : 'sessionStorage';
-            const key = args.key as string | undefined;
-            if (key) {
-              const val = await evaluateJs(session, `${storageType}.getItem(${JSON.stringify(key)})`);
-              return { content: [{ type: 'text', text: val !== null ? `${storageType}[${key}] = ${String(val)}` : `${storageType}[${key}] = (not set)` }] };
-            }
-            const result = await evaluateJs(session, `JSON.stringify(Object.fromEntries(Object.entries(${storageType})))`);
-            const parsed = typeof result === 'string' ? JSON.parse(result) : {};
-            const entries = Object.entries(parsed);
-            if (entries.length === 0) return { content: [{ type: 'text', text: `${storageType} is empty.` }] };
-            const lines = entries.map(([k, v]) => {
-              const vs = String(v);
-              return `  ${k}: ${vs.slice(0, 200)}${vs.length > 200 ? '...' : ''}`;
-            });
-            return { content: [{ type: 'text', text: `${storageType} (${entries.length} entries):\n${lines.join('\n')}` }] };
-          }
-          case 'set_local_storage': {
-            const key = args.key as string;
-            const val = args.value as string;
-            if (!key || val === undefined) return { content: [{ type: 'text', text: 'Error: set_local_storage requires key and value' }] };
-            await evaluateJs(session, `localStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(val)})`);
-            return { content: [{ type: 'text', text: `localStorage[${key}] set.` }] };
-          }
-          case 'remove_local_storage': {
-            const key = args.key as string;
-            if (!key) return { content: [{ type: 'text', text: 'Error: remove_local_storage requires key' }] };
-            await evaluateJs(session, `localStorage.removeItem(${JSON.stringify(key)})`);
-            return { content: [{ type: 'text', text: `localStorage[${key}] removed.` }] };
-          }
-          case 'clear_storage': {
-            const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
-            const types = args.storage_types as string;
-            if (!types) {
-              return { content: [{ type: 'text', text: 'Error: clear_storage requires storage_types parameter (e.g. "cookies,local_storage,session_storage"). This prevents accidental clearing of all storage.' }] };
-            }
-            await sendCdpCommand(session, 'Storage.clearDataForOrigin', { origin, storageTypes: types });
-            return { content: [{ type: 'text', text: `Storage cleared for ${origin} (types: ${types}).` }] };
-          }
-          case 'get_storage_usage': {
-            const origin = (args.origin as string) || await evaluateJs(session, 'window.location.origin') as string;
-            const result = await sendCdpCommand(session, 'Storage.getUsageAndQuota', { origin }) as {
-              usage: number; quota: number; overrideActive: boolean;
-              usageBreakdown: Array<{ storageType: string; usage: number }>;
-            };
-            const total = `Usage: ${(result.usage / 1024).toFixed(1)}KB / ${(result.quota / (1024 * 1024)).toFixed(1)}MB (${((result.usage / result.quota) * 100).toFixed(1)}%)`;
-            const breakdown = (result.usageBreakdown || [])
-              .filter(b => b.usage > 0)
-              .map(b => `  ${b.storageType}: ${(b.usage / 1024).toFixed(1)}KB`)
-              .join('\n');
-            return { content: [{ type: 'text', text: `${total}${breakdown ? '\n\nBreakdown:\n' + breakdown : ''}` }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown storage action: ${action}` }] };
-        }
-      }
-
-      case 'performance': {
-        const action = args.action as string;
-        switch (action) {
-          case 'get_metrics': {
-            await sendCdpCommand(session, 'Performance.enable');
-            const result = await sendCdpCommand(session, 'Performance.getMetrics') as { metrics: Array<{ name: string; value: number }> };
-            await sendCdpCommand(session, 'Performance.disable');
-            const metrics = result?.metrics || [];
-            if (metrics.length === 0) return { content: [{ type: 'text', text: 'No metrics available.' }] };
-            const keyMetrics = ['Timestamp', 'Documents', 'Frames', 'JSEventListeners', 'Nodes', 'LayoutCount',
-              'RecalcStyleCount', 'LayoutDuration', 'RecalcStyleDuration', 'ScriptDuration', 'TaskDuration',
-              'JSHeapUsedSize', 'JSHeapTotalSize'];
-            const lines = metrics
-              .filter(m => keyMetrics.includes(m.name))
-              .map(m => {
-                if (m.name.includes('HeapUsedSize') || m.name.includes('HeapTotalSize'))
-                  return `  ${m.name}: ${(m.value / (1024 * 1024)).toFixed(2)}MB`;
-                if (m.name.includes('Duration'))
-                  return `  ${m.name}: ${(m.value * 1000).toFixed(1)}ms`;
-                return `  ${m.name}: ${m.value}`;
-              });
-            return { content: [{ type: 'text', text: `Performance Metrics:\n${lines.join('\n')}` }] };
-          }
-          case 'get_web_vitals': {
-            const code = `JSON.stringify({
-              lcp: window.__spawriter_lcp || null,
-              cls: window.__spawriter_cls || null,
-              inp: window.__spawriter_inp || null,
-              fcp: performance.getEntriesByName('first-contentful-paint')[0]?.startTime || null,
-              ttfb: performance.getEntriesByType('navigation')[0]?.responseStart || null,
-              domInteractive: performance.getEntriesByType('navigation')[0]?.domInteractive || null,
-              domComplete: performance.getEntriesByType('navigation')[0]?.domComplete || null,
-              loadTime: performance.getEntriesByType('navigation')[0]?.loadEventEnd || null,
-            })`;
-            const raw = await evaluateJs(session, code);
-            const vitals = typeof raw === 'string' ? JSON.parse(raw) : {};
-            const fmt = (val: number | null, unit: string, good: number, poor: number) => {
-              if (val === null || val === undefined) return '(not measured)';
-              const s = unit === 'ms' ? `${val.toFixed(0)}ms` : val.toFixed(3);
-              const grade = val <= good ? '✅ Good' : val <= poor ? '⚠️ Needs Improvement' : '❌ Poor';
-              return `${s} ${grade}`;
-            };
-            const lines = [
-              `  LCP: ${fmt(vitals.lcp, 'ms', 2500, 4000)}`,
-              `  CLS: ${fmt(vitals.cls, '', 0.1, 0.25)}`,
-              `  INP: ${fmt(vitals.inp, 'ms', 200, 500)}`,
-              `  FCP: ${vitals.fcp ? `${vitals.fcp.toFixed(0)}ms` : '(not available)'}`,
-              `  TTFB: ${vitals.ttfb ? `${vitals.ttfb.toFixed(0)}ms` : '(not available)'}`,
-              `  DOM Interactive: ${vitals.domInteractive ? `${vitals.domInteractive.toFixed(0)}ms` : '(n/a)'}`,
-              `  DOM Complete: ${vitals.domComplete ? `${vitals.domComplete.toFixed(0)}ms` : '(n/a)'}`,
-              `  Load: ${vitals.loadTime ? `${vitals.loadTime.toFixed(0)}ms` : '(n/a)'}`,
-            ];
-            const observerCode = `
-              if (!window.__spawriter_lcp_obs) {
-                window.__spawriter_lcp = 0; window.__spawriter_cls = 0; window.__spawriter_inp = Infinity;
-                new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_lcp = e.startTime; }).observe({type:'largest-contentful-paint',buffered:true});
-                new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_cls += e.value; }).observe({type:'layout-shift',buffered:true});
-                new PerformanceObserver(l => { for (const e of l.getEntries()) window.__spawriter_inp = Math.min(window.__spawriter_inp, e.duration); }).observe({type:'event',buffered:true,durationThreshold:16});
-                window.__spawriter_lcp_obs = true;
-              }
-              'observers_active'`;
-            await evaluateJs(session, observerCode);
-            return { content: [{ type: 'text', text: `Web Vitals:\n${lines.join('\n')}\n\n(Note: LCP/CLS/INP require observers — run this tool again for updated values after page interaction.)` }] };
-          }
-          case 'get_memory': {
-            await sendCdpCommand(session, 'Performance.enable');
-            const result = await sendCdpCommand(session, 'Performance.getMetrics') as { metrics: Array<{ name: string; value: number }> };
-            await sendCdpCommand(session, 'Performance.disable');
-            const m = Object.fromEntries((result?.metrics || []).map(x => [x.name, x.value]));
-            const heapUsed = m['JSHeapUsedSize'] || 0;
-            const heapTotal = m['JSHeapTotalSize'] || 0;
-            const nodes = m['Nodes'] || 0;
-            const listeners = m['JSEventListeners'] || 0;
-            const docs = m['Documents'] || 0;
-            const frames = m['Frames'] || 0;
-            return { content: [{ type: 'text', text: `Memory:\n  JS Heap: ${(heapUsed / (1024 * 1024)).toFixed(2)}MB / ${(heapTotal / (1024 * 1024)).toFixed(2)}MB (${heapTotal > 0 ? ((heapUsed / heapTotal) * 100).toFixed(1) : 0}%)\n  DOM Nodes: ${nodes}\n  Event Listeners: ${listeners}\n  Documents: ${docs}\n  Frames: ${frames}` }] };
-          }
-          case 'get_resource_timing': {
-            const count = (args.count as number) || 20;
-            const typeFilter = (args.type_filter as string) || '';
-            const code = `JSON.stringify(performance.getEntriesByType('resource').map(e => ({
-              name: e.name, type: e.initiatorType, duration: e.duration,
-              transferSize: e.transferSize, decodedBodySize: e.decodedBodySize,
-              startTime: e.startTime
-            })))`;
-            const raw = await evaluateJs(session, code);
-            let resources: Array<{ name: string; type: string; duration: number; transferSize: number; decodedBodySize: number; startTime: number }> =
-              typeof raw === 'string' ? JSON.parse(raw) : [];
-            if (typeFilter) resources = resources.filter(r => r.type.toLowerCase().includes(typeFilter.toLowerCase()));
-            resources.sort((a, b) => b.duration - a.duration);
-            resources = resources.slice(0, count);
-            if (resources.length === 0) return { content: [{ type: 'text', text: 'No resource timing entries found.' }] };
-            const lines = resources.map(r => {
-              const url = r.name.length > 80 ? '...' + r.name.slice(-77) : r.name;
-              return `  ${r.duration.toFixed(0).padStart(6)}ms  ${(r.transferSize / 1024).toFixed(1).padStart(7)}KB  ${r.type.padEnd(12)}  ${url}`;
-            });
-            return { content: [{ type: 'text', text: `Resource Timing (top ${resources.length} by duration):\n  ${' '.padEnd(6)}ms  ${' '.padEnd(7)}KB  ${'type'.padEnd(12)}  URL\n${lines.join('\n')}` }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown performance action: ${action}` }] };
-        }
-      }
-
-      case 'editor': {
-        const action = args.action as string;
-        switch (action) {
-          case 'list_sources': {
-            const search = (args.search as string || '').toLowerCase();
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); await sendCdpCommand(session, 'Runtime.enable'); debuggerEnabled = true; await new Promise(r => setTimeout(r, 200)); }
-            let scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
-            if (search) scripts = scripts.filter(s => s.url.toLowerCase().includes(search));
-            scripts = scripts.slice(0, 50);
-            if (scripts.length === 0) return { content: [{ type: 'text', text: 'No scripts found.' }] };
-            const lines = scripts.map(s => `  [${s.scriptId}] ${s.url}`);
-            return { content: [{ type: 'text', text: `Scripts (${scripts.length}):\n${lines.join('\n')}` }] };
-          }
-          case 'get_source': {
-            const scriptId = args.scriptId as string;
-            if (!scriptId) return { content: [{ type: 'text', text: 'Error: get_source requires scriptId' }] };
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; }
-            const result = await sendCdpCommand(session, 'Debugger.getScriptSource', { scriptId }) as { scriptSource: string };
-            let source = result?.scriptSource || '(empty)';
-            const lineStart = args.line_start as number | undefined;
-            const lineEnd = args.line_end as number | undefined;
-            if (lineStart || lineEnd) {
-              const srcLines = source.split('\n');
-              const start = Math.max(1, lineStart || 1) - 1;
-              const end = Math.min(srcLines.length, lineEnd || srcLines.length);
-              source = srcLines.slice(start, end).map((l, i) => `${(start + i + 1).toString().padStart(5)}| ${l}`).join('\n');
-            } else if (source.length > 50000) {
-              source = source.slice(0, 50000) + `\n[Truncated to 50000 chars. Use line_start/line_end for specific ranges.]`;
-            }
-            return { content: [{ type: 'text', text: source }] };
-          }
-          case 'edit_source': {
-            const scriptId = args.scriptId as string;
-            const content = args.content as string;
-            if (!scriptId || !content) return { content: [{ type: 'text', text: 'Error: edit_source requires scriptId and content' }] };
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; }
-            try {
-              await sendCdpCommand(session, 'Debugger.setScriptSource', { scriptId, scriptSource: content });
-              return { content: [{ type: 'text', text: `Script ${scriptId} updated (hot-reload applied).` }] };
-            } catch (e) {
-              const code = `
-                try {
-                  const s = document.createElement('script');
-                  s.textContent = ${JSON.stringify(content)};
-                  document.head.appendChild(s);
-                  'Script injected via DOM.'
-                } catch(e) { 'Fallback failed: ' + e.message }`;
-              const fb = await evaluateJs(session, code);
-              return { content: [{ type: 'text', text: `setScriptSource failed (${String(e)}). Fallback: ${fb}` }] };
-            }
-          }
-          case 'search_source': {
-            const search = args.search as string;
-            if (!search) return { content: [{ type: 'text', text: 'Error: search_source requires search string' }] };
-            if (!debuggerEnabled) { await sendCdpCommand(session, 'Debugger.enable'); debuggerEnabled = true; await new Promise(r => setTimeout(r, 200)); }
-            const scripts = Array.from(knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
-            const matches: string[] = [];
-            for (const s of scripts.slice(0, 30)) {
-              try {
-                const result = await sendCdpCommand(session, 'Debugger.searchInContent', { scriptId: s.scriptId, query: search }) as { result: Array<{ lineNumber: number; lineContent: string }> };
-                if (result?.result?.length) {
-                  matches.push(`${s.url} (${result.result.length} matches):`);
-                  for (const m of result.result.slice(0, 5)) {
-                    matches.push(`  L${m.lineNumber + 1}: ${m.lineContent.trim().slice(0, 120)}`);
-                  }
-                  if (result.result.length > 5) matches.push(`  ... and ${result.result.length - 5} more`);
-                }
-              } catch { /* skip scripts that can't be searched */ }
-            }
-            return { content: [{ type: 'text', text: matches.length > 0 ? `Search results for "${search}":\n${matches.join('\n')}` : `No results for "${search}" in loaded scripts.` }] };
-          }
-          case 'list_stylesheets': {
-            await sendCdpCommand(session, 'CSS.enable');
-            await sendCdpCommand(session, 'DOM.enable');
-            const result = await sendCdpCommand(session, 'CSS.getStyleSheets' in {} ? 'CSS.getStyleSheets' : 'Runtime.evaluate', {
-              expression: `JSON.stringify(Array.from(document.styleSheets).map((s, i) => ({ id: i, href: s.href || '(inline)', disabled: s.disabled, rules: s.cssRules?.length || 0 })))`,
-              returnByValue: true,
-            }) as { result?: { value: unknown } };
-            const sheets = typeof (result?.result as Record<string, unknown>)?.value === 'string'
-              ? JSON.parse((result?.result as Record<string, unknown>).value as string)
-              : [];
-            if (sheets.length === 0) return { content: [{ type: 'text', text: 'No stylesheets found.' }] };
-            const lines = sheets.map((s: { id: number; href: string; disabled: boolean; rules: number }) =>
-              `  [${s.id}] ${s.href} (${s.rules} rules${s.disabled ? ', disabled' : ''})`
-            );
-            return { content: [{ type: 'text', text: `Stylesheets (${sheets.length}):\n${lines.join('\n')}` }] };
-          }
-          case 'get_stylesheet': {
-            const idx = args.styleSheetId as string;
-            if (idx === undefined) return { content: [{ type: 'text', text: 'Error: get_stylesheet requires styleSheetId' }] };
-            const code = `(() => {
-              const s = document.styleSheets[${parseInt(idx, 10)}];
-              if (!s) return 'Stylesheet not found.';
-              try { return Array.from(s.cssRules).map(r => r.cssText).join('\\n'); }
-              catch(e) { return 'Cannot read rules (CORS): ' + e.message; }
-            })()`;
-            let cssText = await evaluateJs(session, code) as string;
-            if (cssText.length > 50000) cssText = cssText.slice(0, 50000) + '\n[Truncated]';
-            return { content: [{ type: 'text', text: cssText }] };
-          }
-          case 'edit_stylesheet': {
-            const idx = args.styleSheetId as string;
-            const content = args.content as string;
-            if (idx === undefined || !content) return { content: [{ type: 'text', text: 'Error: edit_stylesheet requires styleSheetId and content' }] };
-            const code = `(() => {
-              const s = document.styleSheets[${parseInt(idx, 10)}];
-              if (!s) return 'Stylesheet not found.';
-              while (s.cssRules.length > 0) s.deleteRule(0);
-              const rules = ${JSON.stringify(content)}.split('}').filter(r => r.trim());
-              rules.forEach(r => { try { s.insertRule(r.trim() + '}', s.cssRules.length); } catch(e) {} });
-              return 'Stylesheet updated (' + s.cssRules.length + ' rules applied).';
-            })()`;
-            const result = await evaluateJs(session, code);
-            return { content: [{ type: 'text', text: String(result) }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown editor action: ${action}` }] };
-        }
-      }
-
-      case 'network_intercept': {
-        const action = args.action as string;
-        switch (action) {
-          case 'enable': {
-            const patterns = [{ urlPattern: args.url_pattern as string || '*', requestStage: 'Request' }];
-            await sendCdpCommand(session, 'Fetch.enable', { patterns });
-            interceptEnabled = true;
-            return { content: [{ type: 'text', text: `Network interception enabled. ${interceptRules.size} rules active.` }] };
-          }
-          case 'disable': {
-            await sendCdpCommand(session, 'Fetch.disable');
-            interceptEnabled = false;
-            return { content: [{ type: 'text', text: 'Network interception disabled.' }] };
-          }
-          case 'list_rules': {
-            const rules = Array.from(interceptRules.values());
-            if (rules.length === 0) return { content: [{ type: 'text', text: `No intercept rules. Interception is ${interceptEnabled ? 'enabled' : 'disabled'}.` }] };
-            const lines = rules.map(r => {
-              const parts = [`[${r.id}] pattern="${r.urlPattern}"`];
-              if (r.resourceType) parts.push(`type=${r.resourceType}`);
-              if (r.block) parts.push('→ BLOCK');
-              else if (r.mockStatus !== undefined) parts.push(`→ mock ${r.mockStatus}`);
-              return parts.join(' ');
-            });
-            return { content: [{ type: 'text', text: `Intercept rules (${rules.length}, ${interceptEnabled ? 'enabled' : 'disabled'}):\n${lines.join('\n')}` }] };
-          }
-          case 'add_rule': {
-            const urlPattern = args.url_pattern as string;
-            if (!urlPattern) return { content: [{ type: 'text', text: 'Error: add_rule requires url_pattern' }] };
-            const ruleId = `rule_${interceptNextId++}`;
-            const rule: InterceptRule = { id: ruleId, urlPattern, resourceType: args.resource_type as string | undefined };
-            if (args.block) {
-              rule.block = true;
-            } else if (args.mock_status !== undefined) {
-              rule.mockStatus = args.mock_status as number;
-              if (args.mock_headers) rule.mockHeaders = JSON.parse(args.mock_headers as string);
-              if (args.mock_body !== undefined) rule.mockBody = args.mock_body as string;
-            }
-            interceptRules.set(ruleId, rule);
-            return { content: [{ type: 'text', text: `Rule added: ${ruleId} (pattern="${urlPattern}"${rule.block ? ', block' : ''}${rule.mockStatus !== undefined ? `, mock ${rule.mockStatus}` : ''})` }] };
-          }
-          case 'remove_rule': {
-            const ruleId = args.rule_id as string;
-            if (!ruleId) return { content: [{ type: 'text', text: 'Error: remove_rule requires rule_id' }] };
-            const removed = interceptRules.delete(ruleId);
-            return { content: [{ type: 'text', text: removed ? `Rule ${ruleId} removed.` : `Rule ${ruleId} not found.` }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown intercept action: ${action}` }] };
-        }
-      }
-
-      case 'emulation': {
-        const action = args.action as string;
-        switch (action) {
-          case 'set_device': {
-            const width = args.width as number || 375;
-            const height = args.height as number || 812;
-            const dpr = args.device_scale_factor as number || 1;
-            const mobile = args.mobile as boolean ?? false;
-            await sendCdpCommand(session, 'Emulation.setDeviceMetricsOverride', {
-              width, height, deviceScaleFactor: dpr, mobile,
-            });
-            return { content: [{ type: 'text', text: `Device emulation: ${width}x${height} @${dpr}x${mobile ? ' (mobile)' : ''}` }] };
-          }
-          case 'set_user_agent': {
-            const ua = args.user_agent as string;
-            if (!ua) return { content: [{ type: 'text', text: 'Error: set_user_agent requires user_agent' }] };
-            await sendCdpCommand(session, 'Emulation.setUserAgentOverride', { userAgent: ua });
-            return { content: [{ type: 'text', text: `User agent set.` }] };
-          }
-          case 'set_geolocation': {
-            const lat = args.latitude as number;
-            const lng = args.longitude as number;
-            if (lat === undefined || lng === undefined) return { content: [{ type: 'text', text: 'Error: set_geolocation requires latitude and longitude' }] };
-            await sendCdpCommand(session, 'Emulation.setGeolocationOverride', {
-              latitude: lat, longitude: lng, accuracy: (args.accuracy as number) || 1,
-            });
-            return { content: [{ type: 'text', text: `Geolocation: ${lat}, ${lng}` }] };
-          }
-          case 'set_timezone': {
-            const tz = args.timezone_id as string;
-            if (!tz) return { content: [{ type: 'text', text: 'Error: set_timezone requires timezone_id' }] };
-            await sendCdpCommand(session, 'Emulation.setTimezoneOverride', { timezoneId: tz });
-            return { content: [{ type: 'text', text: `Timezone: ${tz}` }] };
-          }
-          case 'set_locale': {
-            const loc = args.locale as string;
-            if (!loc) return { content: [{ type: 'text', text: 'Error: set_locale requires locale' }] };
-            await sendCdpCommand(session, 'Emulation.setLocaleOverride', { locale: loc });
-            return { content: [{ type: 'text', text: `Locale: ${loc}` }] };
-          }
-          case 'set_network_conditions': {
-            const presets: Record<string, { offline: boolean; latency: number; downloadThroughput: number; uploadThroughput: number }> = {
-              'offline': { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
-              'slow-3g': { offline: false, latency: 2000, downloadThroughput: 50 * 1024, uploadThroughput: 50 * 1024 },
-              'fast-3g': { offline: false, latency: 562, downloadThroughput: 180 * 1024, uploadThroughput: 84 * 1024 },
-              '4g': { offline: false, latency: 170, downloadThroughput: 1.5 * 1024 * 1024, uploadThroughput: 750 * 1024 },
-              'wifi': { offline: false, latency: 28, downloadThroughput: 30 * 1024 * 1024, uploadThroughput: 15 * 1024 * 1024 },
-            };
-            const preset = args.preset as string;
-            const params = preset && presets[preset]
-              ? presets[preset]
-              : {
-                  offline: false,
-                  latency: (args.latency as number) || 0,
-                  downloadThroughput: (args.download as number) || -1,
-                  uploadThroughput: (args.upload as number) || -1,
-                };
-            await sendCdpCommand(session, 'Network.emulateNetworkConditions', params);
-            return { content: [{ type: 'text', text: `Network: ${preset || 'custom'} (latency=${params.latency}ms, down=${params.downloadThroughput > 0 ? (params.downloadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'}, up=${params.uploadThroughput > 0 ? (params.uploadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'})` }] };
-          }
-          case 'set_media': {
-            const features = (args.features as string || '').split(',').filter(f => f.includes(':')).map(f => {
-              const [n, v] = f.trim().split(':');
-              return { name: n.trim(), value: v.trim() };
-            });
-            await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features });
-            return { content: [{ type: 'text', text: `Media features: ${features.map(f => `${f.name}:${f.value}`).join(', ') || '(cleared)'}` }] };
-          }
-          case 'clear_all': {
-            await sendCdpCommand(session, 'Emulation.clearDeviceMetricsOverride');
-            await sendCdpCommand(session, 'Emulation.setEmulatedMedia', { features: [] });
-            try { await sendCdpCommand(session, 'Emulation.clearGeolocationOverride'); } catch { /* ok */ }
-            try { await sendCdpCommand(session, 'Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }); } catch { /* ok */ }
-            return { content: [{ type: 'text', text: 'All emulations cleared.' }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown emulation action: ${action}` }] };
-        }
-      }
-
-      case 'page_content': {
-        const action = args.action as string;
-        const selector = (args.selector as string) || 'body';
-        const maxLength = (args.max_length as number) || 50000;
-
-        switch (action) {
-          case 'get_html': {
-            const includeStyles = args.include_styles as boolean ?? false;
-            const code = includeStyles
-              ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || '(element not found)'`
-              : `(() => {
-                  const el = document.querySelector(${JSON.stringify(selector)});
-                  if (!el) return '(element not found)';
-                  const clone = el.cloneNode(true);
-                  clone.querySelectorAll('[style]').forEach(e => e.removeAttribute('style'));
-                  clone.querySelectorAll('script,noscript').forEach(e => e.remove());
-                  return clone.outerHTML;
-                })()`;
-            let html = await evaluateJs(session, code) as string;
-            if (html.length > maxLength) html = html.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
-            return { content: [{ type: 'text', text: html }] };
-          }
-          case 'get_text': {
-            const code = `document.querySelector(${JSON.stringify(selector)})?.innerText || '(element not found)'`;
-            let text = await evaluateJs(session, code) as string;
-            if (text.length > maxLength) text = text.slice(0, maxLength) + `\n[Truncated to ${maxLength} chars]`;
-            return { content: [{ type: 'text', text }] };
-          }
-          case 'get_metadata': {
-            const code = `JSON.stringify({
-              title: document.title,
-              url: location.href,
-              description: document.querySelector('meta[name="description"]')?.content || null,
-              charset: document.characterSet,
-              lang: document.documentElement.lang || null,
-              viewport: document.querySelector('meta[name="viewport"]')?.content || null,
-              ogTitle: document.querySelector('meta[property="og:title"]')?.content || null,
-              ogDescription: document.querySelector('meta[property="og:description"]')?.content || null,
-              ogImage: document.querySelector('meta[property="og:image"]')?.content || null,
-              canonical: document.querySelector('link[rel="canonical"]')?.href || null,
-              favicon: document.querySelector('link[rel="icon"]')?.href || document.querySelector('link[rel="shortcut icon"]')?.href || null,
-              scripts: document.querySelectorAll('script[src]').length,
-              stylesheets: document.querySelectorAll('link[rel="stylesheet"]').length,
-              images: document.querySelectorAll('img').length,
-              links: document.querySelectorAll('a[href]').length,
-            })`;
-            const raw = await evaluateJs(session, code);
-            const meta = typeof raw === 'string' ? JSON.parse(raw) : {};
-            const lines = Object.entries(meta)
-              .filter(([, v]) => v !== null && v !== undefined)
-              .map(([k, v]) => `  ${k}: ${v}`);
-            return { content: [{ type: 'text', text: `Page Metadata:\n${lines.join('\n')}` }] };
-          }
-          case 'search_dom': {
-            const search = args.search as string;
-            if (!search) return { content: [{ type: 'text', text: 'Error: search_dom requires search string' }] };
-            const code = `(() => {
-              const results = [];
-              const walker = document.createTreeWalker(document.querySelector(${JSON.stringify(selector)}) || document.body, NodeFilter.SHOW_ELEMENT);
-              const needle = ${JSON.stringify(search.toLowerCase())};
-              while (walker.nextNode()) {
-                const el = walker.currentNode;
-                const tag = el.tagName.toLowerCase();
-                const id = el.id ? '#' + el.id : '';
-                const cls = el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\\s+/).join('.') : '';
-                const text = (el.textContent || '').slice(0, 200).trim();
-                const attrs = Array.from(el.attributes).map(a => a.name + '="' + a.value + '"').join(' ');
-                const match = tag.includes(needle) || id.toLowerCase().includes(needle) ||
-                  cls.toLowerCase().includes(needle) || text.toLowerCase().includes(needle) ||
-                  attrs.toLowerCase().includes(needle);
-                if (match) {
-                  results.push('<' + tag + id + cls + '> ' + text.slice(0, 100));
-                  if (results.length >= 50) break;
-                }
-              }
-              return JSON.stringify(results);
-            })()`;
-            const raw = await evaluateJs(session, code);
-            const results: string[] = typeof raw === 'string' ? JSON.parse(raw) : [];
-            if (results.length === 0) return { content: [{ type: 'text', text: `No elements found matching "${search}".` }] };
-            return { content: [{ type: 'text', text: `DOM search for "${search}" (${results.length} results):\n${results.map(r => `  ${r}`).join('\n')}` }] };
-          }
-          default:
-            return { content: [{ type: 'text', text: `Unknown page_content action: ${action}` }] };
-        }
-      }
-
-      case 'interact': {
-        const ref = args.ref as number;
-        const action = args.action as string;
-        const value = args.value as string | undefined;
-
-        const refCache = getRefCache(session.sessionId);
-        const cached = refCache.get(ref);
-        if (!cached) {
-          return { content: [{ type: 'text', text: formatError({
-            error: `Ref @${ref} not found`,
-            hint: 'Run accessibility_snapshot first to get fresh @ref numbers',
-            recovery: 'accessibility_snapshot',
-          }) }], isError: true };
-        }
-
-        const resolved = await sendCdpCommand(session, 'DOM.resolveNode', {
-          backendNodeId: cached.backendDOMNodeId,
-        }, 10000) as { object?: { objectId?: string } };
-        const objectId = resolved.object?.objectId;
-        if (!objectId) {
-          return { content: [{ type: 'text', text: formatError({
-            error: `Could not resolve @${ref} to a live DOM node`,
-            hint: 'The element may have been removed. Rerun accessibility_snapshot for fresh refs.',
-            recovery: 'accessibility_snapshot',
-          }) }], isError: true };
-        }
-
-        const boxModel = await sendCdpCommand(session, 'DOM.getBoxModel', {
-          backendNodeId: cached.backendDOMNodeId,
-        }, 10000) as { model?: { border: number[] } };
-        const b = boxModel.model?.border;
-        const cx = b ? (Math.min(b[0], b[2], b[4], b[6]) + Math.max(b[0], b[2], b[4], b[6])) / 2 : 0;
-        const cy = b ? (Math.min(b[1], b[3], b[5], b[7]) + Math.max(b[1], b[3], b[5], b[7])) / 2 : 0;
-
-        switch (action) {
-          case 'click':
-            await sendCdpCommand(session, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
-            await sendCdpCommand(session, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
-            break;
-          case 'hover':
-            await sendCdpCommand(session, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy }, 10000);
-            break;
-          case 'fill':
-            await sendCdpCommand(session, 'Runtime.callFunctionOn', {
-              objectId,
-              functionDeclaration: `function(v) {
-                this.focus();
-                this.value = v;
-                this.dispatchEvent(new Event('input', { bubbles: true }));
-                this.dispatchEvent(new Event('change', { bubbles: true }));
-              }`,
-              arguments: [{ value: value ?? '' }],
-            }, 10000);
-            break;
-          case 'focus':
-            await sendCdpCommand(session, 'DOM.focus', { backendNodeId: cached.backendDOMNodeId }, 10000);
-            break;
-          case 'check':
-          case 'uncheck':
-            await sendCdpCommand(session, 'Runtime.callFunctionOn', {
-              objectId,
-              functionDeclaration: `function(checked) {
-                if (this.checked !== checked) {
-                  this.checked = checked;
-                  this.dispatchEvent(new Event('change', { bubbles: true }));
-                }
-              }`,
-              arguments: [{ value: action === 'check' }],
-            }, 10000);
-            break;
-          case 'select':
-            if (!value) {
-              return { content: [{ type: 'text', text: formatError({
-                error: 'Missing value for select action',
-                hint: 'Provide a value parameter with the option value to select',
-              }) }], isError: true };
-            }
-            await sendCdpCommand(session, 'Runtime.callFunctionOn', {
-              objectId,
-              functionDeclaration: `function(v) {
-                this.value = v;
-                this.dispatchEvent(new Event('change', { bubbles: true }));
-              }`,
-              arguments: [{ value }],
-            }, 10000);
-            break;
-          default:
-            return { content: [{ type: 'text', text: formatError({
-              error: `Unknown action: ${action}`,
-              hint: 'Valid actions: click, hover, fill, focus, check, uncheck, select',
-            }) }], isError: true };
-        }
-
-        return { content: [{ type: 'text', text: `Performed ${action} on @${ref} [${cached.role}]${cached.name ? ` "${cached.name}"` : ''}\nTip: call screenshot to verify the result` }] };
-      }
-
-      case 'browser_fetch': {
-        const url = args.url as string;
-        const method = (args.method as string) || 'GET';
-        const headers = args.headers as string | undefined;
-        const body = args.body as string | undefined;
-        const rawMaxSize = args.max_body_size;
-        const maxSize = Math.max(1, Math.min(Number.isFinite(rawMaxSize as number) ? (rawMaxSize as number) : 10000, 100000));
-        const timeoutMs = 30000;
-
-        const fetchCode = `
-          (async () => {
-            try {
-              const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort(), ${timeoutMs});
-              const resp = await fetch(${JSON.stringify(url)}, {
-                method: ${JSON.stringify(method)},
-                ${headers ? `headers: JSON.parse(${JSON.stringify(headers)}),` : ''}
-                ${body ? `body: ${JSON.stringify(body)},` : ''}
-                credentials: 'include',
-                signal: controller.signal
-              });
-              clearTimeout(timer);
-              const text = await resp.text();
-              return JSON.stringify({
-                status: resp.status,
-                statusText: resp.statusText,
-                headers: Object.fromEntries(resp.headers.entries()),
-                body: text.slice(0, ${maxSize}),
-                truncated: text.length > ${maxSize}
-              });
-            } catch (e) {
-              return JSON.stringify({ error: e.name === 'AbortError' ? 'Request timed out after ${timeoutMs / 1000}s' : e.message });
-            }
-          })()
-        `;
-
-        const result = await evaluateJs(session, fetchCode);
-        return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result) }] };
-      }
-
-      case 'trace': {
-        const traceAction = args.action as string;
-        await ensureRelayServer();
-        const port = getRelayPort();
-        const traceResp = await fetch(`http://localhost:${port}/trace`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: traceAction }),
-          signal: AbortSignal.timeout(18000),
-        });
-        if (!traceResp.ok) {
-          const text = await traceResp.text().catch(() => '');
-          return { content: [{ type: 'text', text: formatError({
-            error: `Trace request failed (HTTP ${traceResp.status})`,
-            hint: text || 'Relay may need to be restarted to load trace support',
-            recovery: 'reset',
-          }) }], isError: true };
-        }
-        const traceResult = await traceResp.json() as { status?: string; recording?: boolean; eventCount?: number; events?: unknown[]; count?: number; error?: string };
-
-        if (traceResult.error) {
-          return { content: [{ type: 'text', text: formatError({ error: traceResult.error, hint: 'Extension may not be connected', recovery: 'reset' }) }], isError: true };
-        }
-
-        if (traceAction === 'stop') {
-          const events = traceResult.events ?? [];
-          const count = traceResult.count ?? events.length;
-          if (count === 0) {
-            return { content: [{ type: 'text', text: 'Recording stopped. No events captured.' }] };
-          }
-          const summary = JSON.stringify(events, null, 2);
-          const maxLen = 50000;
-          const text = summary.length > maxLen
-            ? summary.slice(0, maxLen) + `\n[Truncated — ${count} total events]`
-            : summary;
-          return { content: [{ type: 'text', text: `Recording stopped. ${count} events captured:\n${text}` }] };
-        }
-        if (traceAction === 'status') {
-          return { content: [{ type: 'text', text: `Trace status: recording=${traceResult.recording ?? false}, events=${traceResult.eventCount ?? 0}` }] };
-        }
-        return { content: [{ type: 'text', text: `Trace ${traceAction}: ${traceResult.status ?? 'ok'}` }] };
-      }
-
-      default:
-        return {
-          content: [{ type: 'text', text: `Unknown tool: ${name}` }],
-        };
-    }
-  } catch (e) {
-    error(`Error executing tool ${name}:`, e);
-    cdpSession = null;
-    return {
-      content: [{ type: 'text', text: formatError({ error: `${String(e)}`, hint: 'CDP connection may have been lost', recovery: 'reset' }) }],
-      isError: true,
-    };
-  }
-
-  } // end _legacyDispatch
-
-  }; // end handleToolCall
+    return { content: [{ type: 'text', text: formatError({ error: `Unknown tool: ${name}`, hint: 'Available tools: execute, reset, single_spa, tab' }) }], isError: true };
+  };
 
   try {
     return await withTimeout(handleToolCall(), MCP_REQUEST_TIMEOUT, name);
@@ -3175,15 +463,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 async function main() {
   log('Starting MCP server...');
 
   process.on('uncaughtException', (err) => {
     error('Uncaught exception (recovered):', err.message);
-    if (cdpSession) {
-      cdpSession.ws.close();
-      cdpSession = null;
-    }
   });
 
   process.on('unhandledRejection', (reason) => {
@@ -3196,21 +484,11 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-
   mcpLog('info', 'MCP server ready');
 
   process.on('SIGINT', async () => {
     log('Shutting down...');
-    if (cdpSession) {
-      await releaseAllMyLeases(cdpSession).catch(() => {});
-      cdpSession.ws.close();
-    }
-    for (const [id, agent] of agentSessions) {
-      if (agent.cdpSession) {
-        await releaseAllMyLeases(agent.cdpSession, id).catch(() => {});
-        agent.cdpSession.ws.close();
-      }
-    }
+    await executorManager.resetAll().catch(() => {});
     process.exit(0);
   });
 }

@@ -9694,14 +9694,14 @@ describe('Phase 2: single_spa delegates to internal handlers', () => {
 
 describe('Phase 2: SessionStore session limit', () => {
   it('ExecutorManager should throw when max sessions reached', () => {
-    const mgr = new ExecutorManager(2);
+    const mgr = new ExecutorManager({ maxSessions: 2 });
     mgr.getOrCreate('s1');
     mgr.getOrCreate('s2');
     assert.throws(() => mgr.getOrCreate('s3'), /limit reached/i);
   });
 
   it('remove frees slot for new session', async () => {
-    const mgr = new ExecutorManager(1);
+    const mgr = new ExecutorManager({ maxSessions: 1 });
     mgr.getOrCreate('s1');
     assert.throws(() => mgr.getOrCreate('s2'), /limit reached/i);
     await mgr.remove('s1');
@@ -10107,5 +10107,82 @@ describe('Tab state lifecycle – title prefix expectations', () => {
     assert.equal(title1.replace(re, ''), 'Old Tab');
     assert.equal(title2.replace(re, ''), 'Old Tab');
     assert.equal(('🟢 ' + 'Old Tab'.replace(re, '')), '🟢 Old Tab');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatMcpResult — converts ExecuteResult to MCP content array
+// ---------------------------------------------------------------------------
+describe('formatMcpResult', () => {
+  interface ExecuteResult {
+    text: string;
+    isError: boolean;
+    images: Array<{ data: string; mimeType: string }>;
+    screenshots: Array<{ path: string; base64: string; mimeType: string; snapshot: string; labelCount: number }>;
+  }
+
+  function formatMcpResult(result: ExecuteResult): {
+    content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+    isError?: boolean;
+  } {
+    const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+    if (result.text) {
+      content.push({ type: 'text', text: result.text });
+    }
+    for (const img of result.images) {
+      content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+    }
+    if (content.length === 0) {
+      content.push({ type: 'text', text: 'Code executed successfully (no output)' });
+    }
+    return { content, isError: result.isError || undefined };
+  }
+
+  it('returns text content for text result', () => {
+    const result = formatMcpResult({ text: 'hello', isError: false, images: [], screenshots: [] });
+    assert.equal(result.content.length, 1);
+    assert.equal(result.content[0].type, 'text');
+    assert.equal(result.content[0].text, 'hello');
+    assert.equal(result.isError, undefined);
+  });
+
+  it('returns image content for images', () => {
+    const result = formatMcpResult({
+      text: 'Screenshot',
+      isError: false,
+      images: [{ data: 'base64data', mimeType: 'image/webp' }],
+      screenshots: [],
+    });
+    assert.equal(result.content.length, 2);
+    assert.equal(result.content[0].type, 'text');
+    assert.equal(result.content[1].type, 'image');
+    assert.equal(result.content[1].data, 'base64data');
+    assert.equal(result.content[1].mimeType, 'image/webp');
+  });
+
+  it('returns fallback message for empty result', () => {
+    const result = formatMcpResult({ text: '', isError: false, images: [], screenshots: [] });
+    assert.equal(result.content.length, 1);
+    assert.ok(result.content[0].text!.includes('successfully'));
+  });
+
+  it('sets isError flag', () => {
+    const result = formatMcpResult({ text: 'Error: x', isError: true, images: [], screenshots: [] });
+    assert.equal(result.isError, true);
+  });
+
+  it('returns multiple images', () => {
+    const result = formatMcpResult({
+      text: '',
+      isError: false,
+      images: [
+        { data: 'a', mimeType: 'image/png' },
+        { data: 'b', mimeType: 'image/webp' },
+      ],
+      screenshots: [],
+    });
+    assert.equal(result.content.length, 2);
+    assert.equal(result.content[0].type, 'image');
+    assert.equal(result.content[1].type, 'image');
   });
 });

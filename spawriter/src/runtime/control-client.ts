@@ -36,13 +36,6 @@ export class ControlClient {
     );
   }
 
-  async executeTool(sessionId: string, name: string, args: Record<string, unknown>) {
-    return this.request('/cli/tool', {
-      method: 'POST',
-      body: JSON.stringify({ sessionId, name, args }),
-    });
-  }
-
   async createSession(opts?: { cwd?: string }) {
     return this.request<{ id: string }>('/cli/session/new', {
       method: 'POST',
@@ -51,7 +44,7 @@ export class ControlClient {
   }
 
   async listSessions() {
-    return this.request<{ sessions: Array<{ id: string; createdAt: number }> }>('/cli/sessions');
+    return this.request<{ sessions: Array<{ id: string; connected: boolean; stateKeys: string[] }> }>('/cli/sessions');
   }
 
   async deleteSession(sessionId: string) {

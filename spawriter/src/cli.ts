@@ -216,11 +216,11 @@ cli.command('session list', 'List all active sessions')
     }
 
     const idWidth = Math.max(2, ...sessions.map(s => s.id.length));
-    console.log('ID'.padEnd(idWidth) + '  CREATED');
-    console.log('-'.repeat(idWidth + 21));
+    console.log('ID'.padEnd(idWidth) + '  STATUS');
+    console.log('-'.repeat(idWidth + 15));
     for (const s of sessions) {
-      const time = new Date(s.createdAt).toISOString().slice(0, 19).replace('T', ' ');
-      console.log(s.id.padEnd(idWidth) + '  ' + time);
+      const status = s.connected ? 'connected' : 'disconnected';
+      console.log(s.id.padEnd(idWidth) + '  ' + status);
     }
   });
 

@@ -591,7 +591,7 @@ describe('ExecutorManager', () => {
   });
 
   it('should throw when max sessions reached', () => {
-    const manager = new ExecutorManager(2);
+    const manager = new ExecutorManager({ maxSessions: 2 });
     manager.getOrCreate('first');
     manager.getOrCreate('second');
     assert.equal(manager.size, 2);
@@ -635,7 +635,7 @@ describe('ExecutorManager', () => {
 
 describe('ExecutorManager – eviction edge cases', () => {
   it('maxSessions=1 should throw on second create', () => {
-    const mgr = new ExecutorManager(1);
+    const mgr = new ExecutorManager({ maxSessions: 1 });
     mgr.getOrCreate('a');
     assert.throws(() => mgr.getOrCreate('b'), /executor limit reached/i);
     assert.equal(mgr.size, 1);
@@ -643,7 +643,7 @@ describe('ExecutorManager – eviction edge cases', () => {
   });
 
   it('re-accessing existing session should not trigger eviction', () => {
-    const mgr = new ExecutorManager(2);
+    const mgr = new ExecutorManager({ maxSessions: 2 });
     const a = mgr.getOrCreate('a');
     mgr.getOrCreate('b');
     const a2 = mgr.getOrCreate('a');
@@ -652,7 +652,7 @@ describe('ExecutorManager – eviction edge cases', () => {
   });
 
   it('remove + re-create should create fresh instance', async () => {
-    const mgr = new ExecutorManager(2);
+    const mgr = new ExecutorManager({ maxSessions: 2 });
     const first = mgr.getOrCreate('x');
     mgr.getOrCreate('y');
     await mgr.remove('x');
@@ -662,7 +662,7 @@ describe('ExecutorManager – eviction edge cases', () => {
   });
 
   it('remove then getOrCreate should create new instance', async () => {
-    const mgr = new ExecutorManager(5);
+    const mgr = new ExecutorManager({ maxSessions: 5 });
     const original = mgr.getOrCreate('sess');
     await mgr.remove('sess');
     const replacement = mgr.getOrCreate('sess');
@@ -670,7 +670,7 @@ describe('ExecutorManager – eviction edge cases', () => {
   });
 
   it('resetAll should make all gets return null', async () => {
-    const mgr = new ExecutorManager(5);
+    const mgr = new ExecutorManager({ maxSessions: 5 });
     mgr.getOrCreate('a');
     mgr.getOrCreate('b');
     mgr.getOrCreate('c');
@@ -682,7 +682,7 @@ describe('ExecutorManager – eviction edge cases', () => {
   });
 
   it('listSessions after remove should only show surviving sessions', async () => {
-    const mgr = new ExecutorManager(3);
+    const mgr = new ExecutorManager({ maxSessions: 3 });
     mgr.getOrCreate('old');
     mgr.getOrCreate('mid');
     mgr.getOrCreate('new');
@@ -696,7 +696,7 @@ describe('ExecutorManager – eviction edge cases', () => {
   });
 
   it('double remove should be safe', async () => {
-    const mgr = new ExecutorManager(5);
+    const mgr = new ExecutorManager({ maxSessions: 5 });
     mgr.getOrCreate('x');
     assert.equal(await mgr.remove('x'), true);
     assert.equal(await mgr.remove('x'), false);
@@ -717,7 +717,7 @@ describe('ExecutorManager – session status inspection', () => {
   });
 
   it('listSessions preserves insertion order', () => {
-    const mgr = new ExecutorManager(10);
+    const mgr = new ExecutorManager({ maxSessions: 10 });
     mgr.getOrCreate('alpha');
     mgr.getOrCreate('beta');
     mgr.getOrCreate('gamma');

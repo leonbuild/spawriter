@@ -19,8 +19,6 @@ import type {
   LeaseInfo,
 } from './protocol.js';
 import { LEASE_ERROR_CODE } from './protocol.js';
-import { registerControlRoutes } from './runtime/control-routes.js';
-import { SessionStore } from './runtime/session-store.js';
 import { ExecutorManager } from './pw-executor.js';
 
 interface CDPClient {
@@ -1017,12 +1015,73 @@ function handleCDPMessage(data: Buffer, clientId: string) {
   }
 }
 
-const relaySessionStore = new SessionStore();
-const relayExecutorManager = new ExecutorManager();
+const relayExecutorManager = new ExecutorManager({ maxSessions: 10 });
 
-registerControlRoutes(app, relaySessionStore, relayExecutorManager, async (name, args) => {
-  log(`CLI tool call: ${name}`, JSON.stringify(args).slice(0, 200));
-  return { content: [{ type: 'text', text: `Tool ${name} not yet bridged to relay. Use MCP for full tool access.` }] };
+// ---------------------------------------------------------------------------
+// CLI control routes (inlined from former control-routes.ts)
+// Security middleware: Sec-Fetch-Site, Content-Type, and token auth
+// ---------------------------------------------------------------------------
+
+app.use('/cli/*', async (c, next) => {
+  const secFetchSite = c.req.header('sec-fetch-site');
+  if (secFetchSite && secFetchSite !== 'none' && secFetchSite !== 'same-origin') {
+    return c.json({ error: 'Cross-origin requests not allowed' }, 403);
+  }
+  if (c.req.method === 'POST') {
+    const contentType = c.req.header('content-type');
+    if (!contentType?.includes('application/json')) {
+      return c.json({ error: 'Content-Type must be application/json' }, 400);
+    }
+  }
+  const token = getRelayToken();
+  if (token) {
+    const auth = c.req.header('authorization');
+    if (auth !== `Bearer ${token}`) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+  }
+  await next();
+});
+
+app.post('/cli/execute', async (c) => {
+  try {
+    const body = await c.req.json() as { sessionId: string; code: string; timeout?: number };
+    const executor = relayExecutorManager.getOrCreate(body.sessionId);
+    const result = await executor.execute(body.code, body.timeout || 10000);
+    return c.json({ text: result.text, images: result.images, screenshots: result.screenshots, isError: result.isError });
+  } catch (err: any) {
+    return c.json({ text: err.message, images: [], screenshots: [], isError: true }, 500);
+  }
+});
+
+app.post('/cli/session/new', async (c) => {
+  try {
+    const id = `sw-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    relayExecutorManager.getOrCreate(id);
+    return c.json({ id });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 400);
+  }
+});
+
+app.get('/cli/sessions', (c) => {
+  const sessions = relayExecutorManager.listSessions();
+  return c.json({ sessions: sessions.map(s => ({ id: s.id, connected: s.connected, stateKeys: s.stateKeys })) });
+});
+
+app.post('/cli/session/delete', async (c) => {
+  const { sessionId } = await c.req.json();
+  const ok = await relayExecutorManager.remove(sessionId);
+  if (!ok) return c.json({ error: 'Session not found' }, 404);
+  return c.json({ success: true });
+});
+
+app.post('/cli/session/reset', async (c) => {
+  const { sessionId } = await c.req.json();
+  const executor = relayExecutorManager.get(sessionId);
+  if (!executor) return c.json({ error: 'Session not found' }, 404);
+  await executor.reset();
+  return c.json({ success: true });
 });
 
 export async function startRelayServer(): Promise<void> {
