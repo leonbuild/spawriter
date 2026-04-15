@@ -766,6 +766,21 @@ function handleExtensionMessage(data: Buffer) {
       return;
     }
 
+    if (message.method === 'tabInfoChanged') {
+      const params = (message as any).params as { tabId?: number; title?: string; url?: string } | undefined;
+      const tabId = params?.tabId;
+      if (tabId != null) {
+        for (const target of attachedTargets.values()) {
+          if (target.tabId === tabId && target.targetInfo) {
+            if (params?.title != null) target.targetInfo.title = params.title;
+            if (params?.url != null) target.targetInfo.url = params.url;
+            break;
+          }
+        }
+      }
+      return;
+    }
+
     if (isExtensionLogMessage(message)) {
       const params = message.params as { level?: string; args?: unknown[] };
       const level = params.level ?? 'log';

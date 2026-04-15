@@ -1133,8 +1133,9 @@ export class PlaywrightExecutor {
       },
 
       // --- CSS inspect ---
-      cssInspect: async (selector: string, properties?: string) => {
-        const requestedProps = (properties || '').split(',').map(p => p.trim()).filter(Boolean);
+      cssInspect: async (selector: string, properties?: string | string[]) => {
+        const raw = Array.isArray(properties) ? properties.join(',') : (properties || '');
+        const requestedProps = raw.split(',').map(p => p.trim()).filter(Boolean);
         const defaultProps = [
           'display', 'position', 'width', 'height', 'margin', 'padding',
           'color', 'background-color', 'font-size', 'font-weight', 'font-family',
@@ -1683,7 +1684,7 @@ export class PlaywrightExecutor {
       },
 
       // --- Page content ---
-      pageContent: async (action: string, options?: { selector?: string; max_length?: number; search?: string; include_styles?: boolean }) => {
+      pageContent: async (action: string, options?: { selector?: string; max_length?: number; search?: string; query?: string; include_styles?: boolean }) => {
         const selector = options?.selector || 'body';
         const maxLength = options?.max_length || 50000;
         switch (action) {
@@ -1710,8 +1711,8 @@ export class PlaywrightExecutor {
             return `Page Metadata:\n${lines.join('\n')}`;
           }
           case 'search_dom': {
-            const search = options?.search;
-            if (!search) return 'Error: search_dom requires search string';
+            const search = options?.search || options?.query;
+            if (!search) return 'Error: search_dom requires search string (pass {search:"..."} or {query:"..."})';
             const code = `(() => { const results = []; const walker = document.createTreeWalker(document.querySelector(${JSON.stringify(selector)}) || document.body, NodeFilter.SHOW_ELEMENT); const needle = ${JSON.stringify(search.toLowerCase())}; while (walker.nextNode()) { const el = walker.currentNode; const tag = el.tagName.toLowerCase(); const id = el.id ? '#' + el.id : ''; const cls = el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\\s+/).join('.') : ''; const text = (el.textContent || '').slice(0, 200).trim(); const attrs = Array.from(el.attributes).map(a => a.name + '="' + a.value + '"').join(' '); const match = tag.includes(needle) || id.toLowerCase().includes(needle) || cls.toLowerCase().includes(needle) || text.toLowerCase().includes(needle) || attrs.toLowerCase().includes(needle); if (match) { results.push('<' + tag + id + cls + '> ' + text.slice(0, 100)); if (results.length >= 50) break; } } return JSON.stringify(results); })()`;
             const raw = await evaluateJs(code);
             const results: string[] = typeof raw === 'string' ? JSON.parse(raw) : [];

@@ -180,7 +180,7 @@ These are handled by `handleServerCdpCommand()` (relay.ts line 585-754) and neve
 
 ## Part 6: Identified Gaps and Actionable Items
 
-### 6.1 Stale title/URL in `/json/list` — FUNCTIONAL GAP
+### 6.1 Stale title/URL in `/json/list` — IMPLEMENTED
 
 **Issue**: The relay stores tab title and URL at `Target.attachedToTarget` time and never updates them. When a user navigates to a different page, `/json/list` returns the original title/URL.
 
@@ -234,15 +234,13 @@ if (message.method === 'tabInfoChanged') {
 }
 ```
 
-**Estimated effort**: ~15 LOC (bridge.js) + ~15 LOC (relay.ts).
+**Implementation**: bridge.js line 277-285, relay.ts line 767-779. Tests: relay.test.ts `handleTabInfoChanged` suite (12 tests).
 
-### 6.2 `Target.tabClaimed`/`Target.tabReleased` dead handlers — COSMETIC
+### 6.2 `Target.tabClaimed`/`Target.tabReleased` dead handlers — CLEANED UP
 
-**Issue**: `broadcastOwnershipEvent()` in relay.ts sends to `broadcastToCDPClients()`, not `sendToExtension()`. The bridge has handlers for these events (bridge.js lines 475-490) but they are never triggered. Ownership data reaches the extension only via `Target.ownershipSnapshot`.
+**Issue**: `broadcastOwnershipEvent()` in relay.ts sends to `broadcastToCDPClients()`, not `sendToExtension()`. The bridge had handlers for these events but they were never triggered. Ownership data reaches the extension only via `Target.ownershipSnapshot`.
 
-**Impact**: None. The snapshot path works correctly. The individual event handlers are dead code but harmless.
-
-**Potential cleanup**: Either (a) remove the dead handlers from bridge.js, or (b) have relay also send these events to the extension for real-time updates (currently batched via snapshot). Option (a) is simpler.
+**Fix**: Removed dead handlers from bridge.js. Ownership continues to be synced via `Target.ownershipSnapshot` and the 5s `/json/list` polling.
 
 ### 6.3 Phase F: CDP WebSocket Session Proxy — FUTURE
 
@@ -270,7 +268,7 @@ Compared the full CLI/MCP/relay feature set documented in `EXECUTOR_REFACTOR_PLA
 | Tab attach/detach events | Extension → relay | Already fully handled | **Yes** |
 | Trace recording | `/trace` → extension WS | `handleTraceCommand()` | **Yes** |
 
-**Conclusion**: The only functional gap between the extension and the latest CLI/MCP is the stale title/URL issue (6.1). Everything else is fully compatible.
+**Conclusion**: All functional gaps have been resolved. The stale title/URL issue (6.1) has been fixed. Dead event handlers (6.2) have been cleaned up. The extension is fully compatible with the latest CLI/MCP.
 
 ---
 

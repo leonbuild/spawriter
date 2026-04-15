@@ -272,6 +272,16 @@ import browser from "webextension-polyfill";
       if (changeInfo.status === "complete" && attachedTabs.has(tabId)) {
         markTabTitle(tabId, getTabState(tabId));
       }
+      if (attachedTabs.has(tabId) && (changeInfo.title || changeInfo.url)) {
+        sendMessage({
+          method: "tabInfoChanged",
+          params: {
+            tabId,
+            ...(changeInfo.title && { title: changeInfo.title }),
+            ...(changeInfo.url && { url: changeInfo.url }),
+          },
+        });
+      }
     });
 
     debuggerEventListenerRegistered = true;
@@ -469,24 +479,6 @@ import browser from "webextension-polyfill";
 
     if (message.method === "Target.ownershipSnapshot") {
       applyOwnershipSnapshot(message?.params?.ownership || []);
-      return;
-    }
-
-    if (message.method === "Target.tabClaimed") {
-      const { tabId, sessionId, claimedAt } = message?.params || {};
-      if (tabId != null) {
-        tabOwnership.set(tabId, { sessionId, claimedAt });
-        syncOwnershipStates();
-      }
-      return;
-    }
-
-    if (message.method === "Target.tabReleased") {
-      const { tabId } = message?.params || {};
-      if (tabId != null) {
-        tabOwnership.delete(tabId);
-        syncOwnershipStates();
-      }
       return;
     }
 

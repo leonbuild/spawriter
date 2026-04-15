@@ -114,6 +114,18 @@ function createRelayState() {
     return recipients;
   }
 
+  function handleTabInfoChanged(params: { tabId?: number; title?: string; url?: string } | undefined) {
+    const tabId = params?.tabId;
+    if (tabId == null) return;
+    for (const target of attachedTargets.values()) {
+      if (target.tabId === tabId && target.targetInfo) {
+        if (params?.title != null) target.targetInfo.title = params.title;
+        if (params?.url != null) target.targetInfo.url = params.url;
+        break;
+      }
+    }
+  }
+
   return {
     attachedTargets,
     tabOwners,
@@ -126,6 +138,7 @@ function createRelayState() {
     checkOwnership,
     listTargets,
     routeCdpEvent,
+    handleTabInfoChanged,
   };
 }
 
@@ -707,5 +720,112 @@ describe('checkIdleShutdown timer lifecycle', () => {
     assert.equal(checker.state().timerSet, true);
     checker.checkIdleShutdown(0, true);
     assert.equal(checker.state().timerSet, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: tabInfoChanged handler — live title/URL updates
+// ---------------------------------------------------------------------------
+
+describe('handleTabInfoChanged — title/URL sync from extension', () => {
+  let relay: ReturnType<typeof createRelayState>;
+
+  beforeEach(() => {
+    relay = createRelayState();
+    relay.attachedTargets.set('session-1', {
+      sessionId: 'session-1',
+      tabId: 42,
+      targetInfo: { title: 'Original Title', url: 'https://example.com', type: 'page', tabId: 42 },
+    });
+    relay.attachedTargets.set('session-2', {
+      sessionId: 'session-2',
+      tabId: 43,
+      targetInfo: { title: 'Other Tab', url: 'https://other.com', type: 'page', tabId: 43 },
+    });
+  });
+
+  it('should update title when title changes', () => {
+    relay.handleTabInfoChanged({ tabId: 42, title: 'New Title' });
+    const target = relay.attachedTargets.get('session-1');
+    assert.equal(target?.targetInfo?.title, 'New Title');
+    assert.equal(target?.targetInfo?.url, 'https://example.com');
+  });
+
+  it('should update URL when URL changes', () => {
+    relay.handleTabInfoChanged({ tabId: 42, url: 'https://example.com/page2' });
+    const target = relay.attachedTargets.get('session-1');
+    assert.equal(target?.targetInfo?.title, 'Original Title');
+    assert.equal(target?.targetInfo?.url, 'https://example.com/page2');
+  });
+
+  it('should update both title and URL simultaneously', () => {
+    relay.handleTabInfoChanged({ tabId: 42, title: 'Page 2', url: 'https://example.com/page2' });
+    const target = relay.attachedTargets.get('session-1');
+    assert.equal(target?.targetInfo?.title, 'Page 2');
+    assert.equal(target?.targetInfo?.url, 'https://example.com/page2');
+  });
+
+  it('should not affect other tabs', () => {
+    relay.handleTabInfoChanged({ tabId: 42, title: 'Changed' });
+    const other = relay.attachedTargets.get('session-2');
+    assert.equal(other?.targetInfo?.title, 'Other Tab');
+    assert.equal(other?.targetInfo?.url, 'https://other.com');
+  });
+
+  it('should ignore unknown tabId', () => {
+    relay.handleTabInfoChanged({ tabId: 999, title: 'Ghost Tab' });
+    assert.equal(relay.attachedTargets.get('session-1')?.targetInfo?.title, 'Original Title');
+    assert.equal(relay.attachedTargets.get('session-2')?.targetInfo?.title, 'Other Tab');
+  });
+
+  it('should ignore when tabId is missing', () => {
+    relay.handleTabInfoChanged({ title: 'No Tab' });
+    assert.equal(relay.attachedTargets.get('session-1')?.targetInfo?.title, 'Original Title');
+  });
+
+  it('should ignore undefined params', () => {
+    relay.handleTabInfoChanged(undefined);
+    assert.equal(relay.attachedTargets.get('session-1')?.targetInfo?.title, 'Original Title');
+  });
+
+  it('should handle target without targetInfo gracefully', () => {
+    relay.attachedTargets.set('session-bare', { sessionId: 'session-bare', tabId: 99 });
+    relay.handleTabInfoChanged({ tabId: 99, title: 'Should not crash' });
+    assert.equal(relay.attachedTargets.get('session-bare')?.targetInfo, undefined);
+  });
+
+  it('should reflect updated title in /json/list output', () => {
+    relay.handleTabInfoChanged({ tabId: 42, title: 'Updated Title', url: 'https://newsite.com' });
+    const targets = relay.listTargets(19989);
+    const updated = targets.find(t => t.tabId === 42);
+    assert.equal(updated?.title, 'Updated Title');
+    assert.equal(updated?.url, 'https://newsite.com');
+  });
+
+  it('should update only the first matching target for a tabId', () => {
+    relay.attachedTargets.set('session-dup', {
+      sessionId: 'session-dup',
+      tabId: 42,
+      targetInfo: { title: 'Duplicate', url: 'https://dup.com', type: 'page', tabId: 42 },
+    });
+    relay.handleTabInfoChanged({ tabId: 42, title: 'Changed' });
+    const original = relay.attachedTargets.get('session-1');
+    const dup = relay.attachedTargets.get('session-dup');
+    assert.equal(original?.targetInfo?.title, 'Changed');
+    assert.equal(dup?.targetInfo?.title, 'Duplicate');
+  });
+
+  it('should handle empty string title', () => {
+    relay.handleTabInfoChanged({ tabId: 42, title: '' });
+    assert.equal(relay.attachedTargets.get('session-1')?.targetInfo?.title, '');
+  });
+
+  it('should handle sequential updates correctly', () => {
+    relay.handleTabInfoChanged({ tabId: 42, title: 'Step 1' });
+    relay.handleTabInfoChanged({ tabId: 42, url: 'https://step2.com' });
+    relay.handleTabInfoChanged({ tabId: 42, title: 'Step 3', url: 'https://step3.com' });
+    const target = relay.attachedTargets.get('session-1');
+    assert.equal(target?.targetInfo?.title, 'Step 3');
+    assert.equal(target?.targetInfo?.url, 'https://step3.com');
   });
 });
