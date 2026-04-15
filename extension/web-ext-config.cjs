@@ -6,6 +6,7 @@ module.exports = {
     ".github/**",
     "scripts/**",
     "dist-chrome/**",
+    "web-ext-artifacts/**",
     "package.json",
     "package-lock.json",
     "README.md",
@@ -16,6 +17,7 @@ module.exports = {
     "web-ext-config.cjs",
     "manifest.chrome.json",
     "demo-*.png",
-    "*.md"
+    "*.md",
+    "**/*.LICENSE.txt"
   ]
 };

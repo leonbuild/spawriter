@@ -8,19 +8,20 @@
   "description": "spawriter devtools panel with MCP support (Manifest V3)",
   "action": {
     "default_icon": {
-      "16": "./icons/icon-16.png",
-      "32": "./icons/icon-32.png",
-      "48": "./icons/icon-48.png",
-      "128": "./icons/icon-128.png"
+      "16": "./build/icons/icon-16.png",
+      "32": "./build/icons/icon-32.png",
+      "48": "./build/icons/icon-48.png",
+      "128": "./build/icons/icon-128.png"
     },
     "default_title": "spawriter - Click to attach debugger"
   },
   "icons": {
-    "16": "./icons/icon-16.png",
-    "48": "./icons/icon-48.png",
-    "128": "./icons/icon-128.png"
+    "16": "./build/icons/icon-16.png",
+    "48": "./build/icons/icon-48.png",
+    "128": "./build/icons/icon-128.png"
   },
   "devtools_page": "./build/main.html",
+  "minimum_chrome_version": "116",
   "permissions": ["storage", "scripting", "browsingData", "tabs", "debugger", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "content_scripts": [

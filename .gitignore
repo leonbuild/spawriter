@@ -5,7 +5,6 @@ spawriter/dist
 
 # Extension build outputs
 extension/build
-extension/dist-chrome/
 extension/web-ext-artifacts
 
 # Generated icons (built from SVG by convert-icons.js)
