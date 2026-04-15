@@ -85,4 +85,4 @@ After any UI code change, automatically:
 | App not mounting after override | Navigate to the app's route first |
 | Debugger not pausing | `execute` → `dbg.enable()` first |
 | Connection error | `reset` then retry |
-| All tabs leased | `tab { action: "connect", url: "...", create: true }` |
+| All tabs owned by others | `tab { action: "connect", url: "...", create: true }` |

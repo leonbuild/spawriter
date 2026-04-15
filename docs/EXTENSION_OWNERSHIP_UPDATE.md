@@ -36,8 +36,8 @@ The extension's bridge.js was updated to replace the per-session lease state tra
 | Old Event | New Event | Line | Handler |
 |---|---|---|---|
 | `Target.leaseSnapshot` | `Target.ownershipSnapshot` | 470-472 | `applyOwnershipSnapshot(params.ownership)` |
-| `Target.leaseAcquired` | `Target.tabClaimed` | 475-481 | `tabOwnership.set(tabId, { sessionId, claimedAt })` |
-| `Target.leaseReleased` / `Target.leaseLost` | `Target.tabReleased` | 484-490 | `tabOwnership.delete(tabId)` |
+| `Target.leaseAcquired` | `Target.tabClaimed` | Removed | Handler removed (dead code — relay sends to CDP clients, not extension) |
+| `Target.leaseReleased` / `Target.leaseLost` | `Target.tabReleased` | Removed | Handler removed (same reason) |
 
 ### Changed Lifecycle Points
 
@@ -77,8 +77,8 @@ Every `sendToExtension()` call in relay.ts sends a JSON message to the extension
 | `connectTabByMatch` | `POST /connect-tab` (line 234) | line 456: URL/tabId matching + tab creation | **OK** |
 | `trace` | `POST /trace` (line 288) | line 463-467: `handleTraceCommand()` | **OK** |
 | `Target.ownershipSnapshot` | `sendOwnershipSnapshotToExtension()` (line 133-144) | line 470-472: `applyOwnershipSnapshot()` | **OK** |
-| `Target.tabClaimed` | `broadcastOwnershipEvent()` (line 146) → **CDP clients only** | line 475-481: handler exists but **never received** — relay sends to `broadcastToCDPClients`, not `sendToExtension` | **OK** (dead code, harmless) |
-| `Target.tabReleased` | `broadcastOwnershipEvent()` (line 146) → **CDP clients only** | line 484-490: handler exists but **never received** — same | **OK** (dead code, harmless) |
+| `Target.tabClaimed` | `broadcastOwnershipEvent()` (line 146) → **CDP clients only** | Handler removed (was dead code — relay sends to `broadcastToCDPClients`, not `sendToExtension`) | **OK** (cleaned up) |
+| `Target.tabReleased` | `broadcastOwnershipEvent()` (line 146) → **CDP clients only** | Handler removed (same reason) | **OK** (cleaned up) |
 
 ### Messages extension sends to relay
 
