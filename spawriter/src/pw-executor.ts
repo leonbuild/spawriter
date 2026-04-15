@@ -43,7 +43,7 @@ import { createRequire } from 'node:module';
 // Allowed modules for sandboxed require (matches upstream playwriter)
 // ---------------------------------------------------------------------------
 
-const ALLOWED_MODULES = new Set([
+export const ALLOWED_MODULES = new Set([
   'path', 'node:path', 'url', 'node:url', 'querystring', 'node:querystring',
   'punycode', 'node:punycode', 'crypto', 'node:crypto', 'buffer', 'node:buffer',
   'string_decoder', 'node:string_decoder', 'util', 'node:util', 'assert', 'node:assert',

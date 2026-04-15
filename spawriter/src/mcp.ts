@@ -325,7 +325,7 @@ const tools = [
       properties: {
         code: {
           type: 'string',
-          description: 'Playwright JS code. Globals: {page, context, browser, state, singleSpa, snapshot, screenshotWithLabels, screenshot, consoleLogs, networkLog, networkDetail, networkIntercept, cssInspect, dbg, browserFetch, storage, emulation, performance, editor, pageContent, interact, clearCacheAndReload, navigate, ensureFreshRender, resetPlaywright, getCDPSession, getLatestLogs, clearAllLogs, clearNetworkLog, refToLocator}. Use ; for multiple statements.',
+          description: 'Playwright JS code. Globals: {page, context, browser, state, navigate, ensureFreshRender, screenshot, screenshotWithLabels, snapshot/accessibilitySnapshot, interact, refToLocator, consoleLogs, getLatestLogs, clearAllLogs, networkLog, networkDetail, clearNetworkLog, networkIntercept, dbg, editor, browserFetch, storage, emulation, performance, cssInspect, pageContent, singleSpa, clearCacheAndReload, getCDPSession, resetPlaywright, require, import}. Use ; for multiple statements.',
         },
         timeout: {
           type: 'number',

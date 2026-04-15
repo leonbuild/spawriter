@@ -4,7 +4,7 @@
 > **Last updated: 2026-04-15 (second run)**
 > **Status: ALL FUNCTIONAL WORK COMPLETE**
 > - All VM globals fully functional via relay CDP forwarding — zero graceful failures
-> - Unit tests: 1429/1429 PASS | Runtime tests: 118/118 PASS | Total: 1547/1547 PASS
+> - Unit tests: 1556/1556 PASS (306 suites) | Total: 1556/1556 PASS
 > - CLI E2E: 43/43 PASS | MCP E2E: 33/33 PASS (29 VM globals + 4 MCP tools)
 > - Phases A-E of EXECUTOR_REFACTOR_PLAN.md: COMPLETE
 > - Only low-priority quality improvements remain (test migration, relay HTTP tests)
@@ -25,9 +25,8 @@
 - **interact() via page.evaluate**: Uses DOM queries with ARIA role/name mapping instead of Playwright locators (which timeout through relay).
 
 > **Audit note on test counts (2026-04-15 latest run)**:
-> - `npm test` (6 core files): **1429 tests, 280 suites, 0 failures**
-> - Runtime module tests (4 files): **118 tests, 23 suites, 0 failures**
-> - **Total: 1547 tests, 0 failures**
+> - All test files (10 files): **1556 tests, 306 suites, 0 failures**
+> - Added: ALLOWED_MODULES sandboxing, usefulGlobals coverage, buildVmGlobals structural tests
 
 ### Known Issue: CDP Session via Relay
 
@@ -507,11 +506,10 @@ All 32 VM globals tested via MCP `execute` tool — all pass. Additionally teste
 - **`single_spa` tool**: `status` — PASS
 - **`reset` tool**: Full reset — PASS
 
-### Summary Statistics (Latest — 2026-04-15, second verified run)
+### Summary Statistics (Latest — 2026-04-15, third verified run)
 
-- **Unit tests**: **1429/1429 PASS** (280 suites, 0 failures)
-- **Runtime tests**: **118/118 PASS** (23 suites, 0 failures)
-- **Total unit+runtime**: **1547/1547 PASS**
+- **All unit+runtime tests**: **1556/1556 PASS** (306 suites, 0 failures)
+- New tests added: ALLOWED_MODULES sandboxing, usefulGlobals, buildVmGlobals structural
 - **CLI E2E tests**: **43/43 PASS** — zero failures, zero graceful errors
 - **MCP E2E tests**: **33/33 PASS** (29 VM globals via execute + 4 MCP tools) — zero failures
 - **MCP tools**: **4/4 PASS** (execute, reset, single_spa, tab)

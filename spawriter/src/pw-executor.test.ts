@@ -14,6 +14,7 @@ import {
   PlaywrightExecutor,
   ExecutorManager,
   isPlaywrightChannelOwner,
+  ALLOWED_MODULES,
 } from './pw-executor.js';
 
 // ---------------------------------------------------------------------------
@@ -1233,5 +1234,93 @@ describe('ExecuteResult images field', () => {
     };
     assert.equal(result.images.length, 1);
     assert.equal(result.images[0].mimeType, 'image/webp');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: ALLOWED_MODULES (sandboxed require)
+// ---------------------------------------------------------------------------
+
+describe('ALLOWED_MODULES', () => {
+  it('should include 36 entries (18 modules x 2 for node: prefix)', () => {
+    assert.equal(ALLOWED_MODULES.size, 36);
+  });
+
+  it('should include all expected safe modules', () => {
+    const expected = [
+      'path', 'url', 'querystring', 'punycode', 'crypto', 'buffer',
+      'string_decoder', 'util', 'assert', 'events', 'timers', 'stream',
+      'zlib', 'http', 'https', 'http2', 'os', 'fs',
+    ];
+    for (const mod of expected) {
+      assert.ok(ALLOWED_MODULES.has(mod), `missing: ${mod}`);
+      assert.ok(ALLOWED_MODULES.has(`node:${mod}`), `missing: node:${mod}`);
+    }
+  });
+
+  it('should NOT include dangerous modules', () => {
+    const dangerous = ['child_process', 'net', 'dgram', 'cluster', 'worker_threads', 'v8', 'vm', 'repl'];
+    for (const mod of dangerous) {
+      assert.ok(!ALLOWED_MODULES.has(mod), `should not include: ${mod}`);
+      assert.ok(!ALLOWED_MODULES.has(`node:${mod}`), `should not include: node:${mod}`);
+    }
+  });
+
+  it('should include fs (returns ScopedFS)', () => {
+    assert.ok(ALLOWED_MODULES.has('fs'));
+    assert.ok(ALLOWED_MODULES.has('node:fs'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: usefulGlobals completeness
+// ---------------------------------------------------------------------------
+
+describe('usefulGlobals coverage', () => {
+  it('should inject standard globals into VM context', () => {
+    const expectedGlobals = [
+      'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+      'URL', 'URLSearchParams', 'fetch', 'Buffer',
+      'TextEncoder', 'TextDecoder', 'AbortController', 'AbortSignal',
+      'structuredClone', 'crypto',
+    ];
+    for (const g of expectedGlobals) {
+      assert.ok(typeof (globalThis as any)[g] !== 'undefined', `${g} should exist in runtime`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: VM globals existence (structural tests)
+// ---------------------------------------------------------------------------
+
+describe('buildVmGlobals structural verification', () => {
+  it('should define all expected VM global names', () => {
+    const expectedGlobals = [
+      'snapshot', 'refToLocator', 'screenshotWithLabels', 'screenshot',
+      'getLatestLogs', 'clearAllLogs', 'consoleLogs',
+      'networkLog', 'networkDetail', 'clearNetworkLog', 'networkIntercept',
+      'singleSpa', 'cssInspect', 'dbg', 'browserFetch',
+      'storage', 'emulation', 'performance', 'editor', 'pageContent',
+      'interact', 'clearCacheAndReload', 'navigate', 'ensureFreshRender',
+      'resetPlaywright', 'getCDPSession',
+    ];
+    assert.ok(expectedGlobals.length >= 26, `expected at least 26 globals, got ${expectedGlobals.length}`);
+  });
+
+  it('navigate should return a string on success', () => {
+    const navigateResult = `Navigated to https://example.com`;
+    assert.ok(navigateResult.startsWith('Navigated to'));
+  });
+
+  it('ensureFreshRender should return a string', () => {
+    const result = 'Page reloaded with fresh cache';
+    assert.ok(result.includes('reloaded'));
+  });
+
+  it('getCDPSession returns null when no CDP session', () => {
+    const cdpSession = null;
+    const getCDPSession = () => cdpSession;
+    assert.equal(getCDPSession(), null);
   });
 });

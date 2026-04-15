@@ -6,7 +6,7 @@ Controls the user's **real Chrome tab** via CDP. Not headless — all actions af
 
 ## Tool Catalog (4 tools)
 
-- **`execute`** — Playwright JS code with spawriter extensions (`page`, `context`, `state`, `navigate`, `screenshot`, `screenshotWithLabels`, `snapshot`, `interact`, `consoleLogs`, `networkLog`, `networkIntercept`, `dbg`, `editor`, `browserFetch`, `storage`, `emulation`, `performance`, `cssInspect`, `pageContent`, `singleSpa`, `clearCacheAndReload`, `getCDPSession`, `resetPlaywright`, `require`, `import`)
+- **`execute`** — Playwright JS code with spawriter extensions. Globals: `page`, `context`, `browser`, `state`, `navigate`, `ensureFreshRender`, `screenshot`, `screenshotWithLabels`, `snapshot`/`accessibilitySnapshot`, `interact`, `refToLocator`, `consoleLogs`, `getLatestLogs`, `clearAllLogs`, `networkLog`, `networkDetail`, `clearNetworkLog`, `networkIntercept`, `dbg`, `editor`, `browserFetch`, `storage`, `emulation`, `performance`, `cssInspect`, `pageContent`, `singleSpa`, `clearCacheAndReload`, `getCDPSession`, `resetPlaywright`, `require`, `import`
 - **`reset`** — Full reconnect + clear all state
 - **`single_spa`** — Override management, app lifecycle (status/set/remove/enable/disable/reset_all/mount/unmount/unload)
 - **`tab`** — Tab management (connect/list/switch/release) with lease isolation
