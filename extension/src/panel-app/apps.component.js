@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { Scoped, always } from "kremling";
 import AppStatusOverride from "./app-status-override.component";
 import Button from "./button";
@@ -26,8 +26,8 @@ export default function Apps(props) {
   const [editValues, setEditValues] = useState({});
   // Reset All 确认状态
   const [showResetConfirm, setShowResetConfirm] = useState(false);
-  // 文件输入 ref
   const fileInputRef = React.useRef(null);
+  const inputRefs = useRef({});
   // 导入/导出消息提示
   const [importExportMessage, setImportExportMessage] = useState(null); // { type: 'success' | 'error', text: '...' }
   // 排序方式：'status' 或 'appname'
@@ -271,32 +271,44 @@ export default function Apps(props) {
     }
   }, [overlaysEnabled, mountedApps, otherApps]);
 
-  // 开始编辑
   const startEdit = (appName) => {
     setEditingApps({ ...editingApps, [appName]: true });
     setEditValues({
       ...editValues,
       [appName]: importMaps.savedOverrides[appName]?.url || ""
     });
+    requestAnimationFrame(() => {
+      const el = inputRefs.current[appName];
+      if (el) {
+        el.focus();
+        el.select();
+      }
+    });
   };
 
-  // 取消编辑
   const cancelEdit = (appName) => {
+    inputRefs.current[appName]?.blur();
     setEditingApps({ ...editingApps, [appName]: false });
     setEditValues({ ...editValues, [appName]: "" });
   };
 
-  // 保存并刷新
   const handleSaveAndRefresh = async (appName) => {
+    inputRefs.current[appName]?.blur();
+    setEditingApps({ ...editingApps, [appName]: false });
+
     const url = editValues[appName];
-    if (url && url.trim()) {
-      // 有 URL，保存并启用
+    if (isValidOverrideUrl(url)) {
       await importMaps.saveOverride(appName, url.trim());
+    } else if (url && url.trim()) {
+      const newSavedOverrides = {
+        ...importMaps.savedOverrides,
+        [appName]: { url: url.trim(), enabled: false }
+      };
+      await browser.storage.local.set({ savedOverrides: newSavedOverrides });
+      await importMaps.loadSavedOverrides();
     } else {
-      // 空 URL，清空地址并关闭 toggle
       await importMaps.clearSavedOverride(appName);
     }
-    setEditingApps({ ...editingApps, [appName]: false });
   };
 
   // Toggle 切换
@@ -322,10 +334,20 @@ export default function Apps(props) {
     return !!importMaps.savedOverrides[appName]?.url;
   };
 
-  // 验证 URL 是否以 .js 结尾
-  const isValidJsUrl = (url) => {
-    if (!url || !url.trim()) return true; // 空值不显示错误
-    return url.trim().toLowerCase().endsWith('.js');
+  const isValidOverrideUrl = (url) => {
+    if (!url || !url.trim()) return false;
+    const trimmed = url.trim();
+    try {
+      new URL(trimmed);
+    } catch {
+      return false;
+    }
+    return trimmed.toLowerCase().endsWith('.js');
+  };
+
+  const showUrlWarning = (url) => {
+    if (!url || !url.trim()) return false;
+    return !url.trim().toLowerCase().endsWith('.js');
   };
 
   return (
@@ -472,9 +494,10 @@ export default function Apps(props) {
                   <div className="input-container">
                     <div className="input-wrapper">
                       <input
+                        ref={(el) => { inputRefs.current[app.name] = el; }}
                         className={always("import-override")
                           .maybe("editing", editingApps[app.name])
-                          .maybe("invalid", editingApps[app.name] && !isValidJsUrl(editValues[app.name]))
+                          .maybe("invalid", editingApps[app.name] && showUrlWarning(editValues[app.name]))
                           .maybe("active", isToggleEnabled(app.name) && hasSavedUrl(app.name))}
                         value={getDisplayUrl(app.name)}
                         readOnly={!editingApps[app.name]}
@@ -482,11 +505,6 @@ export default function Apps(props) {
                           setEditValues({ ...editValues, [app.name]: e.target.value });
                         }}
                         onClick={() => {
-                          if (!editingApps[app.name] && !getDisplayUrl(app.name)) {
-                            startEdit(app.name);
-                          }
-                        }}
-                        onDoubleClick={() => {
                           if (!editingApps[app.name]) {
                             startEdit(app.name);
                           }
@@ -495,6 +513,9 @@ export default function Apps(props) {
                           if (e.key === "Enter" && editingApps[app.name]) {
                             e.preventDefault();
                             handleSaveAndRefresh(app.name);
+                          } else if (e.key === "Escape" && editingApps[app.name]) {
+                            e.preventDefault();
+                            cancelEdit(app.name);
                           }
                         }}
                         placeholder="Enter override URL..."
@@ -511,9 +532,8 @@ export default function Apps(props) {
                         </button>
                       )}
                     </div>
-                    {/* 验证提示 - 仅在 edit 模式且 URL 不以 .js 结尾时显示 */}
-                    {editingApps[app.name] && !isValidJsUrl(editValues[app.name]) && (
-                      <span className="url-warning">URL of an APP must end with .js</span>
+                    {editingApps[app.name] && showUrlWarning(editValues[app.name]) && (
+                      <span className="url-warning">URL must end with .js</span>
                     )}
                   </div>
                   
@@ -924,15 +944,23 @@ body.dark & .app-name {
 & .import-override:read-only {
   background-color: #f5f5f5;
   cursor: pointer;
+  border-color: lightgrey;
+}
+
+& .import-override:read-only:focus {
+  outline: none;
+  border-color: lightgrey;
 }
 
 & .import-override.editing {
   background-color: #fff;
   border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
 }
 
-& .import-override:focus {
+& .import-override.editing:focus {
   border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
   outline: none;
 }
 
