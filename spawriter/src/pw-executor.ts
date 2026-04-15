@@ -181,7 +181,7 @@ function getCommandTimeout(method: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// Tab title prefix (used by MCP for lease state indicator)
+// Tab title prefix (used by MCP for ownership state indicator)
 // ---------------------------------------------------------------------------
 
 const TITLE_PREFIX_RE = /^(?:🟢 |🟡 |🔴 |🔵 )+/;
@@ -250,8 +250,14 @@ export class PlaywrightExecutor {
   private refCacheByTab: Map<string, Map<number, RefInfo>> = new Map();
   private savedOverrides: OverrideState = {};
 
+  private ownedTabIds = new Set<number>();
+  private activeTabId: number | null = null;
+  private tabIdToUrl = new Map<number, string>();
+  private lastCdpClientId: string | null = null;
+
   private logger: ExecutorLogger;
   relaySendCdp: RelayCdpSender | null = null;
+  onCdpClientCreated: ((clientId: string) => void) | null = null;
   private scopedFs: ScopedFS;
   private sandboxedRequire: NodeRequire;
   private warningEvents: Array<{ id: number; message: string }> = [];
@@ -308,6 +314,33 @@ export class PlaywrightExecutor {
     this.customGlobals = { ...this.customGlobals, ...globals };
   }
 
+  getActiveTabId(): number | null { return this.activeTabId; }
+  getOwnedTabIds(): Set<number> { return this.ownedTabIds; }
+  getLastCdpClientId(): string | null { return this.lastCdpClientId; }
+
+  claimTab(tabId: number, url?: string): void {
+    this.ownedTabIds.add(tabId);
+    if (url) this.tabIdToUrl.set(tabId, url);
+    if (this.activeTabId == null) this.activeTabId = tabId;
+  }
+
+  switchToTab(tabId: number): void {
+    if (!this.ownedTabIds.has(tabId)) {
+      throw new Error(`Tab ${tabId} not owned by this session. Owned: [${[...this.ownedTabIds].join(', ')}]`);
+    }
+    this.activeTabId = tabId;
+    this.page = null;
+  }
+
+  releaseTab(tabId: number): void {
+    this.ownedTabIds.delete(tabId);
+    this.tabIdToUrl.delete(tabId);
+    if (this.activeTabId === tabId) {
+      this.activeTabId = this.ownedTabIds.size > 0 ? [...this.ownedTabIds][0] : null;
+      this.page = null;
+    }
+  }
+
   // -----------------------------------------------------------------------
   // Connection
   // -----------------------------------------------------------------------
@@ -321,6 +354,8 @@ export class PlaywrightExecutor {
 
     const port = getRelayPort();
     const clientId = `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.lastCdpClientId = clientId;
+    this.onCdpClientCreated?.(clientId);
     const cdpUrl = getCdpUrl(port, clientId);
 
     this.logger.log('Connecting Playwright over CDP:', cdpUrl);
@@ -341,7 +376,25 @@ export class PlaywrightExecutor {
     context.setDefaultNavigationTimeout(15000);
 
     const pages = context.pages().filter(p => !p.isClosed());
-    const page = pages.length > 0 ? pages[0] : await context.newPage();
+
+    let page: Page;
+    if (this.activeTabId != null && pages.length > 1) {
+      const targetUrl = this.tabIdToUrl.get(this.activeTabId);
+      const targetPage = targetUrl
+        ? pages.find(p => p.url() === targetUrl || p.url().startsWith(targetUrl))
+        : undefined;
+      page = targetPage ?? pages[0] ?? await context.newPage();
+
+      if (!targetPage && targetUrl) {
+        this.logger?.log(`Could not find page for tab ${this.activeTabId} (url: ${targetUrl}), using first available page`);
+      }
+    } else {
+      page = pages.length > 0 ? pages[0] : await context.newPage();
+    }
+
+    if (this.activeTabId != null) {
+      this.tabIdToUrl.set(this.activeTabId, page.url());
+    }
 
     this.setupPageListeners(page);
 
@@ -1949,6 +2002,7 @@ export class PlaywrightExecutor {
     this.context = null;
     this.page = null;
     this.isConnected = false;
+    // Preserve ownedTabIds/activeTabId/tabIdToUrl — they are logical ownership, not connection state
   }
 
   private async closeQuietly(): Promise<void> {

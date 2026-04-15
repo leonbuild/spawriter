@@ -136,10 +136,11 @@ function getAgentSession(agentId: string): AgentSession {
 
 async function remoteRelaySendCdp(method: string, params?: Record<string, unknown>, timeout?: number): Promise<unknown> {
   const port = getRelayPort();
+  const mcpSessionId = `mcp-${getEffectiveClientId() || 'default'}`;
   const resp = await fetch(`http://localhost:${port}/cli/cdp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ method, params, timeout }),
+    body: JSON.stringify({ method, params, timeout, sessionId: mcpSessionId }),
     signal: AbortSignal.timeout(timeout || 30000),
   });
   const json = await resp.json() as { result?: unknown; error?: string };
@@ -191,6 +192,8 @@ async function handleTabAction(
   if (sessionId) activeAgentId = sessionId;
   const effectiveClientId = getEffectiveClientId(sessionId);
 
+  const mySessionId = `mcp-${effectiveClientId || 'default'}`;
+
   switch (action) {
     case 'list': {
       await ensureRelayServer();
@@ -198,18 +201,23 @@ async function handleTabAction(
       if (targets.length === 0) {
         return { content: [{ type: 'text', text: 'No tabs attached. Click the spawriter toolbar button on a Chrome tab, or use tab { action: "connect", url: "..." } to attach one.' }] };
       }
+      const executor = await getOrCreateExecutor();
       const lines = targets.map((t, i) => {
         const markers: string[] = [];
-        if (t.lease?.clientId === effectiveClientId) markers.push('MINE');
-        else if (t.lease) markers.push(`LEASED by ${t.lease.label || t.lease.clientId}`);
-        else markers.push('AVAILABLE');
+        if (t.owner === mySessionId) {
+          markers.push(t.tabId === executor.getActiveTabId() ? 'MINE ★' : 'MINE');
+        } else if (t.owner) {
+          markers.push(t.owner);
+        } else {
+          markers.push('AVAILABLE');
+        }
         const tabLabel = t.tabId != null ? ` (tabId: ${t.tabId})` : '';
         return `${i + 1}. [${t.id}]${tabLabel} ← ${markers.join(', ')}\n   ${t.title || '(no title)'}\n   ${t.url || '(no url)'}`;
       });
-      const myTabs = targets.filter(t => t.lease?.clientId === effectiveClientId);
-      const otherTabs = targets.filter(t => t.lease && t.lease.clientId !== effectiveClientId);
-      const availableTabs = targets.filter(t => !t.lease);
-      const summary = `${targets.length} tab(s), ${myTabs.length} mine, ${otherTabs.length} leased by others, ${availableTabs.length} available`;
+      const myTabs = targets.filter(t => t.owner === mySessionId);
+      const otherTabs = targets.filter(t => t.owner && t.owner !== mySessionId);
+      const availableTabs = targets.filter(t => !t.owner);
+      const summary = `${targets.length} tab(s), ${myTabs.length} mine, ${otherTabs.length} owned by others, ${availableTabs.length} available`;
       return { content: [{ type: 'text', text: `${summary}\n\n${lines.join('\n\n')}` }] };
     }
 
@@ -232,36 +240,107 @@ async function handleTabAction(
       if (!result.success) {
         return { content: [{ type: 'text', text: formatError({ error: `Failed to connect tab: ${(result as any).error || 'Unknown error'}`, recovery: 'reset' }) }], isError: true };
       }
+
+      let claimStatus = 'unclaimed';
+      if (result.tabId != null) {
+        try {
+          const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tabId: result.tabId, sessionId: mySessionId }),
+          });
+          if (claimResp.ok) {
+            claimStatus = 'claimed';
+            const executor = await getOrCreateExecutor();
+            executor.claimTab(result.tabId, url);
+          } else {
+            const claimErr = await claimResp.json().catch(() => ({}));
+            claimStatus = `claim failed: ${(claimErr as any).error || claimResp.status}`;
+          }
+        } catch (e: any) {
+          claimStatus = `claim failed: ${e.message}`;
+        }
+      }
+
       await sleep(500);
       const targets = await getTargets(port);
       const newTarget = targets.find(t => t.tabId === result.tabId);
       const created = result.created ? ' (newly created)' : '';
       const info = newTarget
-        ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}`
-        : `Tab attached${created} (tabId: ${result.tabId}). Use tab { action: "list" } to see it.`;
+        ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}\n  Ownership: ${claimStatus}`
+        : `Tab attached${created} (tabId: ${result.tabId}). Ownership: ${claimStatus}. Use tab { action: "list" } to see it.`;
       return { content: [{ type: 'text', text: info }] };
     }
 
     case 'switch': {
-      const targetId = args.targetId as string;
-      if (!targetId) {
-        return { content: [{ type: 'text', text: formatError({ error: 'targetId is required', hint: 'Use tab { action: "list" } to see available targets' }) }], isError: true };
+      const switchTabId = args.tabId as number;
+      if (!switchTabId) {
+        return { content: [{ type: 'text', text: formatError({ error: 'tabId is required (number)', hint: 'Use tab { action: "list" } to see available tabs and their tabIds' }) }], isError: true };
       }
       await ensureRelayServer();
       const targets = await getTargets(port);
-      const target = targets.find(t => t.id === targetId);
+      const target = targets.find(t => t.tabId === switchTabId);
       if (!target) {
-        const available = targets.map(t => `  ${t.id} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
-        return { content: [{ type: 'text', text: formatError({ error: `Target "${targetId}" not found`, hint: `Available targets:\n${available}` }) }], isError: true };
+        const available = targets.map(t => `  tabId ${t.tabId} — ${t.url || '(no url)'}`).join('\n') || '  (none)';
+        return { content: [{ type: 'text', text: formatError({ error: `Tab ${switchTabId} not found`, hint: `Available tabs:\n${available}` }) }], isError: true };
       }
-      if (target.lease && target.lease.clientId !== effectiveClientId) {
-        return { content: [{ type: 'text', text: formatError({ error: 'Tab leased by another agent', hint: `Tab ${targetId} is owned by "${target.lease.label || target.lease.clientId}"` }) }], isError: true };
+      if (target.owner && target.owner !== mySessionId) {
+        return { content: [{ type: 'text', text: formatError({ error: `Tab ${switchTabId} owned by ${target.owner}`, hint: 'You can only switch to tabs you own or unclaimed tabs' }) }], isError: true };
       }
-      return { content: [{ type: 'text', text: `Switched to tab: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}` }] };
+      if (!target.owner) {
+        try {
+          const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tabId: switchTabId, sessionId: mySessionId }),
+          });
+          if (!claimResp.ok) {
+            const claimErr = await claimResp.json().catch(() => ({}));
+            return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${(claimErr as any).error || claimResp.status}` }) }], isError: true };
+          }
+        } catch (e: any) {
+          return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${e.message}` }) }], isError: true };
+        }
+      }
+      const executor = await getOrCreateExecutor();
+      executor.claimTab(switchTabId, target.url);
+      executor.switchToTab(switchTabId);
+      return { content: [{ type: 'text', text: `Switched to tab ${switchTabId}: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}` }] };
     }
 
     case 'release': {
-      return { content: [{ type: 'text', text: 'Tab released.' }] };
+      const releaseTabId = args.tabId as number | undefined;
+      if (releaseTabId) {
+        try {
+          await fetch(`http://localhost:${port}/cli/tab/release`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tabId: releaseTabId, sessionId: mySessionId }),
+          });
+        } catch {}
+        const executor = await getOrCreateExecutor();
+        executor.releaseTab(releaseTabId);
+        return { content: [{ type: 'text', text: `Tab ${releaseTabId} released.` }] };
+      }
+      const targets = await getTargets(port);
+      let releasedCount = 0;
+      for (const t of targets) {
+        if (t.owner === mySessionId && t.tabId != null) {
+          try {
+            await fetch(`http://localhost:${port}/cli/tab/release`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ tabId: t.tabId, sessionId: mySessionId }),
+            });
+            releasedCount++;
+          } catch {}
+        }
+      }
+      const executor = await getOrCreateExecutor();
+      for (const tid of [...executor.getOwnedTabIds()]) {
+        executor.releaseTab(tid);
+      }
+      return { content: [{ type: 'text', text: `Released ${releasedCount} tab(s).` }] };
     }
 
     default:
@@ -275,7 +354,7 @@ interface TargetListItem {
   type: string;
   title: string;
   url: string;
-  lease?: { clientId: string; label?: string } | null;
+  owner?: string | null;
 }
 
 async function getTargets(port: number): Promise<TargetListItem[]> {
@@ -367,22 +446,19 @@ Actions:
   },
   {
     name: 'tab',
-    description: `Manage browser tabs via the Tab Lease System.
-
-Actions:
-- connect: Connect to a tab by URL (create if not found with create=true)
-- list: List all available tabs with lease status
-- switch: Switch to a tab by targetId
-- release: Release the currently held tab`,
+    description: `Tab management for multi-agent isolation.
+- connect: Connect to a tab by URL or tabId (auto-claims ownership)
+- list: List all tabs with ownership status
+- switch: Switch active tab by tabId (claims if unclaimed)
+- release: Release tab ownership (by tabId, or all if omitted)`,
     inputSchema: {
       type: 'object' as const,
       properties: {
         action: { type: 'string', enum: ['connect', 'list', 'switch', 'release'], description: 'Tab action' },
         url: { type: 'string', description: 'Tab URL (for connect)' },
         create: { type: 'boolean', description: 'Create new tab if not found (for connect)' },
-        targetId: { type: 'string', description: 'Target session ID (for switch)' },
-        tabId: { type: 'number', description: 'Chrome tab ID (for connect)' },
-        session_id: { type: 'string', description: 'Session ID for per-session tab isolation' },
+        tabId: { type: 'number', description: 'Chrome tab ID (for connect, switch, release)' },
+        session_id: { type: 'string', description: 'Session ID for per-agent tab isolation' },
       },
       required: ['action'],
     },
@@ -404,6 +480,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter: code' }) }], isError: true };
       }
       await ensureRelayServer();
+      const mcpSessionId = `mcp-${getEffectiveClientId() || 'default'}`;
+      fetch(`http://localhost:${getRelayPort()}/cli/session/activity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: mcpSessionId }),
+      }).catch(() => {});
       const executor = await getOrCreateExecutor();
       const result = await executor.execute(code, timeout);
       return formatMcpResult(result);

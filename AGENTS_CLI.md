@@ -252,4 +252,4 @@ The CLI communicates with the relay server via HTTP:
 
 CDP-dependent features work through a three-tier fallback: Direct CDP → Relay CDP (via extension WebSocket) → Playwright-native / `page.evaluate()`.
 
-The tab lease system is **not enforced** for CLI HTTP routes — CLI is designed as a single-user tool.
+Tab ownership is universally enforced across all paths (CLI HTTP, MCP, CDP WebSocket). Unclaimed tabs are auto-claimed on first `execute`.

@@ -247,6 +247,33 @@ cli.command('session reset <id>', 'Reset the browser connection for a session')
     console.log(`Connection reset.${result.pageUrl ? ` Current: ${result.pageUrl}` : ''}${result.pagesCount != null ? ` (${result.pagesCount} pages)` : ''}`);
   });
 
+// === session bind ===
+cli.command('session bind <tabId>', 'Bind session to a specific tab')
+  .option('--host <host>', 'Remote relay host')
+  .option('--token <token>', 'Auth token')
+  .option('-s, --session <name>', 'Session ID (required)')
+  .action(async (tabId: string, options: Record<string, unknown>) => {
+    const sessionId = options.session as string;
+    if (!sessionId) { console.error('Error: -s/--session is required.'); process.exit(1); }
+    const port = getRelayPort();
+    const token = (options.token as string) || getRelayToken();
+    const response = await fetch(`http://localhost:${port}/cli/tab/claim`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ tabId: Number(tabId), sessionId }),
+    });
+    const result = await response.json() as Record<string, unknown>;
+    if (response.ok) {
+      console.log(`Session ${sessionId} bound to tab ${tabId}.`);
+    } else {
+      console.error(`Failed: ${result.error || 'Unknown error'}`);
+      process.exit(1);
+    }
+  });
+
 // === logfile ===
 cli.command('logfile', 'Print log file paths').action(async () => {
   const os = await import('node:os');

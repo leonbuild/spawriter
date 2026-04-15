@@ -10026,7 +10026,7 @@ describe('setTabTitlePrefix code generation', () => {
 });
 
 // ===========================================================================
-// Tests: Tab state lifecycle — lease acquire/release title changes
+// Tests: Tab state lifecycle — ownership claim/release title changes
 // ===========================================================================
 
 describe('Tab state lifecycle – title prefix expectations', () => {
@@ -10036,23 +10036,21 @@ describe('Tab state lifecycle – title prefix expectations', () => {
 
   function resolveBridgeVisualState(args: {
     attached: boolean;
-    hasLease: boolean;
+    isOwned: boolean;
     baseState?: 'idle' | 'connected' | 'connecting' | 'error';
   }): 'idle' | 'connected' | 'connecting' | 'error' {
-    const { attached, hasLease, baseState = 'idle' } = args;
+    const { attached, isOwned, baseState = 'idle' } = args;
     if (baseState === 'connecting' || baseState === 'error') return baseState;
     if (!attached) return 'idle';
-    return hasLease ? 'connected' : 'idle';
+    return isOwned ? 'connected' : 'idle';
   }
 
-  it('acquireLease should result in green prefix', () => {
-    // After acquireLease succeeds + enableDomains, setTabTitlePrefix(🟢) is called
+  it('claimTab should result in green prefix', () => {
     const expectedPrefix = '🟢 ';
     assert.ok(expectedPrefix.startsWith('🟢'));
   });
 
-  it('releaseLease should result in blue prefix', () => {
-    // Before releaseLease, setTabTitlePrefix(🔵) is called
+  it('releaseTab should result in blue prefix', () => {
     const expectedPrefix = '🔵 ';
     assert.ok(expectedPrefix.startsWith('🔵'));
   });
@@ -10070,28 +10068,28 @@ describe('Tab state lifecycle – title prefix expectations', () => {
     assert.equal(state, null);
   });
 
-  it('bridge attachTab should remain blue until lease is acquired', () => {
+  it('bridge attachTab should remain blue until ownership is claimed', () => {
     const bridgeAttachState = resolveBridgeVisualState({
       attached: true,
-      hasLease: false,
+      isOwned: false,
       baseState: 'idle',
     });
     assert.equal(TAB_TITLE_PREFIXES[bridgeAttachState], '🔵 ');
   });
 
-  it('bridge should become green only after lease acquisition', () => {
-    const leasedState = resolveBridgeVisualState({
+  it('bridge should become green only after ownership claim', () => {
+    const ownedState = resolveBridgeVisualState({
       attached: true,
-      hasLease: true,
+      isOwned: true,
       baseState: 'idle',
     });
-    assert.equal(TAB_TITLE_PREFIXES[leasedState], '🟢 ');
+    assert.equal(TAB_TITLE_PREFIXES[ownedState], '🟢 ');
   });
 
-  it('bridge should revert to blue after lease release', () => {
+  it('bridge should revert to blue after ownership release', () => {
     const releasedState = resolveBridgeVisualState({
       attached: true,
-      hasLease: false,
+      isOwned: false,
       baseState: 'idle',
     });
     assert.equal(TAB_TITLE_PREFIXES[releasedState], '🔵 ');

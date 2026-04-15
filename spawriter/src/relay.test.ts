@@ -1,5 +1,5 @@
 /**
- * Tests for relay.ts logic: HTTP routes, lease management, target listing,
+ * Tests for relay.ts logic: HTTP routes, tab ownership management, target listing,
  * extension validation, CDP event routing, and download behavior.
  *
  * Run: npx tsx --test spawriter/src/relay.test.ts
@@ -7,8 +7,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { VERSION, getCdpUrl, DEFAULT_PORT } from './utils.js';
-import { LEASE_ERROR_CODE } from './protocol.js';
-import type { LeaseInfo } from './protocol.js';
+import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 
 // ---------------------------------------------------------------------------
 // Simulated relay state (mirrors relay.ts structures)
@@ -28,12 +27,6 @@ interface AttachedTarget {
   targetInfo?: TargetInfo;
 }
 
-interface TabLease {
-  clientId: string;
-  label?: string;
-  acquiredAt: number;
-}
-
 interface DownloadBehavior {
   behavior: string;
   downloadPath?: string;
@@ -41,69 +34,45 @@ interface DownloadBehavior {
 
 function createRelayState() {
   const attachedTargets = new Map<string, AttachedTarget>();
-  const leases = new Map<string, TabLease>();
+  const tabOwners = new Map<number, { sessionId: string; claimedAt: number }>();
+  const sessionActivity = new Map<string, number>();
   const downloadBehaviors = new Map<string, DownloadBehavior>();
 
-  function getLeaseInfo(sessionId: string): LeaseInfo | null {
-    const lease = leases.get(sessionId);
-    if (!lease) return null;
-    return {
-      clientId: lease.clientId,
-      label: lease.label,
-      acquiredAt: lease.acquiredAt,
-    };
-  }
-
-  function acquireLease(
-    clientId: string,
-    sessionId: string,
-    label?: string
-  ): { granted: boolean; error?: string; holder?: { clientId: string; label?: string } } {
-    if (!attachedTargets.has(sessionId)) {
-      return { granted: false, error: `Target ${sessionId} not found` };
+  function claimTab(tabId: number, sessionId: string, force?: boolean): { ok: boolean; owner?: string } {
+    const existing = tabOwners.get(tabId);
+    if (existing && existing.sessionId !== sessionId) {
+      if (!force) return { ok: false, owner: existing.sessionId };
     }
-    const existing = leases.get(sessionId);
-    if (existing && existing.clientId !== clientId) {
-      return {
-        granted: false,
-        error: `Tab leased by ${existing.label || existing.clientId}`,
-        holder: { clientId: existing.clientId, label: existing.label },
-      };
+    tabOwners.set(tabId, { sessionId, claimedAt: Date.now() });
+    sessionActivity.set(sessionId, Date.now());
+    return { ok: true };
+  }
+
+  function releaseTab(tabId: number, sessionId: string): boolean {
+    const existing = tabOwners.get(tabId);
+    if (!existing || existing.sessionId !== sessionId) return false;
+    tabOwners.delete(tabId);
+    return true;
+  }
+
+  function releaseAllTabs(sessionId: string): number {
+    const toRelease: number[] = [];
+    for (const [tabId, o] of tabOwners) {
+      if (o.sessionId === sessionId) toRelease.push(tabId);
     }
-    leases.set(sessionId, { clientId, label, acquiredAt: Date.now() });
-    return { granted: true };
+    for (const tabId of toRelease) tabOwners.delete(tabId);
+    return toRelease.length;
   }
 
-  function releaseLease(
-    clientId: string,
-    sessionId: string
-  ): { released: boolean; error?: string } {
-    const existing = leases.get(sessionId);
-    if (!existing) return { released: true };
-    if (existing.clientId !== clientId) return { released: false, error: 'Not the lease holder' };
-    leases.delete(sessionId);
-    return { released: true };
+  function getTabOwner(tabId: number): string | undefined {
+    return tabOwners.get(tabId)?.sessionId;
   }
 
-  function releaseAllLeases(clientId: string): number {
-    let count = 0;
-    for (const [sessionId, lease] of leases) {
-      if (lease.clientId === clientId) {
-        leases.delete(sessionId);
-        count++;
-      }
-    }
-    return count;
-  }
-
-  function checkLeaseEnforcement(
-    clientId: string,
-    sessionId: string
-  ): { allowed: boolean; error?: string } {
-    const lease = leases.get(sessionId);
-    if (!lease) return { allowed: true };
-    if (lease.clientId !== clientId) {
-      return { allowed: false, error: `Tab leased by ${lease.label || lease.clientId}` };
+  function checkOwnership(sessionId: string, tabId: number): { allowed: boolean; error?: string } {
+    const owner = tabOwners.get(tabId);
+    if (!owner) return { allowed: true };
+    if (owner.sessionId !== sessionId) {
+      return { allowed: false, error: `Tab ${tabId} is owned by session "${owner.sessionId}"` };
     }
     return { allowed: true };
   }
@@ -118,21 +87,45 @@ function createRelayState() {
         title: ti.title ?? '',
         url: ti.url ?? '',
         webSocketDebuggerUrl: getCdpUrl(port, target.sessionId),
-        lease: getLeaseInfo(target.sessionId),
+        owner: target.tabId != null ? (getTabOwner(target.tabId) ?? null) : null,
       };
     });
   }
 
+  function routeCdpEvent(
+    tabId: number | undefined,
+    cdpClients: Map<string, object>,
+    sessionToClientId: Map<string, string>,
+  ): string[] {
+    const recipients: string[] = [];
+    if (tabId == null) {
+      for (const clientId of cdpClients.keys()) recipients.push(clientId);
+      return recipients;
+    }
+    const owner = tabOwners.get(tabId);
+    if (owner) {
+      const ownerClientId = sessionToClientId.get(owner.sessionId);
+      if (ownerClientId && cdpClients.has(ownerClientId)) {
+        recipients.push(ownerClientId);
+      }
+      return recipients;
+    }
+    for (const clientId of cdpClients.keys()) recipients.push(clientId);
+    return recipients;
+  }
+
   return {
     attachedTargets,
-    leases,
+    tabOwners,
+    sessionActivity,
     downloadBehaviors,
-    getLeaseInfo,
-    acquireLease,
-    releaseLease,
-    releaseAllLeases,
-    checkLeaseEnforcement,
+    claimTab,
+    releaseTab,
+    releaseAllTabs,
+    getTabOwner,
+    checkOwnership,
     listTargets,
+    routeCdpEvent,
   };
 }
 
@@ -150,38 +143,6 @@ function validateExtensionOrigin(
   if (!match) return false;
   if (allowAny) return true;
   return allowedIds.includes(match[1]);
-}
-
-// ---------------------------------------------------------------------------
-// CDP event routing (mirrors relay.ts logic)
-// ---------------------------------------------------------------------------
-
-function routeCdpEvent(
-  sessionId: string | undefined,
-  leases: Map<string, TabLease>,
-  cdpClients: Map<string, { ws: { send: (data: string) => void } }>
-): string[] {
-  const recipients: string[] = [];
-
-  if (!sessionId) {
-    for (const clientId of cdpClients.keys()) {
-      recipients.push(clientId);
-    }
-    return recipients;
-  }
-
-  const lease = leases.get(sessionId);
-  if (lease) {
-    if (cdpClients.has(lease.clientId)) {
-      recipients.push(lease.clientId);
-    }
-    return recipients;
-  }
-
-  for (const clientId of cdpClients.keys()) {
-    recipients.push(clientId);
-  }
-  return recipients;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,21 +197,19 @@ describe('GET /json/list route logic', () => {
     assert.equal(targets[0].title, 'Test Page');
     assert.equal(targets[0].url, 'https://example.com');
     assert.match(targets[0].webSocketDebuggerUrl, /ws:\/\/127\.0\.0\.1:19989\/cdp\/session-1/);
-    assert.equal(targets[0].lease, null);
+    assert.equal(targets[0].owner, null);
   });
 
-  it('should include lease info when a lease exists', () => {
+  it('should include owner when a tab is claimed', () => {
     const relay = createRelayState();
     relay.attachedTargets.set('s1', {
       sessionId: 's1',
       tabId: 1,
       targetInfo: { title: 'Page 1', url: 'https://a.com', type: 'page' },
     });
-    relay.acquireLease('agent-a', 's1', 'Agent A');
+    relay.claimTab(1, 'sw-agent-a');
     const targets = relay.listTargets(19989);
-    assert.notEqual(targets[0].lease, null);
-    assert.equal(targets[0].lease!.clientId, 'agent-a');
-    assert.equal(targets[0].lease!.label, 'Agent A');
+    assert.equal(targets[0].owner, 'sw-agent-a');
   });
 
   it('should handle targets without targetInfo', () => {
@@ -319,10 +278,10 @@ describe('Extension origin validation', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: Lease enforcement on CDP commands
+// Tests: Ownership enforcement on CDP commands
 // ---------------------------------------------------------------------------
 
-describe('Lease enforcement on CDP commands', () => {
+describe('Ownership enforcement on CDP commands', () => {
   let relay: ReturnType<typeof createRelayState>;
 
   beforeEach(() => {
@@ -334,36 +293,30 @@ describe('Lease enforcement on CDP commands', () => {
     });
   });
 
-  it('should allow commands when no lease exists', () => {
-    const result = relay.checkLeaseEnforcement('agent-a', 's1');
+  it('should allow commands when no ownership exists', () => {
+    const result = relay.checkOwnership('sw-a', 1);
     assert.equal(result.allowed, true);
   });
 
-  it('should allow commands from the lease holder', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.checkLeaseEnforcement('agent-a', 's1');
+  it('should allow commands from the tab owner', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.checkOwnership('sw-a', 1);
     assert.equal(result.allowed, true);
   });
 
-  it('should block commands from non-holder', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.checkLeaseEnforcement('agent-b', 's1');
+  it('should block commands from non-owner', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.checkOwnership('sw-b', 1);
     assert.equal(result.allowed, false);
-    assert.ok(result.error?.includes('leased by'));
-  });
-
-  it('should include label in error when available', () => {
-    relay.acquireLease('agent-a', 's1', 'Agent Alpha');
-    const result = relay.checkLeaseEnforcement('agent-b', 's1');
-    assert.ok(result.error?.includes('Agent Alpha'));
+    assert.ok(result.error?.includes('sw-a'));
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: Lease acquire / release
+// Tests: Tab claim / release
 // ---------------------------------------------------------------------------
 
-describe('Relay-level lease operations', () => {
+describe('Relay-level ownership operations', () => {
   let relay: ReturnType<typeof createRelayState>;
 
   beforeEach(() => {
@@ -380,113 +333,99 @@ describe('Relay-level lease operations', () => {
     });
   });
 
-  it('should grant lease for unlocked target', () => {
-    const result = relay.acquireLease('agent-a', 's1');
-    assert.equal(result.granted, true);
+  it('should claim unclaimed tab', () => {
+    const result = relay.claimTab(1, 'sw-a');
+    assert.equal(result.ok, true);
   });
 
-  it('should allow re-acquire by same client', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.acquireLease('agent-a', 's1');
-    assert.equal(result.granted, true);
+  it('should allow re-claim by same session', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.claimTab(1, 'sw-a');
+    assert.equal(result.ok, true);
   });
 
-  it('should reject lease for target held by another', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.acquireLease('agent-b', 's1');
-    assert.equal(result.granted, false);
-    assert.ok(result.holder);
-    assert.equal(result.holder!.clientId, 'agent-a');
+  it('should reject claim for tab held by another', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.claimTab(1, 'sw-b');
+    assert.equal(result.ok, false);
+    assert.equal(result.owner, 'sw-a');
   });
 
-  it('should reject lease for non-existent target', () => {
-    const result = relay.acquireLease('agent-a', 'nonexistent');
-    assert.equal(result.granted, false);
-    assert.ok(result.error?.includes('not found'));
+  it('should allow force claim on tab held by another', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.claimTab(1, 'sw-b', true);
+    assert.equal(result.ok, true);
+    assert.equal(relay.getTabOwner(1), 'sw-b');
   });
 
-  it('should release lease by holder', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.releaseLease('agent-a', 's1');
-    assert.equal(result.released, true);
-    assert.equal(relay.leases.size, 0);
+  it('should release tab by owner', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.releaseTab(1, 'sw-a');
+    assert.equal(result, true);
+    assert.equal(relay.tabOwners.size, 0);
   });
 
-  it('should fail to release lease by non-holder', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.releaseLease('agent-b', 's1');
-    assert.equal(result.released, false);
+  it('should fail to release tab by non-owner', () => {
+    relay.claimTab(1, 'sw-a');
+    const result = relay.releaseTab(1, 'sw-b');
+    assert.equal(result, false);
   });
 
-  it('should succeed to release non-existent lease', () => {
-    const result = relay.releaseLease('agent-a', 's2');
-    assert.equal(result.released, true);
-  });
-
-  it('should release all leases for a client', () => {
-    relay.acquireLease('agent-a', 's1');
-    relay.acquireLease('agent-a', 's2');
-    const count = relay.releaseAllLeases('agent-a');
+  it('should release all tabs for a session', () => {
+    relay.claimTab(1, 'sw-a');
+    relay.claimTab(2, 'sw-a');
+    const count = relay.releaseAllTabs('sw-a');
     assert.equal(count, 2);
-    assert.equal(relay.leases.size, 0);
+    assert.equal(relay.tabOwners.size, 0);
   });
 
-  it('should only release the matching client leases', () => {
-    relay.acquireLease('agent-a', 's1');
-    relay.acquireLease('agent-b', 's2');
-    const count = relay.releaseAllLeases('agent-a');
+  it('should only release matching session tabs', () => {
+    relay.claimTab(1, 'sw-a');
+    relay.claimTab(2, 'sw-b');
+    const count = relay.releaseAllTabs('sw-a');
     assert.equal(count, 1);
-    assert.equal(relay.leases.size, 1);
-    assert.equal(relay.leases.has('s2'), true);
+    assert.equal(relay.tabOwners.size, 1);
+    assert.equal(relay.getTabOwner(2), 'sw-b');
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: CDP event routing with leases
+// Tests: CDP event routing with ownership
 // ---------------------------------------------------------------------------
 
 describe('CDP event routing', () => {
-  it('should broadcast to all clients when no sessionId', () => {
-    const leases = new Map<string, TabLease>();
-    const clients = new Map([
-      ['c1', { ws: { send: () => {} } }],
-      ['c2', { ws: { send: () => {} } }],
-    ]);
-    const recipients = routeCdpEvent(undefined, leases, clients);
-    assert.equal(recipients.length, 2);
-    assert.ok(recipients.includes('c1'));
-    assert.ok(recipients.includes('c2'));
-  });
-
-  it('should broadcast to all when session has no lease', () => {
-    const leases = new Map<string, TabLease>();
-    const clients = new Map([
-      ['c1', { ws: { send: () => {} } }],
-      ['c2', { ws: { send: () => {} } }],
-    ]);
-    const recipients = routeCdpEvent('some-session', leases, clients);
+  it('should broadcast to all clients when no tabId', () => {
+    const relay = createRelayState();
+    const clients = new Map([['c1', {}], ['c2', {}]]);
+    const s2c = new Map<string, string>();
+    const recipients = relay.routeCdpEvent(undefined, clients, s2c);
     assert.equal(recipients.length, 2);
   });
 
-  it('should route only to lease holder when leased', () => {
-    const leases = new Map<string, TabLease>();
-    leases.set('s1', { clientId: 'c1', acquiredAt: Date.now() });
-    const clients = new Map([
-      ['c1', { ws: { send: () => {} } }],
-      ['c2', { ws: { send: () => {} } }],
-    ]);
-    const recipients = routeCdpEvent('s1', leases, clients);
+  it('should broadcast to all when tab has no owner', () => {
+    const relay = createRelayState();
+    const clients = new Map([['c1', {}], ['c2', {}]]);
+    const s2c = new Map<string, string>();
+    const recipients = relay.routeCdpEvent(42, clients, s2c);
+    assert.equal(recipients.length, 2);
+  });
+
+  it('should route only to owner client when tab is owned', () => {
+    const relay = createRelayState();
+    relay.claimTab(42, 'sw-a');
+    const clients = new Map([['c1', {}], ['c2', {}]]);
+    const s2c = new Map([['sw-a', 'c1']]);
+    const recipients = relay.routeCdpEvent(42, clients, s2c);
     assert.equal(recipients.length, 1);
     assert.equal(recipients[0], 'c1');
   });
 
-  it('should return empty when lease holder is not connected', () => {
-    const leases = new Map<string, TabLease>();
-    leases.set('s1', { clientId: 'disconnected-agent', acquiredAt: Date.now() });
-    const clients = new Map([
-      ['c1', { ws: { send: () => {} } }],
-    ]);
-    const recipients = routeCdpEvent('s1', leases, clients);
+  it('should return empty when owner client is not connected', () => {
+    const relay = createRelayState();
+    relay.claimTab(42, 'sw-a');
+    const clients = new Map([['c1', {}]]);
+    const s2c = new Map([['sw-a', 'disconnected']]);
+    const recipients = relay.routeCdpEvent(42, clients, s2c);
     assert.equal(recipients.length, 0);
   });
 });
@@ -536,41 +475,33 @@ describe('Target attach/detach lifecycle', () => {
       targetInfo: { title: 'Test', url: 'https://test.com', type: 'page' },
     });
     assert.equal(relay.attachedTargets.size, 1);
-
     relay.attachedTargets.delete('s1');
     assert.equal(relay.attachedTargets.size, 0);
   });
 
-  it('should clean up leases when target is removed', () => {
+  it('should clean up ownership when target is removed', () => {
     relay.attachedTargets.set('s1', { sessionId: 's1', tabId: 1 });
-    relay.acquireLease('agent-a', 's1');
-    assert.equal(relay.leases.size, 1);
-
+    relay.claimTab(1, 'sw-a');
+    assert.equal(relay.tabOwners.size, 1);
     relay.attachedTargets.delete('s1');
-    relay.leases.delete('s1');
-    assert.equal(relay.leases.size, 0);
-  });
-
-  it('should handle simultaneous targets from same tab (re-attach)', () => {
-    relay.attachedTargets.set('s1', { sessionId: 's1', tabId: 1 });
-    relay.attachedTargets.set('s1-new', { sessionId: 's1-new', tabId: 1 });
-    assert.equal(relay.attachedTargets.size, 2);
+    relay.tabOwners.delete(1);
+    assert.equal(relay.tabOwners.size, 0);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: LEASE_ERROR_CODE
+// Tests: OWNERSHIP_ERROR_CODE
 // ---------------------------------------------------------------------------
 
-describe('LEASE_ERROR_CODE', () => {
+describe('OWNERSHIP_ERROR_CODE', () => {
   it('should be -32001', () => {
-    assert.equal(LEASE_ERROR_CODE, -32001);
+    assert.equal(OWNERSHIP_ERROR_CODE, -32001);
   });
 
   it('should be usable in CDP error responses', () => {
     const errorResponse = {
       id: 1,
-      error: { code: LEASE_ERROR_CODE, message: 'Tab leased by another agent' },
+      error: { code: OWNERSHIP_ERROR_CODE, message: 'Tab owned by another session' },
     };
     assert.equal(errorResponse.error.code, -32001);
   });
@@ -594,93 +525,55 @@ describe('Multi-agent isolation scenario', () => {
     }
   });
 
-  it('should allow multiple agents to lease different tabs', () => {
-    assert.equal(relay.acquireLease('agent-a', 'tab-1').granted, true);
-    assert.equal(relay.acquireLease('agent-b', 'tab-2').granted, true);
-    assert.equal(relay.acquireLease('agent-c', 'tab-3').granted, true);
-    assert.equal(relay.leases.size, 3);
+  it('should allow multiple sessions to own different tabs', () => {
+    assert.equal(relay.claimTab(1, 'sw-a').ok, true);
+    assert.equal(relay.claimTab(2, 'sw-b').ok, true);
+    assert.equal(relay.claimTab(3, 'sw-c').ok, true);
+    assert.equal(relay.tabOwners.size, 3);
   });
 
-  it('should prevent agent from using another agent tab', () => {
-    relay.acquireLease('agent-a', 'tab-1');
-    relay.acquireLease('agent-b', 'tab-2');
+  it('should prevent session from using another session tab', () => {
+    relay.claimTab(1, 'sw-a');
+    relay.claimTab(2, 'sw-b');
 
-    assert.equal(relay.checkLeaseEnforcement('agent-a', 'tab-1').allowed, true);
-    assert.equal(relay.checkLeaseEnforcement('agent-a', 'tab-2').allowed, false);
-    assert.equal(relay.checkLeaseEnforcement('agent-b', 'tab-2').allowed, true);
-    assert.equal(relay.checkLeaseEnforcement('agent-b', 'tab-1').allowed, false);
+    assert.equal(relay.checkOwnership('sw-a', 1).allowed, true);
+    assert.equal(relay.checkOwnership('sw-a', 2).allowed, false);
+    assert.equal(relay.checkOwnership('sw-b', 2).allowed, true);
+    assert.equal(relay.checkOwnership('sw-b', 1).allowed, false);
   });
 
-  it('should clean up all leases when agent disconnects', () => {
-    relay.acquireLease('agent-a', 'tab-1');
-    relay.acquireLease('agent-a', 'tab-3');
-    relay.acquireLease('agent-b', 'tab-2');
+  it('should clean up all tabs when session disconnects', () => {
+    relay.claimTab(1, 'sw-a');
+    relay.claimTab(3, 'sw-a');
+    relay.claimTab(2, 'sw-b');
 
-    const released = relay.releaseAllLeases('agent-a');
+    const released = relay.releaseAllTabs('sw-a');
     assert.equal(released, 2);
-    assert.equal(relay.leases.size, 1);
+    assert.equal(relay.tabOwners.size, 1);
 
-    assert.equal(relay.acquireLease('agent-c', 'tab-1').granted, true);
-    assert.equal(relay.acquireLease('agent-c', 'tab-3').granted, true);
+    assert.equal(relay.claimTab(1, 'sw-c').ok, true);
+    assert.equal(relay.claimTab(3, 'sw-c').ok, true);
   });
 
   it('should route events correctly in multi-agent scenario', () => {
-    relay.acquireLease('agent-a', 'tab-1');
-    relay.acquireLease('agent-b', 'tab-2');
+    relay.claimTab(1, 'sw-a');
+    relay.claimTab(2, 'sw-b');
+    const clients = new Map([['c-a', {}], ['c-b', {}]]);
+    const s2c = new Map([['sw-a', 'c-a'], ['sw-b', 'c-b']]);
 
-    const clients = new Map([
-      ['agent-a', { ws: { send: () => {} } }],
-      ['agent-b', { ws: { send: () => {} } }],
-    ]);
+    const tab1Recipients = relay.routeCdpEvent(1, clients, s2c);
+    assert.deepEqual(tab1Recipients, ['c-a']);
 
-    const tab1Recipients = routeCdpEvent('tab-1', relay.leases, clients);
-    assert.deepEqual(tab1Recipients, ['agent-a']);
+    const tab2Recipients = relay.routeCdpEvent(2, clients, s2c);
+    assert.deepEqual(tab2Recipients, ['c-b']);
 
-    const tab2Recipients = routeCdpEvent('tab-2', relay.leases, clients);
-    assert.deepEqual(tab2Recipients, ['agent-b']);
-
-    const tab3Recipients = routeCdpEvent('tab-3', relay.leases, clients);
+    const tab3Recipients = relay.routeCdpEvent(3, clients, s2c);
     assert.equal(tab3Recipients.length, 2);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: Lease label display
-// ---------------------------------------------------------------------------
-
-describe('Lease label handling', () => {
-  let relay: ReturnType<typeof createRelayState>;
-
-  beforeEach(() => {
-    relay = createRelayState();
-    relay.attachedTargets.set('s1', { sessionId: 's1', tabId: 1 });
-  });
-
-  it('should store label when provided', () => {
-    relay.acquireLease('agent-a', 's1', 'My Agent');
-    assert.equal(relay.getLeaseInfo('s1')?.label, 'My Agent');
-  });
-
-  it('should allow lease without label', () => {
-    relay.acquireLease('agent-a', 's1');
-    assert.equal(relay.getLeaseInfo('s1')?.label, undefined);
-  });
-
-  it('should use label in denial message', () => {
-    relay.acquireLease('agent-a', 's1', 'Build Agent');
-    const result = relay.acquireLease('agent-b', 's1');
-    assert.ok(result.error?.includes('Build Agent'));
-  });
-
-  it('should use clientId in denial when no label', () => {
-    relay.acquireLease('agent-a', 's1');
-    const result = relay.acquireLease('agent-b', 's1');
-    assert.ok(result.error?.includes('agent-a'));
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Tests: EADDRINUSE handling (Fix #1)
+// Tests: EADDRINUSE handling
 // ---------------------------------------------------------------------------
 
 describe('EADDRINUSE error handling logic', () => {
@@ -703,7 +596,7 @@ describe('EADDRINUSE error handling logic', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: Idle shutdown logic (Fix #4)
+// Tests: Idle shutdown logic
 // ---------------------------------------------------------------------------
 
 describe('Idle shutdown decision logic', () => {
@@ -730,7 +623,7 @@ describe('Idle shutdown decision logic', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: checkIdleShutdown timer behavior (Fix #4 — behavioral)
+// Tests: checkIdleShutdown timer behavior
 // ---------------------------------------------------------------------------
 
 describe('checkIdleShutdown timer lifecycle', () => {

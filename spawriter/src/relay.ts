@@ -16,9 +16,8 @@ import type {
   ExtensionEventMessage,
   ExtensionLogMessage,
   ExtensionMessage,
-  LeaseInfo,
 } from './protocol.js';
-import { LEASE_ERROR_CODE } from './protocol.js';
+import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 import { ExecutorManager } from './pw-executor.js';
 
 interface CDPClient {
@@ -68,44 +67,119 @@ const pendingExtensionCmdRequests = new Map<number, ExtensionCmdPending>();
 let nextExtensionRequestId = 1;
 
 // ---------------------------------------------------------------------------
-// Tab Lease System — multi-agent tab isolation
+// Tab Ownership System — multi-agent tab isolation
 // ---------------------------------------------------------------------------
 
-interface TabLease {
-  sessionId: string;
-  clientId: string;
-  label?: string;
-  acquiredAt: number;
+const tabOwners = new Map<number, { sessionId: string; claimedAt: number }>();
+const sessionActivity = new Map<string, number>();
+const sessionToClientId = new Map<string, string>();
+const pwClientToSession = new Map<string, string>();
+
+function claimTab(tabId: number, sessionId: string, force?: boolean): { ok: boolean; owner?: string } {
+  const existing = tabOwners.get(tabId);
+  if (existing && existing.sessionId !== sessionId) {
+    if (!force) return { ok: false, owner: existing.sessionId };
+    broadcastOwnershipEvent('Target.tabReleased', { tabId, reason: 'force-takeover', previousOwner: existing.sessionId });
+  }
+  tabOwners.set(tabId, { sessionId, claimedAt: Date.now() });
+  sessionActivity.set(sessionId, Date.now());
+  broadcastOwnershipEvent('Target.tabClaimed', { tabId, sessionId, claimedAt: Date.now() });
+  sendOwnershipSnapshotToExtension('claim');
+  return { ok: true };
 }
 
-const tabLeases = new Map<string, TabLease>();
-
-function getLeaseInfo(sessionId: string): LeaseInfo | null {
-  const lease = tabLeases.get(sessionId);
-  if (!lease) return null;
-  return { clientId: lease.clientId, label: lease.label, acquiredAt: lease.acquiredAt };
+function touchClaim(tabId: number, sessionId: string): void {
+  const existing = tabOwners.get(tabId);
+  if (!existing || existing.sessionId !== sessionId) return;
+  sessionActivity.set(sessionId, Date.now());
 }
 
-function releaseClientLeases(clientId: string, reason: string): void {
-  let released = false;
-  for (const [sid, lease] of tabLeases) {
-    if (lease.clientId === clientId) {
-      tabLeases.delete(sid);
-      released = true;
-      log(`Auto-released lease on ${sid} (${reason})`);
-      broadcastToCDPClients({
-        method: 'Target.leaseReleased',
-        params: { sessionId: sid, reason },
-      });
+function releaseTab(tabId: number, sessionId: string): boolean {
+  const existing = tabOwners.get(tabId);
+  if (!existing || existing.sessionId !== sessionId) return false;
+  tabOwners.delete(tabId);
+  broadcastOwnershipEvent('Target.tabReleased', { tabId, reason: 'explicit-release' });
+  sendOwnershipSnapshotToExtension('release');
+  return true;
+}
+
+function releaseAllTabs(sessionId: string): number {
+  const toRelease: number[] = [];
+  for (const [tabId, owner] of tabOwners) {
+    if (owner.sessionId === sessionId) toRelease.push(tabId);
+  }
+  for (const tabId of toRelease) {
+    tabOwners.delete(tabId);
+    broadcastOwnershipEvent('Target.tabReleased', { tabId, reason: 'session-cleanup' });
+  }
+  if (toRelease.length > 0) sendOwnershipSnapshotToExtension('session-cleanup');
+  return toRelease.length;
+}
+
+function getOwnedTabs(sessionId: string): number[] {
+  return [...tabOwners.entries()]
+    .filter(([, o]) => o.sessionId === sessionId)
+    .map(([tabId]) => tabId);
+}
+
+function getTabOwner(tabId: number): string | undefined {
+  return tabOwners.get(tabId)?.sessionId;
+}
+
+function resolveTabIdFromSession(cdpSessionId: string): number | undefined {
+  return attachedTargets.get(cdpSessionId)?.tabId ?? undefined;
+}
+
+function sendOwnershipSnapshotToExtension(reason: string): void {
+  if (extensionWs?.readyState !== WebSocket.OPEN) return;
+  const ownership = [...tabOwners.entries()].map(([tabId, o]) => ({
+    tabId,
+    sessionId: o.sessionId,
+    claimedAt: o.claimedAt,
+  }));
+  sendToExtension({
+    method: 'Target.ownershipSnapshot',
+    params: { reason, ownership },
+  });
+}
+
+function broadcastOwnershipEvent(method: string, params: Record<string, unknown>): void {
+  broadcastToCDPClients({ method, params });
+}
+
+const DEFAULT_STALE_TTL = 30 * 60 * 1000;
+const STALE_SESSION_TTL = (() => {
+  const raw = process.env.SPAWRITER_CLAIM_TTL_MS;
+  const val = Number(raw);
+  return Number.isFinite(val) && val >= 0 ? val : DEFAULT_STALE_TTL;
+})();
+const SWEEP_INTERVAL = STALE_SESSION_TTL > 0
+  ? Math.min(Math.max(10000, Math.floor(STALE_SESSION_TTL / 2)), 60000)
+  : 0;
+
+function startStaleSweep(): void {
+  if (SWEEP_INTERVAL <= 0) return;
+  setInterval(() => {
+    const now = Date.now();
+    for (const [sessionId, lastActive] of sessionActivity) {
+      if (now - lastActive > STALE_SESSION_TTL) {
+        const count = releaseAllTabs(sessionId);
+        if (count > 0) log(`Stale session ${sessionId}: released ${count} tab(s)`);
+        sessionActivity.delete(sessionId);
+        sessionToClientId.delete(sessionId);
+        for (const [pwId, sid] of pwClientToSession) {
+          if (sid === sessionId) pwClientToSession.delete(pwId);
+        }
+        relayExecutorManager.remove(sessionId);
+      }
     }
-  }
-  if (released) {
-    sendLeaseSnapshotToExtension(reason);
-  }
-}
-
-function isPlaywrightClient(clientId: string): boolean {
-  return clientId.startsWith('pw-');
+    for (const [sessionId, lastActive] of sessionActivity) {
+      if (getOwnedTabs(sessionId).length === 0 && now - lastActive > STALE_SESSION_TTL) {
+        sessionActivity.delete(sessionId);
+        sessionToClientId.delete(sessionId);
+      }
+    }
+  }, SWEEP_INTERVAL);
 }
 
 const ALLOWED_EXTENSION_IDS = getAllowedExtensionIds();
@@ -253,7 +327,7 @@ app.get('/json/list', (c) => {
       title: targetInfo.title ?? '',
       url: targetInfo.url ?? '',
       webSocketDebuggerUrl: getCdpUrl(getRelayPort(), target.sessionId),
-      lease: getLeaseInfo(target.sessionId),
+      owner: target.tabId != null ? (getTabOwner(target.tabId) ?? null) : null,
     };
   });
   return c.json(targets);
@@ -267,25 +341,7 @@ function sendToExtension(message: unknown): void {
   }
 }
 
-function sendLeaseSnapshotToExtension(reason: string): void {
-  if (extensionWs?.readyState !== WebSocket.OPEN) return;
-  sendToExtension({
-    method: 'Target.leaseSnapshot',
-    params: {
-      reason,
-      leases: Array.from(tabLeases.values()).map((lease) => {
-        const target = attachedTargets.get(lease.sessionId);
-        return {
-          sessionId: lease.sessionId,
-          clientId: lease.clientId,
-          label: lease.label,
-          acquiredAt: lease.acquiredAt,
-          tabId: target?.tabId,
-        };
-      }),
-    },
-  });
-}
+// sendOwnershipSnapshotToExtension is defined above with the ownership system
 
 function isExtensionConnected(): boolean {
   return extensionWs?.readyState === WebSocket.OPEN;
@@ -586,7 +642,7 @@ function handleServerCdpCommand(
       const targetInfos = Array.from(attachedTargets.values()).map((target) => ({
         ...buildTargetInfo(target),
         attached: true,
-        lease: getLeaseInfo(target.sessionId),
+        owner: target.tabId != null ? (getTabOwner(target.tabId) ?? null) : null,
       }));
       sendCdpResponse(clientId, { id, sessionId, result: { targetInfos } });
       return true;
@@ -642,108 +698,53 @@ function handleServerCdpCommand(
     }
 
     // -----------------------------------------------------------------------
-    // Tab Lease commands
+    // Tab Ownership commands
     // -----------------------------------------------------------------------
 
-    case 'Target.acquireLease': {
-      const leaseSessionId = (params as { sessionId?: string } | undefined)?.sessionId;
-      const leaseLabel = (params as { label?: string } | undefined)?.label;
-
-      if (!leaseSessionId) {
-        sendCdpError(clientId, { id, sessionId, error: 'Target.acquireLease requires params.sessionId' });
+    case 'Target.claimTab': {
+      const claimTabId = asNumber(params?.tabId);
+      const claimSessionId = asString(params?.sessionId);
+      const claimForce = !!params?.force;
+      if (claimTabId == null || !claimSessionId) {
+        sendCdpError(clientId, { id, sessionId, error: 'Target.claimTab requires params.tabId (number) and params.sessionId (string)' });
         return true;
       }
-
-      if (!attachedTargets.has(leaseSessionId)) {
-        sendCdpError(clientId, { id, sessionId, error: `Target ${leaseSessionId} not found` });
-        return true;
-      }
-
-      const existing = tabLeases.get(leaseSessionId);
-      if (existing && existing.clientId !== clientId) {
-        const holderDesc = existing.label ? `"${existing.label}" (${existing.clientId})` : existing.clientId;
+      const result = claimTab(claimTabId, claimSessionId, claimForce);
+      if (!result.ok) {
         sendToCDPClient(clientId, {
-          id,
-          sessionId,
-          error: {
-            code: LEASE_ERROR_CODE,
-            message: `Tab is leased by ${holderDesc}`,
-          },
-          holder: { clientId: existing.clientId, label: existing.label },
+          id, sessionId,
+          error: { code: OWNERSHIP_ERROR_CODE, message: `Tab ${claimTabId} owned by ${result.owner}` },
         });
         return true;
       }
-
-      const lease: TabLease = {
-        sessionId: leaseSessionId,
-        clientId,
-        label: leaseLabel,
-        acquiredAt: Date.now(),
-      };
-      tabLeases.set(leaseSessionId, lease);
-      log(`Lease granted: ${leaseSessionId} → ${clientId}${leaseLabel ? ` (${leaseLabel})` : ''}`);
-
-      if (isExtensionConnected()) {
-        sendToExtension({
-          method: 'Target.leaseAcquired',
-          params: { sessionId: leaseSessionId, lease: getLeaseInfo(leaseSessionId) },
-        });
-      }
-      sendLeaseSnapshotToExtension('acquire');
-
-      sendCdpResponse(clientId, {
-        id,
-        sessionId,
-        result: { granted: true, lease: getLeaseInfo(leaseSessionId) },
-      });
+      sessionToClientId.set(claimSessionId, clientId);
+      sendCdpResponse(clientId, { id, sessionId, result: { claimed: true, tabId: claimTabId } });
       return true;
     }
 
-    case 'Target.releaseLease': {
-      const releaseSessionId = (params as { sessionId?: string } | undefined)?.sessionId;
-
-      if (!releaseSessionId) {
-        sendCdpError(clientId, { id, sessionId, error: 'Target.releaseLease requires params.sessionId' });
+    case 'Target.releaseTab': {
+      const releaseTabId = asNumber(params?.tabId);
+      const releaseSessionId = asString(params?.sessionId);
+      if (releaseTabId == null || !releaseSessionId) {
+        sendCdpError(clientId, { id, sessionId, error: 'Target.releaseTab requires params.tabId and params.sessionId' });
         return true;
       }
-
-      const existing = tabLeases.get(releaseSessionId);
-      if (!existing) {
-        sendCdpResponse(clientId, { id, sessionId, result: { released: true } });
+      const released = releaseTab(releaseTabId, releaseSessionId);
+      if (!released) {
+        sendCdpError(clientId, { id, sessionId, error: 'Not the owner' });
         return true;
       }
-
-      if (existing.clientId !== clientId) {
-        sendCdpError(clientId, { id, sessionId, error: 'Not the lease holder' });
-        return true;
-      }
-
-      tabLeases.delete(releaseSessionId);
-      log(`Lease released: ${releaseSessionId} by ${clientId}`);
-      if (isExtensionConnected()) {
-        sendToExtension({
-          method: 'Target.leaseReleased',
-          params: { sessionId: releaseSessionId, reason: 'explicit-release' },
-        });
-      }
-      sendLeaseSnapshotToExtension('explicit-release');
-      broadcastToCDPClients({
-        method: 'Target.leaseReleased',
-        params: { sessionId: releaseSessionId, reason: 'explicit-release' },
-      });
-
       sendCdpResponse(clientId, { id, sessionId, result: { released: true } });
       return true;
     }
 
-    case 'Target.listLeases': {
-      const leases = Array.from(tabLeases.values()).map(l => ({
-        sessionId: l.sessionId,
-        clientId: l.clientId,
-        label: l.label,
-        acquiredAt: l.acquiredAt,
+    case 'Target.listOwnership': {
+      const ownershipList = [...tabOwners.entries()].map(([tid, o]) => ({
+        tabId: tid,
+        sessionId: o.sessionId,
+        claimedAt: o.claimedAt,
       }));
-      sendCdpResponse(clientId, { id, sessionId, result: { leases } });
+      sendCdpResponse(clientId, { id, sessionId, result: { ownership: ownershipList } });
       return true;
     }
 
@@ -760,8 +761,8 @@ function handleExtensionMessage(data: Buffer) {
       return;
     }
 
-    if (message.method === 'requestLeaseSnapshot') {
-      sendLeaseSnapshotToExtension('extension-request');
+    if (message.method === 'requestOwnershipSnapshot') {
+      sendOwnershipSnapshotToExtension('requested');
       return;
     }
 
@@ -784,20 +785,10 @@ function handleExtensionMessage(data: Buffer) {
             if (existing.tabId === incomingTabId && existingSessionId !== sessionId) {
               log(`Replacing stale target for tabId ${incomingTabId}: ${existingSessionId} → ${sessionId}`);
               attachedTargets.delete(existingSessionId);
-              const staleLease = tabLeases.get(existingSessionId);
-              if (staleLease) {
-                tabLeases.delete(existingSessionId);
-                sendToCDPClient(staleLease.clientId, {
-                  method: 'Target.leaseLost',
-                  params: { sessionId: existingSessionId, reason: 'target-replaced' },
-                });
-                if (isExtensionConnected()) {
-                  sendToExtension({
-                    method: 'Target.leaseLost',
-                    params: { sessionId: existingSessionId, reason: 'target-replaced' },
-                  });
-                }
-                sendLeaseSnapshotToExtension('target-replaced');
+              if (incomingTabId != null && tabOwners.has(incomingTabId)) {
+                tabOwners.delete(incomingTabId);
+                broadcastOwnershipEvent('Target.tabReleased', { tabId: incomingTabId, reason: 'target-replaced' });
+                sendOwnershipSnapshotToExtension('target-replaced');
               }
               broadcastToCDPClients({
                 method: 'Target.detachedFromTarget',
@@ -833,8 +824,8 @@ function handleExtensionMessage(data: Buffer) {
             sessionId,
             targetInfo: enrichedTargetInfo,
             totalAttached: attachedTargets.size,
-            totalLeased: tabLeases.size,
-            totalAvailable: attachedTargets.size - tabLeases.size,
+            totalOwned: tabOwners.size,
+            totalAvailable: attachedTargets.size - tabOwners.size,
           },
         });
         return;
@@ -843,23 +834,17 @@ function handleExtensionMessage(data: Buffer) {
       if (method === 'Target.detachedFromTarget') {
         const detachedSessionId = (params as { sessionId?: string }).sessionId;
         if (detachedSessionId) {
-          attachedTargets.delete(detachedSessionId);
-          const lease = tabLeases.get(detachedSessionId);
-          if (lease) {
-            tabLeases.delete(detachedSessionId);
-            log(`Lease cleaned up for detached tab ${detachedSessionId}`);
-            sendToCDPClient(lease.clientId, {
-              method: 'Target.leaseLost',
-              params: { sessionId: detachedSessionId, reason: 'tab-detached' },
-            });
-            if (isExtensionConnected()) {
-              sendToExtension({
-                method: 'Target.leaseLost',
-                params: { sessionId: detachedSessionId, reason: 'tab-detached' },
-              });
+          const detachedTarget = attachedTargets.get(detachedSessionId);
+          if (detachedTarget?.tabId != null) {
+            const hadOwner = tabOwners.has(detachedTarget.tabId);
+            tabOwners.delete(detachedTarget.tabId);
+            if (hadOwner) {
+              log(`Ownership cleaned up for detached tab ${detachedTarget.tabId}`);
+              broadcastOwnershipEvent('Target.tabReleased', { tabId: detachedTarget.tabId, reason: 'tab-detached' });
+              sendOwnershipSnapshotToExtension('tab-detached');
             }
-            sendLeaseSnapshotToExtension('tab-detached');
           }
+          attachedTargets.delete(detachedSessionId);
         }
       }
 
@@ -903,35 +888,50 @@ function handleExtensionMessage(data: Buffer) {
   }
 }
 
-function checkLeaseEnforcement(clientId: string, sessionId: string | undefined, id: number): boolean {
-  if (!sessionId || isPlaywrightClient(clientId)) return true;
+function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: number): boolean {
+  if (!cdpSessionId) return true;
+  const tabId = resolveTabIdFromSession(cdpSessionId);
+  if (tabId == null) return true;
+  const owner = tabOwners.get(tabId);
+  if (!owner) return true;
 
-  const lease = tabLeases.get(sessionId);
-  if (!lease) return true;
+  const ownerClientId = sessionToClientId.get(owner.sessionId);
+  if (ownerClientId === clientId) return true;
 
-  if (lease.clientId !== clientId) {
-    const holderDesc = lease.label ? `"${lease.label}" (${lease.clientId})` : lease.clientId;
-    sendCdpError(clientId, {
-      id,
-      sessionId,
-      error: `Tab is leased by ${holderDesc}. Acquire a different tab or wait for release.`,
-      code: LEASE_ERROR_CODE,
-    });
-    return false;
+  if (clientId.startsWith('pw-')) {
+    const boundSession = pwClientToSession.get(clientId);
+    if (boundSession === owner.sessionId) return true;
   }
-  return true;
+
+  sendCdpError(clientId, {
+    id,
+    sessionId: cdpSessionId,
+    error: `Tab ${tabId} is owned by session "${owner.sessionId}". Cannot operate.`,
+    code: OWNERSHIP_ERROR_CODE,
+  });
+  return false;
 }
 
 function routeCdpEvent(method: string, params: unknown, sessionId?: string): void {
-  if (sessionId && tabLeases.has(sessionId)) {
-    const lease = tabLeases.get(sessionId)!;
-    sendToCDPClient(lease.clientId, { method, params, sessionId });
-    for (const [cid, client] of cdpClients) {
-      if (isPlaywrightClient(cid) && client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(JSON.stringify({ method, params, sessionId }));
-      }
-    }
+  if (!sessionId) {
+    broadcastToCDPClients({ method, params, sessionId });
     return;
+  }
+  const tabId = resolveTabIdFromSession(sessionId);
+  if (tabId != null) {
+    const owner = tabOwners.get(tabId);
+    if (owner) {
+      const ownerClientId = sessionToClientId.get(owner.sessionId);
+      if (ownerClientId) {
+        sendToCDPClient(ownerClientId, { method, params, sessionId });
+      }
+      for (const [cid, client] of cdpClients) {
+        if (cid.startsWith('pw-') && client.ws.readyState === WebSocket.OPEN) {
+          client.ws.send(JSON.stringify({ method, params, sessionId }));
+        }
+      }
+      return;
+    }
   }
   broadcastToCDPClients({ method, params, sessionId });
 }
@@ -948,7 +948,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
         return;
       }
 
-      if (!checkLeaseEnforcement(clientId, params.sessionId, id)) return;
+      if (!checkOwnership(clientId, params.sessionId, id)) return;
 
       const relayId = nextExtensionRequestId++;
       if (!isExtensionConnected()) {
@@ -990,7 +990,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       return;
     }
 
-    if (!checkLeaseEnforcement(clientId, sessionId, id)) return;
+    if (!checkOwnership(clientId, sessionId, id)) return;
 
     const relayId = nextExtensionRequestId++;
     if (!isExtensionConnected()) {
@@ -1076,6 +1076,7 @@ function relaySendCdp(method: string, params?: Record<string, unknown>, timeout 
 }
 
 const relayExecutorManager = new ExecutorManager({ maxSessions: 10, relaySendCdp });
+startStaleSweep();
 
 // ---------------------------------------------------------------------------
 // CLI control routes (inlined from former control-routes.ts)
@@ -1107,7 +1108,48 @@ app.post('/cli/execute', async (c) => {
   try {
     const body = await c.req.json() as { sessionId: string; code: string; timeout?: number };
     const executor = relayExecutorManager.getOrCreate(body.sessionId);
+    sessionActivity.set(body.sessionId, Date.now());
+
+    if (executor.getActiveTabId() == null) {
+      for (const target of attachedTargets.values()) {
+        if (target.tabId != null && !tabOwners.has(target.tabId)) {
+          const claim = claimTab(target.tabId, body.sessionId);
+          if (claim.ok) {
+            executor.claimTab(target.tabId, target.targetInfo?.url);
+            break;
+          }
+        }
+      }
+    }
+
+    const activeTabId = executor.getActiveTabId();
+    if (activeTabId != null) {
+      const owner = getTabOwner(activeTabId);
+      if (owner && owner !== body.sessionId) {
+        return c.json({
+          text: `Tab ${activeTabId} is owned by session "${owner}". Use tab list to see available tabs.`,
+          images: [], screenshots: [], isError: true,
+        }, 403);
+      }
+    }
+
+    const existingPwClientId = executor.getLastCdpClientId?.();
+    if (existingPwClientId) {
+      pwClientToSession.set(existingPwClientId, body.sessionId);
+    }
+    executor.onCdpClientCreated = (newClientId: string) => {
+      pwClientToSession.set(newClientId, body.sessionId);
+    };
+
     const result = await executor.execute(body.code, body.timeout || 10000);
+
+    const latestPwClientId = executor.getLastCdpClientId?.();
+    if (latestPwClientId && latestPwClientId !== existingPwClientId) {
+      pwClientToSession.set(latestPwClientId, body.sessionId);
+    }
+
+    if (activeTabId != null) touchClaim(activeTabId, body.sessionId);
+
     return c.json({ text: result.text, images: result.images, screenshots: result.screenshots, isError: result.isError });
   } catch (err: any) {
     return c.json({ text: err.message, images: [], screenshots: [], isError: true }, 500);
@@ -1131,6 +1173,9 @@ app.get('/cli/sessions', (c) => {
 
 app.post('/cli/session/delete', async (c) => {
   const { sessionId } = await c.req.json();
+  releaseAllTabs(sessionId);
+  sessionActivity.delete(sessionId);
+  sessionToClientId.delete(sessionId);
   const ok = await relayExecutorManager.remove(sessionId);
   if (!ok) return c.json({ error: 'Session not found' }, 404);
   return c.json({ success: true });
@@ -1144,10 +1189,61 @@ app.post('/cli/session/reset', async (c) => {
   return c.json({ success: true });
 });
 
+app.post('/cli/tab/claim', async (c) => {
+  const { tabId, sessionId, force } = await c.req.json();
+  if (tabId == null || !sessionId) return c.json({ error: 'tabId and sessionId required' }, 400);
+  const result = claimTab(tabId, sessionId, !!force);
+  if (!result.ok) return c.json({ error: `Tab ${tabId} owned by ${result.owner}` }, 409);
+  const executor = relayExecutorManager.get(sessionId);
+  if (executor) {
+    const url = [...attachedTargets.values()]
+      .find(t => t.tabId === tabId)?.targetInfo?.url;
+    executor.claimTab(tabId, url);
+  }
+  return c.json({ success: true });
+});
+
+app.post('/cli/tab/release', async (c) => {
+  const { tabId, sessionId } = await c.req.json();
+  if (tabId == null || !sessionId) return c.json({ error: 'tabId and sessionId required' }, 400);
+  const released = releaseTab(tabId, sessionId);
+  if (!released) return c.json({ error: 'Not the owner' }, 403);
+  const executor = relayExecutorManager.get(sessionId);
+  if (executor) executor.releaseTab(tabId);
+  return c.json({ success: true });
+});
+
+app.post('/cli/session/activity', async (c) => {
+  const { sessionId } = await c.req.json();
+  if (!sessionId) return c.json({ error: 'sessionId required' }, 400);
+  sessionActivity.set(sessionId, Date.now());
+  return c.json({ success: true });
+});
+
 app.post('/cli/cdp', async (c) => {
   try {
-    const { method, params, timeout } = await c.req.json() as { method: string; params?: Record<string, unknown>; timeout?: number };
+    const { method, params, sessionId, timeout } = await c.req.json() as {
+      method: string;
+      params?: Record<string, unknown>;
+      sessionId?: string;
+      timeout?: number;
+    };
     if (!method) return c.json({ error: 'method is required' }, 400);
+
+    if (sessionId) {
+      sessionActivity.set(sessionId, Date.now());
+      const targetCdpSession = params?.sessionId as string | undefined;
+      if (targetCdpSession) {
+        const tabId = resolveTabIdFromSession(targetCdpSession);
+        if (tabId != null) {
+          const owner = getTabOwner(tabId);
+          if (owner && owner !== sessionId) {
+            return c.json({ error: `Tab ${tabId} owned by session "${owner}"` }, 403);
+          }
+        }
+      }
+    }
+
     const result = await relaySendCdp(method, params, timeout);
     return c.json({ result });
   } catch (err: any) {
@@ -1212,7 +1308,7 @@ export async function startRelayServer(): Promise<void> {
 
       log('Extension WebSocket connected');
       extensionWs = ws as WebSocket;
-      sendLeaseSnapshotToExtension('extension-connected');
+      sendOwnershipSnapshotToExtension('extension-connected');
 
       ws.on('message', (data) => {
         handleExtensionMessage(rawDataToBuffer(data));
@@ -1224,13 +1320,16 @@ export async function startRelayServer(): Promise<void> {
           extensionWs = null;
         }
 
-        for (const [sid, lease] of tabLeases) {
-          sendToCDPClient(lease.clientId, {
-            method: 'Target.leaseLost',
-            params: { sessionId: sid, reason: 'extension-disconnected' },
+        for (const [tabId] of tabOwners) {
+          broadcastToCDPClients({
+            method: 'Target.tabReleased',
+            params: { tabId, reason: 'extension-disconnected' },
           });
         }
-        tabLeases.clear();
+        tabOwners.clear();
+        sessionActivity.clear();
+        sessionToClientId.clear();
+        pwClientToSession.clear();
 
         for (const target of attachedTargets.values()) {
           broadcastToCDPClients({
@@ -1293,7 +1392,13 @@ export async function startRelayServer(): Promise<void> {
         const current = cdpClients.get(clientId);
         if (current?.ws === ws) {
           cdpClients.delete(clientId);
-          releaseClientLeases(clientId, `client ${clientId} disconnected`);
+          pwClientToSession.delete(clientId);
+          for (const [sid, cid] of sessionToClientId) {
+            if (cid === clientId) {
+              releaseAllTabs(sid);
+              sessionToClientId.delete(sid);
+            }
+          }
         }
         for (const [requestId, pending] of pendingRequests.entries()) {
           if (pending.clientId === clientId) {

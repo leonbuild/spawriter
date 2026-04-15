@@ -829,9 +829,9 @@ because they operate at the browser scope:
 | `Target.attachToTarget` | Create session mapping | Partial (line 619) |
 | `Target.attachToBrowserTarget` | Translate to attachToTarget | **NEW** |
 | `Target.detachFromTarget` | Clean up session | **NEW** |
-| `Target.acquireLease` | Tab lease management | Yes (line 648) |
-| `Target.releaseLease` | Tab lease management | Yes (line 702) |
-| `Target.listLeases` | Tab lease management | Yes (line 739) |
+| `Target.claimTab` | Tab ownership management | Yes |
+| `Target.releaseTab` | Tab ownership management | Yes |
+| `Target.listOwnership` | Tab ownership management | Yes |
 
 ### CDP Domains Used by spawriter VM Globals
 

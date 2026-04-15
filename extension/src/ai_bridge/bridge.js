@@ -5,7 +5,7 @@ import browser from "webextension-polyfill";
 
   let attachedTabs = new Map();
   let tabStates = new Map();
-  let leaseStateBySessionId = new Map();
+  let tabOwnership = new Map();
   let debuggerEventListenerRegistered = false;
   let offscreenReady = false;
 
@@ -75,7 +75,7 @@ import browser from "webextension-polyfill";
   }
 
   function getConnectedCount() {
-    return leaseStateBySessionId.size;
+    return tabOwnership.size;
   }
 
   function getIdleAttachedCount() {
@@ -86,41 +86,30 @@ import browser from "webextension-polyfill";
     return count;
   }
 
-  function isTabLeased(tabId) {
-    const tabInfo = attachedTabs.get(tabId);
-    if (!tabInfo?.sessionId) return false;
-    return leaseStateBySessionId.has(tabInfo.sessionId);
+  function isTabOwned(tabId) {
+    return tabOwnership.has(tabId);
   }
 
-  function syncLeaseDrivenStates() {
-    const leaseByTabId = new Map();
-    for (const lease of leaseStateBySessionId.values()) {
-      if (lease?.tabId !== undefined) {
-        leaseByTabId.set(lease.tabId, lease);
-      }
-    }
-
-    for (const [tabId, tabInfo] of attachedTabs.entries()) {
-      const leasedBySessionId = !!tabInfo?.sessionId && leaseStateBySessionId.has(tabInfo.sessionId);
-      const leasedByTabId = leaseByTabId.has(tabId);
-      const leased = leasedBySessionId || leasedByTabId;
-      const nextState = leased ? "connected" : "idle";
+  function syncOwnershipStates() {
+    for (const [tabId] of attachedTabs.entries()) {
+      const owned = tabOwnership.has(tabId);
+      const nextState = owned ? "connected" : "idle";
       setTabState(tabId, nextState);
       markTabTitle(tabId, nextState);
     }
     updateIcons();
   }
 
-  function applyLeaseSnapshot(leases) {
-    leaseStateBySessionId.clear();
-    if (Array.isArray(leases)) {
-      for (const lease of leases) {
-        if (lease?.sessionId) {
-          leaseStateBySessionId.set(lease.sessionId, lease);
+  function applyOwnershipSnapshot(ownership) {
+    tabOwnership.clear();
+    if (Array.isArray(ownership)) {
+      for (const entry of ownership) {
+        if (entry?.tabId != null) {
+          tabOwnership.set(entry.tabId, { sessionId: entry.sessionId, claimedAt: entry.claimedAt });
         }
       }
     }
-    syncLeaseDrivenStates();
+    syncOwnershipStates();
   }
 
   const icons = {
@@ -150,11 +139,11 @@ import browser from "webextension-polyfill";
     },
   };
 
-  function buildBadgeInfo(leaseCount, idleCount) {
-    if (leaseCount > 0 && idleCount > 0) {
-      return { text: `${leaseCount}·${idleCount}`, color: "#4CAF50" };
-    } else if (leaseCount > 0) {
-      return { text: String(leaseCount), color: "#4CAF50" };
+  function buildBadgeInfo(ownedCount, idleCount) {
+    if (ownedCount > 0 && idleCount > 0) {
+      return { text: `${ownedCount}·${idleCount}`, color: "#4CAF50" };
+    } else if (ownedCount > 0) {
+      return { text: String(ownedCount), color: "#4CAF50" };
     } else if (idleCount > 0) {
       return { text: String(idleCount), color: "#3F51B5" };
     }
@@ -213,12 +202,12 @@ import browser from "webextension-polyfill";
         badgeColor = "#FFC107";
         iconPath = icons.gray.path;
       } else if (state === "connected") {
-        title = `spawriter - In use by agent (${connectedCount} leased` + (idleCount > 0 ? `, ${idleCount} idle)` : ")");
+        title = `spawriter - In use by agent (${connectedCount} owned` + (idleCount > 0 ? `, ${idleCount} idle)` : ")");
         badgeText = globalBadge.text;
         badgeColor = "#4CAF50";
         iconPath = icons.connected.path;
       } else if (attached) {
-        title = `spawriter - Attached, no lease (${idleCount} idle` + (connectedCount > 0 ? `, ${connectedCount} leased)` : ")");
+        title = `spawriter - Attached, no owner (${idleCount} idle` + (connectedCount > 0 ? `, ${connectedCount} owned)` : ")");
         badgeText = globalBadge.text;
         badgeColor = "#3F51B5";
         iconPath = icons.idle.path;
@@ -325,9 +314,7 @@ import browser from "webextension-polyfill";
     const tabInfo = attachedTabs.get(tabId);
     if (!tabInfo) return;
 
-    if (tabInfo.sessionId) {
-      leaseStateBySessionId.delete(tabInfo.sessionId);
-    }
+    tabOwnership.delete(tabId);
     attachedTabs.delete(tabId);
     persistState();
     markTabTitle(tabId, false);
@@ -480,26 +467,25 @@ import browser from "webextension-polyfill";
       return;
     }
 
-    if (message.method === "Target.leaseSnapshot") {
-      const leases = Array.isArray(message?.params?.leases) ? message.params.leases : [];
-      applyLeaseSnapshot(leases);
+    if (message.method === "Target.ownershipSnapshot") {
+      applyOwnershipSnapshot(message?.params?.ownership || []);
       return;
     }
 
-    if (message.method === "Target.leaseAcquired") {
-      const sessionId = message?.params?.sessionId;
-      if (sessionId) {
-        leaseStateBySessionId.set(sessionId, message?.params?.lease || { sessionId });
-        syncLeaseDrivenStates();
+    if (message.method === "Target.tabClaimed") {
+      const { tabId, sessionId, claimedAt } = message?.params || {};
+      if (tabId != null) {
+        tabOwnership.set(tabId, { sessionId, claimedAt });
+        syncOwnershipStates();
       }
       return;
     }
 
-    if (message.method === "Target.leaseReleased" || message.method === "Target.leaseLost") {
-      const sessionId = message?.params?.sessionId;
-      if (sessionId) {
-        leaseStateBySessionId.delete(sessionId);
-        syncLeaseDrivenStates();
+    if (message.method === "Target.tabReleased") {
+      const { tabId } = message?.params || {};
+      if (tabId != null) {
+        tabOwnership.delete(tabId);
+        syncOwnershipStates();
       }
       return;
     }
@@ -745,7 +731,7 @@ import browser from "webextension-polyfill";
       attachedAt: Date.now(),
     });
     persistState();
-    const initialState = isTabLeased(tabId) ? "connected" : "idle";
+    const initialState = isTabOwned(tabId) ? "connected" : "idle";
     setTabState(tabId, initialState);
 
     if (!skipAttachedEvent) {
@@ -841,7 +827,7 @@ import browser from "webextension-polyfill";
           const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
           existing = { sessionId, attachedAt: Date.now() };
           attachedTabs.set(tabId, existing);
-          setTabState(tabId, leaseStateBySessionId.has(sessionId) ? "connected" : "idle");
+          setTabState(tabId, isTabOwned(tabId) ? "connected" : "idle");
           log(`resyncAttachedTabs: new entry for tab ${tabId} with sessionId ${sessionId}`);
         }
 
@@ -880,7 +866,7 @@ import browser from "webextension-polyfill";
           },
         });
 
-        const nextState = leaseStateBySessionId.has(existing.sessionId) ? "connected" : "idle";
+        const nextState = isTabOwned(tabId) ? "connected" : "idle";
         setTabState(tabId, nextState);
         markTabTitle(tabId, nextState);
       }
@@ -999,7 +985,7 @@ import browser from "webextension-polyfill";
   async function init() {
     log("spawriter bridge initializing...");
     await restoreState();
-    leaseStateBySessionId.clear();
+    tabOwnership.clear();
     for (const tabId of attachedTabs.keys()) {
       setTabState(tabId, "idle");
     }
@@ -1010,18 +996,16 @@ import browser from "webextension-polyfill";
       try {
         const resp = await fetch("http://localhost:19989/json/list", { signal: AbortSignal.timeout(2000) });
         const targets = await resp.json();
-        leaseStateBySessionId.clear();
+        tabOwnership.clear();
         for (const target of targets) {
-          if (target.lease) {
-            leaseStateBySessionId.set(target.id, {
-              sessionId: target.id,
-              clientId: target.lease.clientId,
-              tabId: target.tabId,
-              acquiredAt: target.lease.acquiredAt,
+          if (target.owner && target.tabId != null) {
+            tabOwnership.set(target.tabId, {
+              sessionId: target.owner,
+              claimedAt: 0,
             });
           }
         }
-        syncLeaseDrivenStates();
+        syncOwnershipStates();
       } catch (_) {}
     }, 5000);
 
@@ -1031,14 +1015,14 @@ import browser from "webextension-polyfill";
           const resp = await chrome.runtime.sendMessage({ type: "ws-status" });
           if (resp?.state === "open") {
             offscreenReady = true;
-            leaseStateBySessionId.clear();
+            tabOwnership.clear();
             for (const [tabId] of attachedTabs.entries()) {
               setTabState(tabId, "idle");
               markTabTitle(tabId, "idle");
             }
             resyncAttachedTabs().then(async () => {
               await sleep(500);
-              sendMessage({ method: "requestLeaseSnapshot" });
+              sendMessage({ method: "requestOwnershipSnapshot" });
             });
           }
         } catch (_) {}
@@ -1072,7 +1056,7 @@ import browser from "webextension-polyfill";
       offscreenReady = message.state === "open";
       log("Relay WebSocket state:", message.state);
       if (message.state === "closed") {
-        leaseStateBySessionId.clear();
+        tabOwnership.clear();
         for (const tabId of attachedTabs.keys()) {
           setTabState(tabId, "idle");
           markTabTitle(tabId, "idle");
@@ -1081,7 +1065,7 @@ import browser from "webextension-polyfill";
         syncTabGroup();
       }
       if (message.state === "open") {
-        leaseStateBySessionId.clear();
+        tabOwnership.clear();
         for (const [tabId] of attachedTabs.entries()) {
           setTabState(tabId, "idle");
           markTabTitle(tabId, "idle");
@@ -1089,7 +1073,7 @@ import browser from "webextension-polyfill";
         updateIcons();
         resyncAttachedTabs().then(async () => {
           await sleep(500);
-          sendMessage({ method: "requestLeaseSnapshot" });
+          sendMessage({ method: "requestOwnershipSnapshot" });
           syncTabGroup();
         });
       }

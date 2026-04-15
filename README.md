@@ -161,7 +161,7 @@ Key features:
 - **4 core MCP tools**: `execute`, `reset`, `single_spa`, `tab` (legacy tools deprecated but still available)
 - **CLI `-e` code execution**: `spawriter -s <id> -e '<code>'` — Playwright API + spawriter extensions
 - **Zero-touch tab management** — agents create/attach/navigate tabs programmatically
-- **Multi-agent isolation** — Tab Lease System ensures exclusive tab ownership
+- **Multi-agent isolation** — Tab Ownership System ensures exclusive tab ownership per session
 - **Persistent connection** — offscreen document survives MV3 service worker restarts
 
 ## Scripts

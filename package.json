@@ -22,7 +22,7 @@
     "ext:build:chrome": "npm run -w spawriter-extension build:chrome",
     "start:hot": "powershell -ExecutionPolicy Bypass -File scripts/start-hot.ps1",
     "version:bump": "node scripts/bump-version.js",
-    "test": "npx tsx --test spawriter/src/mcp.test.ts spawriter/src/pw-executor.test.ts spawriter/src/lease.test.ts spawriter/src/utils.test.ts spawriter/src/cli.test.ts spawriter/src/relay.test.ts",
+    "test": "npx tsx --test spawriter/src/mcp.test.ts spawriter/src/pw-executor.test.ts spawriter/src/ownership.test.ts spawriter/src/utils.test.ts spawriter/src/cli.test.ts spawriter/src/relay.test.ts",
     "deploy:firefox": "npm run -w spawriter-extension webpack-build && npm run -w spawriter-extension lint && shipit firefox extension/",
     "deploy:chrome": "npm run ext:build:chrome && shipit chrome extension/web-ext-artifacts/spawriter-chrome-$npm_package_version.zip",
     "deploy": "npm run deploy:firefox && npm run deploy:chrome"

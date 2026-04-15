@@ -68,23 +68,13 @@ export interface CDPEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Tab Lease System — multi-agent tab isolation
+// Tab Ownership System — multi-agent tab isolation
 // ---------------------------------------------------------------------------
 
-export interface LeaseInfo {
-  clientId: string;
-  label?: string;
-  acquiredAt: number;
-}
+export const OWNERSHIP_ERROR_CODE = -32001;
 
-export interface TargetWithLease {
-  id: string;
-  tabId?: number;
-  type: string;
-  title: string;
-  url: string;
-  webSocketDebuggerUrl: string;
-  lease: LeaseInfo | null;
+export interface TabOwnership {
+  tabId: number;
+  sessionId: string;
+  claimedAt: number;
 }
-
-export const LEASE_ERROR_CODE = -32001;

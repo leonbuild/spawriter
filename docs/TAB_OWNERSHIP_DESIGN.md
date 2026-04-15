@@ -6,16 +6,16 @@
 
 | Section | Status | Notes |
 |---|---|---|
-| 1. `protocol.ts` | **PLANNED** | Old `LeaseInfo` / `LEASE_ERROR_CODE` still in place |
-| 2. `relay.ts` — Core Ownership Map | **PLANNED** | Old `TabLease` / `tabLeases` / lease functions still in place |
-| 3. `pw-executor.ts` — Executor Binding | **PLANNED** | No `ownedTabIds` / `activeTabId` / `switchToTab` yet; still uses `pages[0]` |
-| 4. `mcp.ts` — MCP Integration | **PLANNED** | Still uses lease-based `TargetListItem`; no relay claim calls |
-| 5. `cli.ts` — CLI Commands | **PLANNED** | No `session bind` command |
-| 6. `extension/bridge.js` — Extension UI | **PLANNED** | Still uses `leaseStateBySessionId` / lease events |
-| 7. `lease.test.ts` → `ownership.test.ts` | **PLANNED** | File not yet renamed; tests still use lease registry |
-| 8. `relay.test.ts` — Update References | **PLANNED** | ~150 lease references remain |
+| 1. `protocol.ts` | **DONE** | `LeaseInfo`/`LEASE_ERROR_CODE` removed; `OWNERSHIP_ERROR_CODE`/`TabOwnership` added |
+| 2. `relay.ts` — Core Ownership Map | **DONE** | `tabOwners`/`sessionActivity`/`claimTab`/`releaseTab`/`touchClaim` + stale sweep |
+| 3. `pw-executor.ts` — Executor Binding | **DONE** | `ownedTabIds`/`activeTabId`/`switchToTab`/`claimTab`/`releaseTab` + URL-based page matching |
+| 4. `mcp.ts` — MCP Integration | **DONE** | Ownership-based `TargetListItem`; relay `/cli/tab/claim` calls; activity tracking |
+| 5. `cli.ts` — CLI Commands | **DONE** | `session bind <tabId>` command added |
+| 6. `extension/bridge.js` — Extension UI | **DONE** | `tabOwnership` Map replaces `leaseStateBySessionId`; new event handlers |
+| 7. `lease.test.ts` → `ownership.test.ts` | **DONE** | File renamed; tests use ownership registry |
+| 8. `relay.test.ts` — Update References | **DONE** | All lease references replaced with ownership |
 
-> **This document is a design specification, not a changelog.** All code changes described below are planned but not yet implemented. The current codebase uses the old lease system throughout. Do not treat code blocks as "already landed" — they are the target implementation.
+> **Implementation complete.** All sections have been implemented. The old lease system has been fully replaced with the tab ownership system described below.
 
 ---
 
