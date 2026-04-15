@@ -1,5 +1,8 @@
 export function canEmitKittyGraphics(): boolean {
-  return process.env.AGENT_GRAPHICS?.includes('kitty') ?? false;
+  if (process.env.AGENT_GRAPHICS?.includes('kitty')) return true;
+  const term = process.env.TERM || '';
+  const termProgram = process.env.TERM_PROGRAM || '';
+  return term.includes('kitty') || termProgram.toLowerCase() === 'kitty';
 }
 
 export function emitKittyImage(base64: string): void {

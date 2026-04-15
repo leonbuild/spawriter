@@ -134,7 +134,20 @@ function getAgentSession(agentId: string): AgentSession {
 // Executor management
 // ---------------------------------------------------------------------------
 
-const executorManager = new ExecutorManager({ maxSessions: 10 });
+async function remoteRelaySendCdp(method: string, params?: Record<string, unknown>, timeout?: number): Promise<unknown> {
+  const port = getRelayPort();
+  const resp = await fetch(`http://localhost:${port}/cli/cdp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method, params, timeout }),
+    signal: AbortSignal.timeout(timeout || 30000),
+  });
+  const json = await resp.json() as { result?: unknown; error?: string };
+  if (!resp.ok || json.error) throw new Error(json.error || `CDP ${method} failed (${resp.status})`);
+  return json.result;
+}
+
+const executorManager = new ExecutorManager({ maxSessions: 10, relaySendCdp: remoteRelaySendCdp });
 
 async function getOrCreateExecutor(agentId?: string): Promise<PlaywrightExecutor> {
   const effectiveId = agentId || activeAgentId;

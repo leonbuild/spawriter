@@ -175,8 +175,11 @@ cli.command('relay', 'Start the CDP relay server')
         const res = await fetch(`http://127.0.0.1:${port}/version`, { signal: AbortSignal.timeout(1000) });
         if (res.ok) {
           console.log(`Port ${port} in use, stopping existing server...`);
-          try { await fetch(`http://127.0.0.1:${port}/shutdown`, { method: 'POST' }); } catch { /* ignore */ }
-          await new Promise(r => setTimeout(r, 500));
+          try { await fetch(`http://127.0.0.1:${port}/shutdown`, { method: 'POST', signal: AbortSignal.timeout(2000) }); } catch { /* ignore */ }
+          for (let i = 0; i < 5; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            try { await fetch(`http://127.0.0.1:${port}/version`, { signal: AbortSignal.timeout(500) }); } catch { break; }
+          }
         }
       } catch { /* not running */ }
     }

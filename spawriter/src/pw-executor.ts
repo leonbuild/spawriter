@@ -34,6 +34,23 @@ import {
   formatConsoleLogs as fmtConsole,
   formatNetworkEntries as fmtNetwork,
 } from './runtime/network-monitor.js';
+import { ScopedFS } from './runtime/scoped-fs.js';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { createRequire } from 'node:module';
+
+// ---------------------------------------------------------------------------
+// Allowed modules for sandboxed require (matches upstream playwriter)
+// ---------------------------------------------------------------------------
+
+const ALLOWED_MODULES = new Set([
+  'path', 'node:path', 'url', 'node:url', 'querystring', 'node:querystring',
+  'punycode', 'node:punycode', 'crypto', 'node:crypto', 'buffer', 'node:buffer',
+  'string_decoder', 'node:string_decoder', 'util', 'node:util', 'assert', 'node:assert',
+  'events', 'node:events', 'timers', 'node:timers', 'stream', 'node:stream',
+  'zlib', 'node:zlib', 'http', 'node:http', 'https', 'node:https',
+  'http2', 'node:http2', 'os', 'node:os', 'fs', 'node:fs',
+]);
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -215,6 +232,8 @@ export interface ExecutorLogger {
   error: (...args: unknown[]) => void;
 }
 
+export type RelayCdpSender = (method: string, params?: Record<string, unknown>, timeout?: number) => Promise<unknown>;
+
 export class PlaywrightExecutor {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
@@ -232,9 +251,57 @@ export class PlaywrightExecutor {
   private savedOverrides: OverrideState = {};
 
   private logger: ExecutorLogger;
+  relaySendCdp: RelayCdpSender | null = null;
+  private scopedFs: ScopedFS;
+  private sandboxedRequire: NodeRequire;
+  private warningEvents: Array<{ id: number; message: string }> = [];
+  private nextWarningEventId = 0;
 
-  constructor(logger?: ExecutorLogger) {
+  constructor(logger?: ExecutorLogger, cwd?: string) {
     this.logger = logger || { log, error };
+    const sessionCwd = cwd ? path.resolve(cwd) : null;
+    this.scopedFs = new ScopedFS(
+      sessionCwd ? [sessionCwd, '/tmp', os.tmpdir()] : undefined,
+      sessionCwd || undefined,
+    );
+    this.sandboxedRequire = this.createSandboxedRequire();
+  }
+
+  private createSandboxedRequire(): NodeRequire {
+    const scopedFs = this.scopedFs;
+    const nodeRequire = createRequire(import.meta.url);
+    const sandboxedRequire = ((id: string) => {
+      if (!ALLOWED_MODULES.has(id)) {
+        const error = new Error(
+          `Module "${id}" is not allowed in the sandbox. ` +
+          `Only safe Node.js built-ins are permitted: ${[...ALLOWED_MODULES].filter((m) => !m.startsWith('node:')).join(', ')}`,
+        );
+        error.name = 'ModuleNotAllowedError';
+        throw error;
+      }
+      if (id === 'fs' || id === 'node:fs') return scopedFs;
+      return nodeRequire(id);
+    }) as NodeRequire;
+    sandboxedRequire.resolve = nodeRequire.resolve;
+    sandboxedRequire.cache = nodeRequire.cache;
+    sandboxedRequire.extensions = nodeRequire.extensions;
+    sandboxedRequire.main = nodeRequire.main;
+    return sandboxedRequire;
+  }
+
+  private enqueueWarning(message: string): void {
+    this.nextWarningEventId += 1;
+    this.warningEvents.push({ id: this.nextWarningEventId, message });
+  }
+
+  private beginWarningScope(): { cursor: number } {
+    return { cursor: this.warningEvents.length };
+  }
+
+  private flushWarningsForScope(scope: { cursor: number }): string[] {
+    const warnings = this.warningEvents.slice(scope.cursor).map(w => w.message);
+    this.warningEvents.splice(scope.cursor);
+    return warnings;
   }
 
   setGlobals(globals: Record<string, unknown>): void {
@@ -301,6 +368,9 @@ export class PlaywrightExecutor {
     page.on('close', () => {
       if (this.page === page) {
         this.logger.log('Active page closed, looking for replacement...');
+        const stateKeys = Object.keys(this.userState);
+        const stateNote = stateKeys.length > 0 ? ` State keys preserved: ${stateKeys.join(', ')}` : '';
+        this.enqueueWarning(`Page closed during execution.${stateNote} A replacement page will be used if available.`);
         const pages = this.context?.pages().filter(p => !p.isClosed()) ?? [];
         this.page = pages.length > 0 ? pages[0] : null;
         if (this.page) {
@@ -308,11 +378,13 @@ export class PlaywrightExecutor {
           this.logger.log('Switched to replacement page:', this.page.url());
         } else {
           this.logger.log('No replacement page available');
+          this.enqueueWarning('No replacement page available after page close.');
         }
       }
     });
 
     page.on('popup', (popup: Page) => {
+      this.enqueueWarning(`Popup detected: ${popup.url() || '(about:blank)'}`);
       this.setupPageListeners(popup);
     });
 
@@ -325,6 +397,59 @@ export class PlaywrightExecutor {
           url: msg.location()?.url,
           lineNumber: msg.location()?.lineNumber,
         });
+      } catch { /* ignore */ }
+    });
+
+    page.on('request', (req) => {
+      try {
+        this.networkMonitor.addNetworkRequest({
+          requestId: req.url() + '-' + Date.now(),
+          request: {
+            url: req.url(),
+            method: req.method(),
+            headers: req.headers(),
+            postData: req.postData() ?? undefined,
+            hasPostData: !!req.postData(),
+          },
+          type: req.resourceType(),
+        });
+      } catch { /* ignore */ }
+    });
+
+    page.on('response', (resp) => {
+      try {
+        const reqUrl = resp.url();
+        const entries = this.networkMonitor.getNetworkEntries({ count: 500 });
+        const match = entries.reverse().find(e => e.url === reqUrl && !e.status);
+        if (match) {
+          this.networkMonitor.setNetworkResponse({
+            requestId: match.requestId,
+            response: {
+              status: resp.status(),
+              statusText: resp.statusText(),
+              headers: resp.headers(),
+              mimeType: resp.headers()['content-type'] || '',
+            },
+          });
+          this.networkMonitor.setNetworkFinished({
+            requestId: match.requestId,
+            encodedDataLength: 0,
+          });
+        }
+      } catch { /* ignore */ }
+    });
+
+    page.on('requestfailed', (req) => {
+      try {
+        const reqUrl = req.url();
+        const entries = this.networkMonitor.getNetworkEntries({ count: 500 });
+        const match = entries.reverse().find(e => e.url === reqUrl && !e.status && !e.error);
+        if (match) {
+          this.networkMonitor.setNetworkFailed({
+            requestId: match.requestId,
+            errorText: req.failure()?.errorText || 'unknown',
+          });
+        }
       } catch { /* ignore */ }
     });
   }
@@ -362,6 +487,7 @@ export class PlaywrightExecutor {
     const consoleLogs: Array<{ method: string; args: unknown[] }> = [];
     const screenshots: ExecuteScreenshot[] = [];
     const images: Array<{ data: string; mimeType: string }> = [];
+    const warningScope = this.beginWarningScope();
 
     this.cancelActiveExecution();
     const abortController = new AbortController();
@@ -449,6 +575,11 @@ export class PlaywrightExecutor {
         finalText = finalText.slice(0, MAX_LENGTH) + `\n\n[Truncated to ${MAX_LENGTH} characters]`;
       }
 
+      const warnings = this.flushWarningsForScope(warningScope);
+      if (warnings.length > 0) {
+        finalText += `\n\n[Warnings]\n${warnings.map(w => `⚠ ${w}`).join('\n')}`;
+      }
+
       return { text: finalText, isError: false, images, screenshots };
     } catch (err: unknown) {
       if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -522,6 +653,23 @@ export class PlaywrightExecutor {
       return page.evaluate(expression);
     };
 
+    const captureScreenshotFallback = async (): Promise<string> => {
+      if (self.relaySendCdp) {
+        const result = await self.relaySendCdp('Page.captureScreenshot', { format: 'png' }) as any;
+        return result?.data || result;
+      }
+      const buf = await page.screenshot({ type: 'png' });
+      return buf.toString('base64');
+    };
+
+    // Relay CDP fallback: sends CDP commands through the relay's extension connection
+    // when Playwright CDPSession is unavailable
+    const relayCdp = async (method: string, params?: Record<string, unknown>, timeout?: number): Promise<unknown> => {
+      if (cdpSession) return sendCdpCmd(method, params, timeout);
+      if (self.relaySendCdp) return self.relaySendCdp(method, params, timeout);
+      throw new Error(`CDP session not available (required for ${method})`);
+    };
+
     const globals: Record<string, unknown> = {
       // --- Accessibility snapshot ---
       snapshot: async (options?: { search?: string; diff?: boolean; interactive_only?: boolean }) => {
@@ -555,21 +703,42 @@ export class PlaywrightExecutor {
         try {
           const ariaText = await (page.locator('body') as any).ariaSnapshot();
           if (ariaText) {
-            if (options?.search) {
-              self.lastSnapshot = ariaText;
-              return searchSnapshot(ariaText, options.search);
+            // Build a lightweight ref cache from interactive elements in the aria text
+            const targetId = (page as any)._guid || 'default';
+            const refCache = self.getRefCache(targetId);
+            refCache.clear();
+            let refIdx = 0;
+            const interactiveRoles = /- (link|button|textbox|checkbox|radio|combobox|menuitem|tab|switch|slider|spinbutton|searchbox)/;
+            const lines = ariaText.split('\n');
+            const annotatedLines: string[] = [];
+            for (const line of lines) {
+              const match = line.match(/- (link|button|textbox|checkbox|radio|combobox|menuitem|tab|switch|slider|spinbutton|searchbox)\s+"?([^":\n]*)"?/);
+              if (match) {
+                const role = match[1];
+                const name = match[2]?.trim() || '';
+                refCache.set(refIdx, { backendDOMNodeId: -1, role, name });
+                annotatedLines.push(line.replace(/^(\s*- )/, `$1@${refIdx} `));
+                refIdx++;
+              } else {
+                annotatedLines.push(line);
+              }
             }
-            self.lastSnapshot = ariaText;
-            return ariaText;
+            const annotated = annotatedLines.join('\n');
+            self.lastSnapshot = annotated;
+            if (options?.search) {
+              return searchSnapshot(annotated, options.search);
+            }
+            return annotated;
           }
         } catch { /* ariaSnapshot not available in this Playwright version */ }
         return '(accessibility snapshot requires CDP session — not available through relay connection)';
       },
 
-      refToLocator: (opts: { ref: number }) => {
+      refToLocator: (optsOrRef: { ref: number } | number) => {
+        const ref = typeof optsOrRef === 'number' ? optsOrRef : optsOrRef.ref;
         const targetId = (page as any)._guid || 'default';
         const refCache = self.getRefCache(targetId);
-        const info = refCache.get(opts.ref);
+        const info = refCache.get(ref);
         if (!info) return null;
         return { backendDOMNodeId: info.backendDOMNodeId, role: info.role, name: info.name };
       },
@@ -579,52 +748,110 @@ export class PlaywrightExecutor {
         const tier = options?.quality || 'medium';
         const profile = resolveImageProfile(tier, options?.model);
 
-        await sendCdpCmd('Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
-        await sendCdpCmd('DOM.enable', undefined, getCommandTimeout('DOM.enable'));
-        const axResult = await sendCdpCmd('Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as any;
-        const interactive = getInteractiveElements(axResult.nodes ?? []);
+        if (cdpSession) {
+          await sendCdpCmd('Accessibility.enable', undefined, getCommandTimeout('Accessibility.enable'));
+          await sendCdpCmd('DOM.enable', undefined, getCommandTimeout('DOM.enable'));
+          const axResult = await sendCdpCmd('Accessibility.getFullAXTree', undefined, getCommandTimeout('Accessibility.getFullAXTree')) as any;
+          const interactive = getInteractiveElements(axResult.nodes ?? []);
 
-        const labelPositions: Array<{ index: number; x: number; y: number; width: number; height: number }> = [];
-        for (const el of interactive) {
-          try {
-            const boxModel = await sendCdpCmd('DOM.getBoxModel', { backendNodeId: el.backendDOMNodeId }) as any;
-            if (boxModel?.model) {
-              const b = boxModel.model.border;
-              const x = Math.min(b[0], b[2], b[4], b[6]);
-              const y = Math.min(b[1], b[3], b[5], b[7]);
-              const maxX = Math.max(b[0], b[2], b[4], b[6]);
-              const maxY = Math.max(b[1], b[3], b[5], b[7]);
-              labelPositions.push({ index: el.index, x, y, width: maxX - x, height: maxY - y });
-            }
-          } catch { /* element not visible */ }
+          const labelPositions: Array<{ index: number; x: number; y: number; width: number; height: number }> = [];
+          for (const el of interactive) {
+            try {
+              const boxModel = await sendCdpCmd('DOM.getBoxModel', { backendNodeId: el.backendDOMNodeId }) as any;
+              if (boxModel?.model) {
+                const b = boxModel.model.border;
+                const x = Math.min(b[0], b[2], b[4], b[6]);
+                const y = Math.min(b[1], b[3], b[5], b[7]);
+                const maxX = Math.max(b[0], b[2], b[4], b[6]);
+                const maxY = Math.max(b[1], b[3], b[5], b[7]);
+                labelPositions.push({ index: el.index, x, y, width: maxX - x, height: maxY - y });
+              }
+            } catch { /* element not visible */ }
+          }
+
+          if (labelPositions.length > 0) {
+            await evaluateJs(buildLabelInjectionScript(labelPositions));
+          }
+
+          const capture = await captureWithSizeGuarantee(sendCdpCmd, profile);
+
+          if (labelPositions.length > 0) {
+            await evaluateJs(REMOVE_LABELS_SCRIPT).catch(() => {});
+          }
+
+          const legend = formatLabelLegend(interactive);
+          const targetId = (page as any)._guid || 'default';
+          const snapshotText = formatAXTreeAsText(axResult.nodes ?? [], true, self.getRefCache(targetId));
+
+          images.push({ data: capture.data, mimeType: capture.mimeType });
+          screenshots.push({
+            path: '',
+            base64: capture.data,
+            mimeType: capture.mimeType as 'image/png' | 'image/webp' | 'image/jpeg',
+            snapshot: snapshotText,
+            labelCount: interactive.length,
+          });
+
+          return legend + (capture.compressed
+            ? `\n(auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit)`
+            : '');
         }
+
+        // Playwright fallback: use in-page JS to find interactive elements and their bounding boxes
+        const findInteractiveCode = `(() => {
+          var selectors = ['a[href]','button','input','select','textarea','[role="button"]','[role="link"]','[role="textbox"]','[role="checkbox"]','[role="radio"]','[role="combobox"]','[role="menuitem"]','[role="tab"]','[role="switch"]','[role="slider"]','[role="spinbutton"]','[role="searchbox"]','[onclick]','[tabindex]:not([tabindex="-1"])'];
+          var seen = new Set();
+          var results = [];
+          var idx = 0;
+          for (var s of selectors) {
+            for (var el of document.querySelectorAll(s)) {
+              if (seen.has(el)) continue;
+              seen.add(el);
+              var rect = el.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              var role = el.getAttribute('role') || el.tagName.toLowerCase();
+              var name = el.getAttribute('aria-label') || el.innerText?.slice(0, 80) || '';
+              results.push({ index: idx++, role: role, name: name.trim(), x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+            }
+          }
+          return JSON.stringify(results);
+        })()`;
+        const rawInteractive = await evaluateJs(findInteractiveCode);
+        const interactiveData: Array<{ index: number; role: string; name: string; x: number; y: number; width: number; height: number }> =
+          typeof rawInteractive === 'string' ? JSON.parse(rawInteractive) : [];
+
+        const labelPositions = interactiveData.map(el => ({
+          index: el.index, x: el.x, y: el.y, width: el.width, height: el.height,
+        }));
 
         if (labelPositions.length > 0) {
           await evaluateJs(buildLabelInjectionScript(labelPositions));
         }
 
-        const capture = await captureWithSizeGuarantee(sendCdpCmd, profile);
+        const data = await captureScreenshotFallback();
 
         if (labelPositions.length > 0) {
           await evaluateJs(REMOVE_LABELS_SCRIPT).catch(() => {});
         }
 
-        const legend = formatLabelLegend(interactive);
-        const targetId = (page as any)._guid || 'default';
-        const snapshotText = formatAXTreeAsText(axResult.nodes ?? [], true, self.getRefCache(targetId));
+        const legendLines = interactiveData.map(el =>
+          `@${el.index} [${el.role}]${el.name ? ` "${el.name}"` : ''}`
+        );
+        const legend = legendLines.length > 0
+          ? `Interactive elements (${legendLines.length}):\n${legendLines.join('\n')}`
+          : 'No interactive elements found.';
 
-        images.push({ data: capture.data, mimeType: capture.mimeType });
+        const snapshotText = self.lastSnapshot || '';
+        images.push({ data, mimeType: 'image/png' });
         screenshots.push({
           path: '',
-          base64: capture.data,
-          mimeType: capture.mimeType as 'image/png' | 'image/webp' | 'image/jpeg',
+          base64: data,
+          mimeType: 'image/png',
           snapshot: snapshotText,
-          labelCount: interactive.length,
+          labelCount: interactiveData.length,
         });
 
-        return legend + (capture.compressed
-          ? `\n(auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit)`
-          : '');
+        return legend + ' (via relay CDP)';
       },
 
       screenshot: async (options?: { quality?: string; model?: string; labels?: boolean }) => {
@@ -640,10 +867,9 @@ export class PlaywrightExecutor {
             ? `Screenshot captured (auto-compressed to fit ${(profile.effectiveLimit / 1_000_000).toFixed(0)}MB limit)`
             : 'Screenshot captured';
         }
-        const buf = await page.screenshot({ type: 'png' });
-        const data = buf.toString('base64');
+        const data = await captureScreenshotFallback();
         images.push({ data, mimeType: 'image/png' });
-        return 'Screenshot captured (via Playwright)';
+        return 'Screenshot captured (via relay CDP)';
       },
 
       // --- Console logs (browser persistent) ---
@@ -758,13 +984,18 @@ export class PlaywrightExecutor {
       // --- Network interception ---
       networkIntercept: {
         enable: async (urlPattern?: string) => {
-          const patterns = [{ urlPattern: urlPattern || '*', requestStage: 'Request' }];
-          await sendCdpCmd('Fetch.enable', { patterns });
+          if (cdpSession) {
+            const patterns = [{ urlPattern: urlPattern || '*', requestStage: 'Request' }];
+            await sendCdpCmd('Fetch.enable', { patterns });
+          }
           self.networkMonitor.enableIntercept();
-          return `Network interception enabled. ${self.networkMonitor.listInterceptRules().length} rules active.`;
+          return `Network interception enabled. ${self.networkMonitor.listInterceptRules().length} rules active.${!cdpSession ? ' (using Playwright page.route — add rules then they will be applied)' : ''}`;
         },
         disable: async () => {
-          await sendCdpCmd('Fetch.disable');
+          if (cdpSession) {
+            await sendCdpCmd('Fetch.disable');
+          }
+          await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {});
           self.networkMonitor.disableIntercept();
           return 'Network interception disabled.';
         },
@@ -813,7 +1044,11 @@ export class PlaywrightExecutor {
           try {
             const parsed = typeof value === 'string' ? JSON.parse(value) : value;
             if (parsed?.success) {
-              await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+              if (cdpSession) {
+                await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+              } else {
+                await page.evaluate('window.location.reload()');
+              }
               await new Promise(r => setTimeout(r, 2000));
               reloaded = true;
             }
@@ -886,35 +1121,46 @@ export class PlaywrightExecutor {
       // --- Debugger ---
       dbg: {
         enable: async () => {
-          await sendCdpCmd('Debugger.enable');
-          await sendCdpCmd('Runtime.enable');
+          await relayCdp('Debugger.enable');
+          await relayCdp('Runtime.enable');
           self.debugger.enabled = true;
           return 'Debugger enabled. Scripts will be parsed and breakpoints can be set.';
         },
+        disable: async () => {
+          if (self.debugger.enabled) {
+            await relayCdp('Debugger.disable').catch(() => {});
+          }
+          self.debugger.enabled = false;
+          self.debugger.paused = false;
+          self.debugger.currentCallFrameId = null;
+          self.debugger.breakpoints.clear();
+          self.debugger.knownScripts.clear();
+          return 'Debugger disabled.';
+        },
         resume: async () => {
           if (!self.debugger.paused) return 'Debugger is not paused.';
-          await sendCdpCmd('Debugger.resume');
+          await relayCdp('Debugger.resume');
           return 'Resumed execution.';
         },
         stepOver: async () => {
           if (!self.debugger.paused) return 'Debugger is not paused.';
-          await sendCdpCmd('Debugger.stepOver');
+          await relayCdp('Debugger.stepOver');
           return 'Stepped over.';
         },
         stepInto: async () => {
           if (!self.debugger.paused) return 'Debugger is not paused.';
-          await sendCdpCmd('Debugger.stepInto');
+          await relayCdp('Debugger.stepInto');
           return 'Stepped into.';
         },
         stepOut: async () => {
           if (!self.debugger.paused) return 'Debugger is not paused.';
-          await sendCdpCmd('Debugger.stepOut');
+          await relayCdp('Debugger.stepOut');
           return 'Stepped out.';
         },
         setBreakpoint: async (file: string, line: number, condition?: string) => {
           if (!file || !line) return 'Error: set_breakpoint requires file and line';
-          if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); await sendCdpCmd('Runtime.enable'); self.debugger.enabled = true; }
-          const result = await sendCdpCmd('Debugger.setBreakpointByUrl', {
+          if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); await relayCdp('Runtime.enable'); self.debugger.enabled = true; }
+          const result = await relayCdp('Debugger.setBreakpointByUrl', {
             lineNumber: line - 1,
             urlRegex: file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
             columnNumber: 0,
@@ -925,7 +1171,7 @@ export class PlaywrightExecutor {
         },
         removeBreakpoint: async (breakpointId: string) => {
           if (!breakpointId) return 'Error: remove_breakpoint requires breakpointId';
-          await sendCdpCmd('Debugger.removeBreakpoint', { breakpointId });
+          await relayCdp('Debugger.removeBreakpoint', { breakpointId });
           self.debugger.breakpoints.delete(breakpointId);
           return `Breakpoint removed: ${breakpointId}`;
         },
@@ -937,7 +1183,7 @@ export class PlaywrightExecutor {
         },
         inspectVariables: async () => {
           if (!self.debugger.paused || !self.debugger.currentCallFrameId) return 'Debugger is not paused at a breakpoint.';
-          const evalResult = await sendCdpCmd('Debugger.evaluateOnCallFrame', {
+          const evalResult = await relayCdp('Debugger.evaluateOnCallFrame', {
             callFrameId: self.debugger.currentCallFrameId,
             expression: '(function(){ var __r = {}; try { var __s = arguments.callee.caller; } catch(e) {} return JSON.stringify(__r); })()',
             returnByValue: true,
@@ -948,11 +1194,11 @@ export class PlaywrightExecutor {
           if (!expression) return 'Error: evaluate requires expression';
           let evalResult;
           if (self.debugger.paused && self.debugger.currentCallFrameId) {
-            evalResult = await sendCdpCmd('Debugger.evaluateOnCallFrame', {
+            evalResult = await relayCdp('Debugger.evaluateOnCallFrame', {
               callFrameId: self.debugger.currentCallFrameId, expression, returnByValue: true, generatePreview: true,
             }) as any;
           } else {
-            evalResult = await sendCdpCmd('Runtime.evaluate', {
+            evalResult = await relayCdp('Runtime.evaluate', {
               expression, returnByValue: true, awaitPromise: true,
             }) as any;
           }
@@ -960,7 +1206,7 @@ export class PlaywrightExecutor {
           return val !== undefined ? (typeof val === 'string' ? val : JSON.stringify(val, null, 2)) : (evalResult?.result?.description || 'undefined');
         },
         listScripts: async (search?: string) => {
-          if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); await sendCdpCmd('Runtime.enable'); self.debugger.enabled = true; await new Promise(r => setTimeout(r, 200)); }
+          if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); await relayCdp('Runtime.enable'); self.debugger.enabled = true; await new Promise(r => setTimeout(r, 200)); }
           const searchStr = (search || '').toLowerCase();
           let scripts = Array.from(self.debugger.knownScripts.values());
           if (searchStr) scripts = scripts.filter(s => s.url.toLowerCase().includes(searchStr));
@@ -970,8 +1216,8 @@ export class PlaywrightExecutor {
           return `Scripts (${scripts.length}):\n${scriptLines.join('\n')}`;
         },
         pauseOnExceptions: async (state: 'none' | 'uncaught' | 'all') => {
-          if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); self.debugger.enabled = true; }
-          await sendCdpCmd('Debugger.setPauseOnExceptions', { state });
+          if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); self.debugger.enabled = true; }
+          await relayCdp('Debugger.setPauseOnExceptions', { state });
           return `Pause on exceptions: ${state}`;
         },
       },
@@ -1015,10 +1261,18 @@ export class PlaywrightExecutor {
         const opts = options || {};
         switch (action) {
           case 'get_cookies': {
-            const result = await sendCdpCmd('Network.getCookies') as any;
-            const cookies = result?.cookies || [];
+            if (cdpSession) {
+              const result = await sendCdpCmd('Network.getCookies') as any;
+              const cookies = result?.cookies || [];
+              if (cookies.length === 0) return 'No cookies found.';
+              const lines = cookies.map((c: any) =>
+                `${c.name}=${String(c.value).slice(0, 80)}${String(c.value).length > 80 ? '...' : ''} (domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'})`
+              );
+              return `Cookies (${cookies.length}):\n${lines.join('\n')}`;
+            }
+            const cookies = await page.context().cookies();
             if (cookies.length === 0) return 'No cookies found.';
-            const lines = cookies.map((c: any) =>
+            const lines = cookies.map((c) =>
               `${c.name}=${String(c.value).slice(0, 80)}${String(c.value).length > 80 ? '...' : ''} (domain=${c.domain}, path=${c.path}, secure=${c.secure}, httpOnly=${c.httpOnly}, sameSite=${c.sameSite || 'None'})`
             );
             return `Cookies (${cookies.length}):\n${lines.join('\n')}`;
@@ -1027,27 +1281,52 @@ export class PlaywrightExecutor {
             const name = opts.name as string;
             const value = opts.value as string;
             if (!name || value === undefined) return 'Error: set_cookie requires name and value';
-            const params: Record<string, unknown> = { name, value };
-            if (opts.domain) params.domain = opts.domain;
-            if (opts.url) params.url = opts.url;
-            if (opts.path) params.path = opts.path;
-            if (opts.secure !== undefined) params.secure = opts.secure;
-            if (opts.httpOnly !== undefined) params.httpOnly = opts.httpOnly;
-            if (opts.sameSite) params.sameSite = opts.sameSite;
-            if (opts.expires) params.expires = opts.expires;
-            if (!params.url && !params.domain) params.url = await evaluateJs('window.location.href');
-            const result = await sendCdpCmd('Network.setCookie', params) as any;
-            return result?.success ? `Cookie "${name}" set.` : `Failed to set cookie "${name}".`;
+            if (cdpSession) {
+              const params: Record<string, unknown> = { name, value };
+              if (opts.domain) params.domain = opts.domain;
+              if (opts.url) params.url = opts.url;
+              if (opts.path) params.path = opts.path;
+              if (opts.secure !== undefined) params.secure = opts.secure;
+              if (opts.httpOnly !== undefined) params.httpOnly = opts.httpOnly;
+              if (opts.sameSite) params.sameSite = opts.sameSite;
+              if (opts.expires) params.expires = opts.expires;
+              if (!params.url && !params.domain) params.url = await evaluateJs('window.location.href');
+              const result = await sendCdpCmd('Network.setCookie', params) as any;
+              return result?.success ? `Cookie "${name}" set.` : `Failed to set cookie "${name}".`;
+            }
+            const cookieObj: Record<string, unknown> = { name, value };
+            if (opts.domain) {
+              cookieObj.domain = opts.domain;
+              cookieObj.path = (opts.path as string) || '/';
+            } else {
+              cookieObj.url = (opts.url as string) || page.url();
+            }
+            if (opts.secure !== undefined) cookieObj.secure = opts.secure;
+            if (opts.httpOnly !== undefined) cookieObj.httpOnly = opts.httpOnly;
+            if (opts.sameSite) cookieObj.sameSite = opts.sameSite;
+            if (typeof opts.expires === 'number') cookieObj.expires = opts.expires;
+            await page.context().addCookies([cookieObj as any]);
+            return `Cookie "${name}" set.`;
           }
           case 'delete_cookie': {
             const name = opts.name as string;
             if (!name) return 'Error: delete_cookie requires name';
-            const params: Record<string, unknown> = { name };
-            if (opts.domain) params.domain = opts.domain;
-            if (opts.url) params.url = opts.url;
-            if (opts.path) params.path = opts.path;
-            if (!params.url && !params.domain) params.url = await evaluateJs('window.location.href');
-            await sendCdpCmd('Network.deleteCookies', params);
+            if (cdpSession) {
+              const params: Record<string, unknown> = { name };
+              if (opts.domain) params.domain = opts.domain;
+              if (opts.url) params.url = opts.url;
+              if (opts.path) params.path = opts.path;
+              if (!params.url && !params.domain) params.url = await evaluateJs('window.location.href');
+              await sendCdpCmd('Network.deleteCookies', params);
+              return `Cookie "${name}" deleted.`;
+            }
+            const delDomain = (opts.domain as string) || undefined;
+            if (delDomain) {
+              await page.context().clearCookies({ name, domain: delDomain });
+            } else {
+              const currentOrigin = new URL(await evaluateJs('window.location.href') as string);
+              await page.context().clearCookies({ name, domain: currentOrigin.hostname });
+            }
             return `Cookie "${name}" deleted.`;
           }
           case 'get_local_storage':
@@ -1086,12 +1365,30 @@ export class PlaywrightExecutor {
             const origin = (opts.origin as string) || await evaluateJs('window.location.origin') as string;
             const types = opts.storage_types as string;
             if (!types) return 'Error: clear_storage requires storage_types parameter';
-            await sendCdpCmd('Storage.clearDataForOrigin', { origin, storageTypes: types });
-            return `Storage cleared for ${origin} (types: ${types}).`;
+            if (cdpSession) {
+              await sendCdpCmd('Storage.clearDataForOrigin', { origin, storageTypes: types });
+              return `Storage cleared for ${origin} (types: ${types}).`;
+            }
+            const cleared: string[] = [];
+            if (types.includes('local_storage')) { await evaluateJs('localStorage.clear()'); cleared.push('localStorage'); }
+            if (types.includes('session_storage')) { await evaluateJs('sessionStorage.clear()'); cleared.push('sessionStorage'); }
+            if (types.includes('cookies')) {
+              const originUrl = new URL(origin);
+              const allCookies = await page.context().cookies();
+              const originCookies = allCookies.filter((c: any) => {
+                const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+                return originUrl.hostname === cd || originUrl.hostname.endsWith('.' + cd);
+              });
+              for (const c of originCookies) await page.context().clearCookies({ name: c.name, domain: c.domain });
+              cleared.push(`cookies (${originCookies.length} for ${origin})`);
+            }
+            return cleared.length > 0
+              ? `Storage cleared for ${origin}: ${cleared.join(', ')}. (Some storage types require CDP for full clearing.)`
+              : `Cannot clear "${types}" without CDP session.`;
           }
           case 'get_storage_usage': {
             const origin = (opts.origin as string) || await evaluateJs('window.location.origin') as string;
-            const result = await sendCdpCmd('Storage.getUsageAndQuota', { origin }) as any;
+            const result = await relayCdp('Storage.getUsageAndQuota', { origin }) as any;
             const total = `Usage: ${(result.usage / 1024).toFixed(1)}KB / ${(result.quota / (1024 * 1024)).toFixed(1)}MB (${((result.usage / result.quota) * 100).toFixed(1)}%)`;
             const breakdown = (result.usageBreakdown || [])
               .filter((b: any) => b.usage > 0)
@@ -1113,32 +1410,41 @@ export class PlaywrightExecutor {
             const height = (opts.height as number) || 812;
             const dpr = (opts.device_scale_factor as number) || 1;
             const mobile = (opts.mobile as boolean) ?? false;
-            await sendCdpCmd('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: dpr, mobile });
-            return `Device emulation: ${width}x${height} @${dpr}x${mobile ? ' (mobile)' : ''}`;
+            try {
+              await relayCdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: dpr, mobile });
+              return `Device emulation: ${width}x${height} @${dpr}x${mobile ? ' (mobile)' : ''}`;
+            } catch {
+              await page.setViewportSize({ width, height });
+              return `Device emulation: ${width}x${height} (viewport only, DPR/mobile requires CDP)`;
+            }
           }
           case 'set_user_agent': {
             const ua = opts.user_agent as string;
             if (!ua) return 'Error: set_user_agent requires user_agent';
-            await sendCdpCmd('Emulation.setUserAgentOverride', { userAgent: ua });
+            await relayCdp('Emulation.setUserAgentOverride', { userAgent: ua });
             return 'User agent set.';
           }
           case 'set_geolocation': {
             const lat = opts.latitude as number;
             const lng = opts.longitude as number;
             if (lat === undefined || lng === undefined) return 'Error: set_geolocation requires latitude and longitude';
-            await sendCdpCmd('Emulation.setGeolocationOverride', { latitude: lat, longitude: lng, accuracy: (opts.accuracy as number) || 1 });
+            try {
+              await relayCdp('Emulation.setGeolocationOverride', { latitude: lat, longitude: lng, accuracy: (opts.accuracy as number) || 1 });
+            } catch {
+              await page.context().setGeolocation({ latitude: lat, longitude: lng, accuracy: (opts.accuracy as number) || 1 });
+            }
             return `Geolocation: ${lat}, ${lng}`;
           }
           case 'set_timezone': {
             const tz = opts.timezone_id as string;
             if (!tz) return 'Error: set_timezone requires timezone_id';
-            await sendCdpCmd('Emulation.setTimezoneOverride', { timezoneId: tz });
+            await relayCdp('Emulation.setTimezoneOverride', { timezoneId: tz });
             return `Timezone: ${tz}`;
           }
           case 'set_locale': {
             const loc = opts.locale as string;
             if (!loc) return 'Error: set_locale requires locale';
-            await sendCdpCmd('Emulation.setLocaleOverride', { locale: loc });
+            await relayCdp('Emulation.setLocaleOverride', { locale: loc });
             return `Locale: ${loc}`;
           }
           case 'set_network_conditions': {
@@ -1153,7 +1459,7 @@ export class PlaywrightExecutor {
             const params = preset && presets[preset]
               ? presets[preset]
               : { offline: false, latency: (opts.latency as number) || 0, downloadThroughput: (opts.download as number) || -1, uploadThroughput: (opts.upload as number) || -1 };
-            await sendCdpCmd('Network.emulateNetworkConditions', params);
+            await relayCdp('Network.emulateNetworkConditions', params);
             return `Network: ${preset || 'custom'} (latency=${params.latency}ms, down=${params.downloadThroughput > 0 ? (params.downloadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'}, up=${params.uploadThroughput > 0 ? (params.uploadThroughput / 1024).toFixed(0) + 'KB/s' : 'unlimited'})`;
           }
           case 'set_media': {
@@ -1161,18 +1467,19 @@ export class PlaywrightExecutor {
               const [n, v] = f.trim().split(':');
               return { name: n.trim(), value: v.trim() };
             });
-            await sendCdpCmd('Emulation.setEmulatedMedia', { features });
+            await relayCdp('Emulation.setEmulatedMedia', { features });
             return `Media features: ${features.map(f => `${f.name}:${f.value}`).join(', ') || '(cleared)'}`;
           }
-          case 'clear_all': {
-            await sendCdpCmd('Emulation.clearDeviceMetricsOverride');
-            await sendCdpCmd('Emulation.setEmulatedMedia', { features: [] });
-            try { await sendCdpCmd('Emulation.clearGeolocationOverride'); } catch { /* ok */ }
-            try { await sendCdpCmd('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }); } catch { /* ok */ }
+          case 'clear_all':
+          case 'reset': {
+            await relayCdp('Emulation.clearDeviceMetricsOverride');
+            await relayCdp('Emulation.setEmulatedMedia', { features: [] });
+            try { await relayCdp('Emulation.clearGeolocationOverride'); } catch { /* ok */ }
+            try { await relayCdp('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }); } catch { /* ok */ }
             return 'All emulations cleared.';
           }
           default:
-            return `Unknown emulation action: ${action}`;
+            return `Unknown emulation action: ${action}. Available: set_device, set_geolocation, set_timezone, set_locale, set_network_conditions, set_media, clear_all/reset`;
         }
       },
 
@@ -1181,9 +1488,9 @@ export class PlaywrightExecutor {
         const act = action || 'get_metrics';
         switch (act) {
           case 'get_metrics': {
-            await sendCdpCmd('Performance.enable');
-            const result = await sendCdpCmd('Performance.getMetrics') as any;
-            await sendCdpCmd('Performance.disable');
+            await relayCdp('Performance.enable');
+            const result = await relayCdp('Performance.getMetrics') as any;
+            await relayCdp('Performance.disable');
             const metrics = result?.metrics || [];
             if (metrics.length === 0) return 'No metrics available.';
             const keyMetrics = ['Timestamp', 'Documents', 'Frames', 'JSEventListeners', 'Nodes', 'LayoutCount',
@@ -1221,11 +1528,21 @@ export class PlaywrightExecutor {
             return `Web Vitals:\n${lines.join('\n')}\n\n(Note: LCP/CLS/INP require observers — run this tool again for updated values after page interaction.)`;
           }
           case 'get_memory': {
-            await sendCdpCmd('Performance.enable');
-            const result = await sendCdpCmd('Performance.getMetrics') as any;
-            await sendCdpCmd('Performance.disable');
-            const m = Object.fromEntries((result?.metrics || []).map((x: any) => [x.name, x.value]));
-            return `Memory:\n  JS Heap: ${((m['JSHeapUsedSize'] || 0) / (1024 * 1024)).toFixed(2)}MB / ${((m['JSHeapTotalSize'] || 0) / (1024 * 1024)).toFixed(2)}MB (${m['JSHeapTotalSize'] > 0 ? (((m['JSHeapUsedSize'] || 0) / m['JSHeapTotalSize']) * 100).toFixed(1) : 0}%)\n  DOM Nodes: ${m['Nodes'] || 0}\n  Event Listeners: ${m['JSEventListeners'] || 0}\n  Documents: ${m['Documents'] || 0}\n  Frames: ${m['Frames'] || 0}`;
+            try {
+              await relayCdp('Performance.enable');
+              const result = await relayCdp('Performance.getMetrics') as any;
+              await relayCdp('Performance.disable');
+              const m = Object.fromEntries((result?.metrics || []).map((x: any) => [x.name, x.value]));
+              return `Memory:\n  JS Heap: ${((m['JSHeapUsedSize'] || 0) / (1024 * 1024)).toFixed(2)}MB / ${((m['JSHeapTotalSize'] || 0) / (1024 * 1024)).toFixed(2)}MB (${m['JSHeapTotalSize'] > 0 ? (((m['JSHeapUsedSize'] || 0) / m['JSHeapTotalSize']) * 100).toFixed(1) : 0}%)\n  DOM Nodes: ${m['Nodes'] || 0}\n  Event Listeners: ${m['JSEventListeners'] || 0}\n  Documents: ${m['Documents'] || 0}\n  Frames: ${m['Frames'] || 0}`;
+            } catch {
+              const memCode = `JSON.stringify({ jsHeapUsed: performance.memory?.usedJSHeapSize || null, jsHeapTotal: performance.memory?.totalJSHeapSize || null, jsHeapLimit: performance.memory?.jsHeapSizeLimit || null })`;
+              const raw = await evaluateJs(memCode);
+              const mem = typeof raw === 'string' ? JSON.parse(raw) : {};
+              if (mem.jsHeapUsed !== null) {
+                return `Memory (via performance.memory):\n  JS Heap: ${(mem.jsHeapUsed / (1024 * 1024)).toFixed(2)}MB / ${(mem.jsHeapTotal / (1024 * 1024)).toFixed(2)}MB (${((mem.jsHeapUsed / mem.jsHeapTotal) * 100).toFixed(1)}%)`;
+              }
+              return 'Memory info not available in this browser.';
+            }
           }
           case 'get_resource_timing': {
             const code = `JSON.stringify(performance.getEntriesByType('resource').map(e => ({ name: e.name, type: e.initiatorType, duration: e.duration, transferSize: e.transferSize, decodedBodySize: e.decodedBodySize, startTime: e.startTime })))`;
@@ -1251,7 +1568,7 @@ export class PlaywrightExecutor {
         switch (action) {
           case 'list_sources': {
             const search = ((opts.search as string) || '').toLowerCase();
-            if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); await sendCdpCmd('Runtime.enable'); self.debugger.enabled = true; await new Promise(r => setTimeout(r, 200)); }
+            if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); await relayCdp('Runtime.enable'); self.debugger.enabled = true; await new Promise(r => setTimeout(r, 200)); }
             let scripts = Array.from(self.debugger.knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
             if (search) scripts = scripts.filter(s => s.url.toLowerCase().includes(search));
             scripts = scripts.slice(0, 50);
@@ -1261,8 +1578,8 @@ export class PlaywrightExecutor {
           case 'get_source': {
             const scriptId = opts.scriptId as string;
             if (!scriptId) return 'Error: get_source requires scriptId';
-            if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); self.debugger.enabled = true; }
-            const result = await sendCdpCmd('Debugger.getScriptSource', { scriptId }) as any;
+            if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); self.debugger.enabled = true; }
+            const result = await relayCdp('Debugger.getScriptSource', { scriptId }) as any;
             let source = result?.scriptSource || '(empty)';
             const lineStart = opts.line_start as number | undefined;
             const lineEnd = opts.line_end as number | undefined;
@@ -1280,9 +1597,9 @@ export class PlaywrightExecutor {
             const scriptId = opts.scriptId as string;
             const content = opts.content as string;
             if (!scriptId || !content) return 'Error: edit_source requires scriptId and content';
-            if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); self.debugger.enabled = true; }
+            if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); self.debugger.enabled = true; }
             try {
-              await sendCdpCmd('Debugger.setScriptSource', { scriptId, scriptSource: content });
+              await relayCdp('Debugger.setScriptSource', { scriptId, scriptSource: content });
               return `Script ${scriptId} updated (hot-reload applied).`;
             } catch (e) {
               const fb = await evaluateJs(`try { const s = document.createElement('script'); s.textContent = ${JSON.stringify(content)}; document.head.appendChild(s); 'Script injected via DOM.' } catch(e) { 'Fallback failed: ' + e.message }`);
@@ -1292,12 +1609,12 @@ export class PlaywrightExecutor {
           case 'search_source': {
             const search = opts.search as string;
             if (!search) return 'Error: search_source requires search string';
-            if (!self.debugger.enabled) { await sendCdpCmd('Debugger.enable'); self.debugger.enabled = true; await new Promise(r => setTimeout(r, 200)); }
+            if (!self.debugger.enabled) { await relayCdp('Debugger.enable'); self.debugger.enabled = true; await new Promise(r => setTimeout(r, 200)); }
             const scripts = Array.from(self.debugger.knownScripts.values()).filter(s => s.url && !s.url.startsWith('chrome-extension://'));
             const matches: string[] = [];
             for (const s of scripts.slice(0, 30)) {
               try {
-                const result = await sendCdpCmd('Debugger.searchInContent', { scriptId: s.scriptId, query: search }) as any;
+                const result = await relayCdp('Debugger.searchInContent', { scriptId: s.scriptId, query: search }) as any;
                 if (result?.result?.length) {
                   matches.push(`${s.url} (${result.result.length} matches):`);
                   for (const m of result.result.slice(0, 5)) matches.push(`  L${m.lineNumber + 1}: ${m.lineContent.trim().slice(0, 120)}`);
@@ -1358,43 +1675,89 @@ export class PlaywrightExecutor {
         const targetId = (page as any)._guid || 'default';
         const refCache = self.getRefCache(targetId);
         const cached = refCache.get(ref);
-        if (!cached) return formatError({ error: `Ref @${ref} not found`, hint: 'Run snapshot() first to get fresh @ref numbers' });
 
-        const resolved = await sendCdpCmd('DOM.resolveNode', { backendNodeId: cached.backendDOMNodeId }, 10000) as any;
-        const objectId = resolved?.object?.objectId;
-        if (!objectId) return formatError({ error: `Could not resolve @${ref} to a live DOM node`, hint: 'The element may have been removed. Rerun snapshot() for fresh refs.' });
+        if (cached && cdpSession) {
+          const resolved = await sendCdpCmd('DOM.resolveNode', { backendNodeId: cached.backendDOMNodeId }, 10000) as any;
+          const objectId = resolved?.object?.objectId;
+          if (!objectId) return formatError({ error: `Could not resolve @${ref} to a live DOM node`, hint: 'The element may have been removed. Rerun snapshot() for fresh refs.' });
 
-        const boxModel = await sendCdpCmd('DOM.getBoxModel', { backendNodeId: cached.backendDOMNodeId }, 10000) as any;
-        const b = boxModel?.model?.border;
-        const cx = b ? (Math.min(b[0], b[2], b[4], b[6]) + Math.max(b[0], b[2], b[4], b[6])) / 2 : 0;
-        const cy = b ? (Math.min(b[1], b[3], b[5], b[7]) + Math.max(b[1], b[3], b[5], b[7])) / 2 : 0;
+          const boxModel = await sendCdpCmd('DOM.getBoxModel', { backendNodeId: cached.backendDOMNodeId }, 10000) as any;
+          const b = boxModel?.model?.border;
+          const cx = b ? (Math.min(b[0], b[2], b[4], b[6]) + Math.max(b[0], b[2], b[4], b[6])) / 2 : 0;
+          const cy = b ? (Math.min(b[1], b[3], b[5], b[7]) + Math.max(b[1], b[3], b[5], b[7])) / 2 : 0;
 
-        switch (action) {
-          case 'click':
-            await sendCdpCmd('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
-            await sendCdpCmd('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
-            break;
-          case 'hover':
-            await sendCdpCmd('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy }, 10000);
-            break;
-          case 'fill':
-            await sendCdpCmd('Runtime.callFunctionOn', { objectId, functionDeclaration: `function(v) { this.focus(); this.value = v; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }`, arguments: [{ value: value ?? '' }] }, 10000);
-            break;
-          case 'focus':
-            await sendCdpCmd('DOM.focus', { backendNodeId: cached.backendDOMNodeId }, 10000);
-            break;
-          case 'check':
-          case 'uncheck':
-            await sendCdpCmd('Runtime.callFunctionOn', { objectId, functionDeclaration: `function(checked) { if (this.checked !== checked) { this.checked = checked; this.dispatchEvent(new Event('change', { bubbles: true })); } }`, arguments: [{ value: action === 'check' }] }, 10000);
-            break;
-          case 'select':
-            if (!value) return formatError({ error: 'Missing value for select action', hint: 'Provide a value parameter' });
-            await sendCdpCmd('Runtime.callFunctionOn', { objectId, functionDeclaration: `function(v) { this.value = v; this.dispatchEvent(new Event('change', { bubbles: true })); }`, arguments: [{ value }] }, 10000);
-            break;
-          default:
-            return formatError({ error: `Unknown action: ${action}`, hint: 'Valid: click, hover, fill, focus, check, uncheck, select' });
+          switch (action) {
+            case 'click':
+              await sendCdpCmd('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
+              await sendCdpCmd('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', clickCount: 1 }, 10000);
+              break;
+            case 'hover':
+              await sendCdpCmd('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy }, 10000);
+              break;
+            case 'fill':
+              await sendCdpCmd('Runtime.callFunctionOn', { objectId, functionDeclaration: `function(v) { this.focus(); this.value = v; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }`, arguments: [{ value: value ?? '' }] }, 10000);
+              break;
+            case 'focus':
+              await sendCdpCmd('DOM.focus', { backendNodeId: cached.backendDOMNodeId }, 10000);
+              break;
+            case 'check':
+            case 'uncheck':
+              await sendCdpCmd('Runtime.callFunctionOn', { objectId, functionDeclaration: `function(checked) { if (this.checked !== checked) { this.checked = checked; this.dispatchEvent(new Event('change', { bubbles: true })); } }`, arguments: [{ value: action === 'check' }] }, 10000);
+              break;
+            case 'select':
+              if (!value) return formatError({ error: 'Missing value for select action', hint: 'Provide a value parameter' });
+              await sendCdpCmd('Runtime.callFunctionOn', { objectId, functionDeclaration: `function(v) { this.value = v; this.dispatchEvent(new Event('change', { bubbles: true })); }`, arguments: [{ value }] }, 10000);
+              break;
+            default:
+              return formatError({ error: `Unknown action: ${action}`, hint: 'Valid: click, hover, fill, focus, check, uncheck, select' });
+          }
+          return `Performed ${action} on @${ref} [${cached.role}]${cached.name ? ` "${cached.name}"` : ''}`;
         }
-        return `Performed ${action} on @${ref} [${cached.role}]${cached.name ? ` "${cached.name}"` : ''}`;
+
+        if (cached) {
+          const role = cached.role;
+          const name = cached.name;
+          const roleToSelector: Record<string, string> = {
+            link: 'a', button: 'button', textbox: 'input[type="text"],input[type="search"],input[type="email"],input[type="url"],input[type="tel"],input[type="password"],input:not([type]),textarea',
+            checkbox: 'input[type="checkbox"]', radio: 'input[type="radio"]', combobox: 'select',
+            menuitem: '[role="menuitem"]', tab: '[role="tab"]', switch: '[role="switch"]',
+            slider: 'input[type="range"]', spinbutton: 'input[type="number"]', searchbox: 'input[type="search"]',
+          };
+          const sel = roleToSelector[role] || `[role="${role}"]`;
+          const interactCode = `(function() {
+            var sels = ${JSON.stringify(sel)}.split(',');
+            var name = ${JSON.stringify(name)};
+            var action = ${JSON.stringify(action)};
+            var value = ${JSON.stringify(value ?? '')};
+            var el = null;
+            for (var i = 0; i < sels.length; i++) {
+              var candidates = document.querySelectorAll(sels[i].trim());
+              for (var j = 0; j < candidates.length; j++) {
+                var c = candidates[j];
+                var text = (c.textContent || c.getAttribute('aria-label') || c.getAttribute('title') || c.getAttribute('placeholder') || c.value || '').trim();
+                if (!name || text.toLowerCase().indexOf(name.toLowerCase()) !== -1) { el = c; break; }
+              }
+              if (el) break;
+            }
+            if (!el) return 'NOT_FOUND';
+            switch (action) {
+              case 'click': el.click(); return 'OK';
+              case 'hover': el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true})); el.dispatchEvent(new MouseEvent('mouseenter', {bubbles:true})); return 'OK';
+              case 'fill': el.focus(); el.value = value; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return 'OK';
+              case 'focus': el.focus(); return 'OK';
+              case 'check': if (!el.checked) el.click(); return 'OK';
+              case 'uncheck': if (el.checked) el.click(); return 'OK';
+              case 'select': el.value = value; el.dispatchEvent(new Event('change',{bubbles:true})); return 'OK';
+              default: return 'UNKNOWN_ACTION';
+            }
+          })()`;
+          const result = await evaluateJs(interactCode);
+          if (result === 'NOT_FOUND') return formatError({ error: `Element not found for @${ref} [${role}] "${name}"`, hint: 'Run snapshot() to refresh refs' });
+          if (result === 'UNKNOWN_ACTION') return formatError({ error: `Unknown action: ${action}`, hint: 'Valid: click, hover, fill, focus, check, uncheck, select' });
+          return `Performed ${action} on @${ref} [${cached.role}]${cached.name ? ` "${cached.name}"` : ''} (via page.evaluate)`;
+        }
+
+        return formatError({ error: `Ref @${ref} not found`, hint: 'Run snapshot() first to get fresh @ref numbers' });
       },
 
       // --- Clear cache and reload ---
@@ -1413,31 +1776,64 @@ export class PlaywrightExecutor {
         const origin = options?.origin || await evaluateJs('window.location.origin') as string;
         const cleared: string[] = [];
         let needsIgnoreCache = false;
+
         if (clearTypes.has('cache')) { needsIgnoreCache = true; cleared.push('cache (per-tab bypass via ignoreCache reload)'); }
+
         if (clearTypes.has('cookies')) {
-          const cookieResult = await sendCdpCmd('Network.getCookies') as any;
-          const originHost = new URL(origin).hostname;
-          const matching = (cookieResult?.cookies || []).filter((c: any) => {
-            const isDotPrefixed = c.domain.startsWith('.');
-            const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
-            if (isDotPrefixed && !originHost.includes('.')) return false;
-            return originHost === cd || originHost.endsWith('.' + cd);
-          });
-          for (const c of matching) await sendCdpCmd('Network.deleteCookies', { name: c.name, domain: c.domain });
-          cleared.push(`cookies (${origin}, ${matching.length} removed)`);
+          if (cdpSession) {
+            const cookieResult = await sendCdpCmd('Network.getCookies') as any;
+            const originHost = new URL(origin).hostname;
+            const matching = (cookieResult?.cookies || []).filter((c: any) => {
+              const isDotPrefixed = c.domain.startsWith('.');
+              const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
+              if (isDotPrefixed && !originHost.includes('.')) return false;
+              return originHost === cd || originHost.endsWith('.' + cd);
+            });
+            for (const c of matching) await sendCdpCmd('Network.deleteCookies', { name: c.name, domain: c.domain });
+            cleared.push(`cookies (${origin}, ${matching.length} removed)`);
+          } else {
+            const originHost = new URL(origin).hostname;
+            const allCookies = await page.context().cookies();
+            const matching = allCookies.filter((c: any) => {
+              const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
+              return originHost === cd || originHost.endsWith('.' + cd);
+            });
+            for (const c of matching) await page.context().clearCookies({ name: c.name, domain: c.domain });
+            cleared.push(`cookies (${origin}, ${matching.length} removed via Playwright)`);
+          }
         }
-        const storageParts: string[] = [];
-        if (clearTypes.has('local_storage')) storageParts.push('local_storage');
-        if (clearTypes.has('session_storage')) storageParts.push('session_storage');
-        if (clearTypes.has('cache_storage')) storageParts.push('cache_storage');
-        if (clearTypes.has('indexeddb')) storageParts.push('indexeddb');
-        if (clearTypes.has('service_workers')) storageParts.push('service_workers');
-        if (storageParts.length > 0) {
-          await sendCdpCmd('Storage.clearDataForOrigin', { origin, storageTypes: storageParts.join(',') });
-          cleared.push(`${storageParts.join(', ')} (${origin})`);
+
+        if (cdpSession) {
+          const storageParts: string[] = [];
+          if (clearTypes.has('local_storage')) storageParts.push('local_storage');
+          if (clearTypes.has('session_storage')) storageParts.push('session_storage');
+          if (clearTypes.has('cache_storage')) storageParts.push('cache_storage');
+          if (clearTypes.has('indexeddb')) storageParts.push('indexeddb');
+          if (clearTypes.has('service_workers')) storageParts.push('service_workers');
+          if (storageParts.length > 0) {
+            await sendCdpCmd('Storage.clearDataForOrigin', { origin, storageTypes: storageParts.join(',') });
+            cleared.push(`${storageParts.join(', ')} (${origin})`);
+          }
+        } else {
+          if (clearTypes.has('local_storage')) { await evaluateJs('localStorage.clear()'); cleared.push('local_storage'); }
+          if (clearTypes.has('session_storage')) { await evaluateJs('sessionStorage.clear()'); cleared.push('session_storage'); }
+          if (clearTypes.has('cache_storage')) {
+            await evaluateJs('caches.keys().then(k => Promise.all(k.map(c => caches.delete(c))))');
+            cleared.push('cache_storage');
+          }
+          if (clearTypes.has('indexeddb')) cleared.push('indexeddb (requires CDP)');
+          if (clearTypes.has('service_workers')) {
+            await evaluateJs("navigator.serviceWorker.getRegistrations().then(regs => Promise.all(regs.map(r => r.unregister())))");
+            cleared.push('service_workers');
+          }
         }
+
         if (shouldReload || needsIgnoreCache) {
-          await sendCdpCmd('Page.reload', { ignoreCache: needsIgnoreCache }, getCommandTimeout('Page.reload'));
+          if (cdpSession) {
+            await sendCdpCmd('Page.reload', { ignoreCache: needsIgnoreCache }, getCommandTimeout('Page.reload'));
+          } else {
+            await page.evaluate('window.location.reload()');
+          }
           await new Promise(r => setTimeout(r, 2000));
           cleared.push(needsIgnoreCache ? 'page reloaded (cache bypassed)' : 'page reloaded');
         }
@@ -1446,13 +1842,21 @@ export class PlaywrightExecutor {
 
       // --- Navigate ---
       navigate: async (url: string) => {
-        await sendCdpCmd('Page.navigate', { url }, getCommandTimeout('Page.navigate'));
+        if (cdpSession) {
+          await sendCdpCmd('Page.navigate', { url }, getCommandTimeout('Page.navigate'));
+        } else {
+          await page.evaluate(`window.location.href = ${JSON.stringify(url)}`);
+        }
         await new Promise(r => setTimeout(r, 2000));
         return `Navigated to ${url}`;
       },
 
       ensureFreshRender: async () => {
-        await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+        if (cdpSession) {
+          await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+        } else {
+          await page.evaluate('window.location.reload()');
+        }
         await new Promise(r => setTimeout(r, 2000));
         return 'Page reloaded with fresh cache';
       },
@@ -1469,6 +1873,11 @@ export class PlaywrightExecutor {
 
     // Alias: accessibilitySnapshot === snapshot
     globals.accessibilitySnapshot = globals.snapshot;
+
+    // Sandboxed require and import (matches upstream playwriter)
+    globals.require = self.sandboxedRequire;
+    globals.import = (specifier: string) => import(specifier);
+
     return globals;
   }
 
@@ -1570,10 +1979,12 @@ export class ExecutorManager {
   private executors = new Map<string, PlaywrightExecutor>();
   private maxSessions: number;
   private logger?: ExecutorLogger;
+  private relaySendCdp?: RelayCdpSender;
 
-  constructor(options?: { maxSessions?: number; logger?: ExecutorLogger }) {
+  constructor(options?: { maxSessions?: number; logger?: ExecutorLogger; relaySendCdp?: RelayCdpSender }) {
     this.maxSessions = options?.maxSessions ?? 5;
     this.logger = options?.logger;
+    this.relaySendCdp = options?.relaySendCdp;
   }
 
   getOrCreate(sessionId: string): PlaywrightExecutor {
@@ -1587,6 +1998,7 @@ export class ExecutorManager {
         );
       }
       executor = new PlaywrightExecutor(this.logger);
+      if (this.relaySendCdp) executor.relaySendCdp = this.relaySendCdp;
       this.executors.set(sessionId, executor);
     }
     return executor;

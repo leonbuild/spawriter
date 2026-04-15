@@ -1,9 +1,57 @@
 # Executor Refactor Plan: Shared Core Architecture
 
 > Generated: 2026-04-14
-> Status: **Proposed — ready for implementation**
+> Last updated: 2026-04-15
+> Status: **Core architecture implemented. All VM globals functional via relay CDP. ScopedFS, Warning System, Kitty auto-detect complete. CDP WebSocket Proxy researched — future phase.**
 > Reference: `D:\dev\0-ref\playwriter` (upstream)
 > Current: `D:\dev\side\spawriter`
+
+## Implementation Status (2026-04-15)
+
+| Phase / Item | Status | Notes |
+|-------------|--------|-------|
+| **A1.** Console log capture (two systems) | **Partial** | Per-execute `customConsole` done; persistent `browserLogs` via `page.on('console')` done in `setupPageListeners` |
+| **A2.** Accessibility snapshot | **Done** | CDP AX tree + `ariaSnapshot` fallback; ref cache populated for `interact()` |
+| **A3.** Screenshot with labels | **Done** | `screenshotWithLabels` via `relaySendCdp('Page.captureScreenshot')` fallback |
+| **A4.** Single-spa management | **Done** | `singleSpa` VM global with `dashboard`, `override`, `mount`/`unmount`/`unload` |
+| **A5.** Network monitoring | **Done** | `networkLog` VM global via CDP `Network.*` |
+| **A6.** Network interception | **Done** | `networkIntercept` VM global via CDP `Fetch.*` |
+| **A7.** Remaining capabilities | **Done** | `cssInspect`, `dbg`, `browserFetch`, `storage`, `emulation`, `performance`, `pageContent`, `tab` — all via `relayCdp()` fallback |
+| **A8.** Sandboxed `require` (ScopedFS) | **Done** | `runtime/scoped-fs.ts` created; 36-entry `ALLOWED_MODULES`; `require('fs')` returns `ScopedFS` |
+| **A9.** AST auto-return | **Done** | Already in place (regex + `new Function` heuristic) |
+| **A10.** Page lifecycle / Warning system | **Done** | `enqueueWarning`, `beginWarningScope`, `flushWarningsForScope`; page close + popup warnings |
+| **A11.** `usefulGlobals` in VM | **Done** | Already in place |
+| **A12.** `resetPlaywright` VM global | **Done** | Exposed as VM global |
+| **A13.** Relay security middleware | **Done** | Already in place in `relay.ts` |
+| **B.** Slim down `mcp.ts` | **Done** | 518 LOC with 4 thin tool wrappers; no `_legacyDispatch`; `remoteRelaySendCdp` for CDP |
+| **C.** Update relay | **Done** | `/shutdown` route, `relaySendCdp()`, `/cli/cdp` endpoint, control-routes inlined, obsolete files removed |
+| **D.** Update CLI | **Done** | `--replace` retry logic; no cli-globals import; uses `ControlClient` + `ensure-relay` |
+| **E.** Update `ExecutorManager` | **Done** | `getOrCreate`, `get`, `remove`, `listSessions`, `resetAll`, `relaySendCdp` passthrough |
+| **F.** CDP WebSocket Session Proxy | **Researched** | Make `newCDPSession(page)` work through relay; eliminate three-tier fallback. Novel approach — no existing solution. See `docs/CDP_WEBSOCKET_PROXY.md` |
+
+### Key Architectural Achievements
+
+1. **Three-tier CDP fallback**: Direct CDP → Relay CDP (`relaySendCdp`) → Playwright-native/`page.evaluate()`. All 41+ VM globals/actions functional.
+2. **`relayCdp()` helper**: Unified dispatch that picks available CDP channel automatically.
+3. **`relaySendCdp()`**: Raw CDP command forwarding through relay's extension WebSocket.
+4. **MCP CDP forwarding**: `/cli/cdp` HTTP endpoint on relay + `remoteRelaySendCdp()` in MCP — enables MCP process to send CDP commands without direct WebSocket access.
+5. **Network monitoring via Playwright events**: `page.on('request'/'response'/'requestfailed')` feeds `NetworkMonitor` — works through relay without CDP `Network.enable`.
+6. **`interact()` via `page.evaluate()`**: DOM queries with ARIA role/name mapping, bypassing Playwright locators that timeout through relay.
+7. **Origin-scoped clearing**: All cookie/storage/cache clearing operations are scoped to the current page's origin — never global.
+8. **ScopedFS**: Sandboxed file system allowing only session CWD and `/tmp` access.
+9. **Warning system**: Scoped warning events per `execute()` call with page close and popup tracking.
+
+### Remaining Work
+
+| Item | Priority | Estimated LOC | Status |
+|------|----------|---------------|--------|
+| Test migration: `mcp.test.ts` → domain-specific files | Low | ~4000 LOC moved | Not started |
+| `relay.test.ts`: Integration tests for relay routes | Low | ~500 LOC new | Not started |
+| **Phase F: CDP WebSocket Session Proxy** | **Future** | ~400-500 new, -500 removed | **Researched** |
+
+**Phase F details:** Intercept `Target.attachToBrowserTarget` at relay level, implement session mapping (`sessionId → tabId`), route sessionId-tagged commands/events, enable `newCDPSession(page)` through extension relay. Would eliminate all three-tier fallback code. No existing project has solved this — spawriter would be first. Requires PoC validation. Full research in `docs/CDP_WEBSOCKET_PROXY.md`.
+
+---
 
 ## Goal
 
@@ -1085,3 +1133,6 @@ Each step is independently testable and deployable. The key invariant is:
 | Relay security middleware? | Port from upstream | Prevents cross-origin attacks |
 | `ExecuteResult` with `screenshots`? | Yes, match upstream type | CLI needs screenshot metadata |
 | `usefulGlobals` in VM? | Yes | VM sandbox needs setTimeout, fetch, etc. |
+| CDP Proxy approach? | Option B (Session-Aware Forwarding) | Builds on existing relay; less invasive than transparent proxy; doesn't need `--remote-debugging-port` |
+| CDP Proxy timing? | Future (after PoC) | Three-tier fallback works (0 failures); novel approach with no reference implementation — validate before committing |
+| `devtools-protocol` npm package? | Use for Phase F | Provides TypeScript types for CDP commands/events; useful for type-safe relay code |

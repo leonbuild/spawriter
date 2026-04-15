@@ -228,6 +228,12 @@ app.get('/version', (c) => {
   return c.json({ version: VERSION });
 });
 
+app.post('/shutdown', (c) => {
+  log('Shutdown requested via /shutdown endpoint');
+  setTimeout(() => process.exit(0), 100);
+  return c.json({ ok: true });
+});
+
 app.get('/json/version', (c) => {
   const port = getRelayPort();
   return c.json({
@@ -1015,7 +1021,61 @@ function handleCDPMessage(data: Buffer, clientId: string) {
   }
 }
 
-const relayExecutorManager = new ExecutorManager({ maxSessions: 10 });
+// ---------------------------------------------------------------------------
+// Direct CDP command sender for the executor (bypasses Playwright CDPSession)
+// ---------------------------------------------------------------------------
+
+function getActiveSessionId(): string | undefined {
+  for (const target of attachedTargets.values()) {
+    return target.sessionId;
+  }
+  return undefined;
+}
+
+function relaySendCdp(method: string, params?: Record<string, unknown>, timeout = 30000): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const sessionId = getActiveSessionId();
+    if (!sessionId) {
+      reject(new Error('No attached target'));
+      return;
+    }
+    if (!isExtensionConnected()) {
+      reject(new Error('Extension not connected'));
+      return;
+    }
+    const relayId = nextExtensionRequestId++;
+    const timeoutId = setTimeout(() => {
+      pendingExtensionCmdRequests.delete(relayId);
+      reject(new Error(`Relay CDP timeout: ${method}`));
+    }, timeout);
+
+    const mockWs = {
+      readyState: 1,
+      send(data: string) {
+        clearTimeout(timeoutId);
+        pendingExtensionCmdRequests.delete(relayId);
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) reject(new Error(typeof parsed.error === 'string' ? parsed.error : parsed.error.message || JSON.stringify(parsed.error)));
+          else resolve(parsed.result ?? parsed);
+        } catch (e) {
+          reject(e);
+        }
+      },
+      close() {},
+    } as unknown as import('ws').WebSocket;
+
+    pendingExtensionCmdRequests.set(relayId, { ws: mockWs, timeoutId });
+
+    sendToExtension({
+      id: relayId,
+      method: 'forwardCDPCommand',
+      params: { method, sessionId, params: params || {} },
+    });
+  });
+}
+
+const relayExecutorManager = new ExecutorManager({ maxSessions: 10, relaySendCdp });
 
 // ---------------------------------------------------------------------------
 // CLI control routes (inlined from former control-routes.ts)
@@ -1082,6 +1142,17 @@ app.post('/cli/session/reset', async (c) => {
   if (!executor) return c.json({ error: 'Session not found' }, 404);
   await executor.reset();
   return c.json({ success: true });
+});
+
+app.post('/cli/cdp', async (c) => {
+  try {
+    const { method, params, timeout } = await c.req.json() as { method: string; params?: Record<string, unknown>; timeout?: number };
+    if (!method) return c.json({ error: 'method is required' }, 400);
+    const result = await relaySendCdp(method, params, timeout);
+    return c.json({ result });
+  } catch (err: any) {
+    return c.json({ error: err.message }, 500);
+  }
 });
 
 export async function startRelayServer(): Promise<void> {
