@@ -2,6 +2,23 @@
 
 > Goal: Every agent clearly knows which tabs are theirs, which belong to others, and cannot accidentally operate on another agent's tab.
 
+### Implementation Status
+
+| Section | Status | Notes |
+|---|---|---|
+| 1. `protocol.ts` | **PLANNED** | Old `LeaseInfo` / `LEASE_ERROR_CODE` still in place |
+| 2. `relay.ts` — Core Ownership Map | **PLANNED** | Old `TabLease` / `tabLeases` / lease functions still in place |
+| 3. `pw-executor.ts` — Executor Binding | **PLANNED** | No `ownedTabIds` / `activeTabId` / `switchToTab` yet; still uses `pages[0]` |
+| 4. `mcp.ts` — MCP Integration | **PLANNED** | Still uses lease-based `TargetListItem`; no relay claim calls |
+| 5. `cli.ts` — CLI Commands | **PLANNED** | No `session bind` command |
+| 6. `extension/bridge.js` — Extension UI | **PLANNED** | Still uses `leaseStateBySessionId` / lease events |
+| 7. `lease.test.ts` → `ownership.test.ts` | **PLANNED** | File not yet renamed; tests still use lease registry |
+| 8. `relay.test.ts` — Update References | **PLANNED** | ~150 lease references remain |
+
+> **This document is a design specification, not a changelog.** All code changes described below are planned but not yet implemented. The current codebase uses the old lease system throughout. Do not treat code blocks as "already landed" — they are the target implementation.
+
+---
+
 ## The Problem
 
 All `PlaywrightExecutor` instances connect via `chromium.connectOverCDP()` and grab `pages[0]` (pw-executor.ts:344). Multiple sessions share the same browser tab. The existing "lease" system only guards CDP WebSocket clients — CLI (`/cli/execute`) and MCP paths bypass it entirely.
@@ -155,6 +172,10 @@ if (SWEEP_INTERVAL > 0) {
         if (count > 0) log(`Stale session ${sessionId}: released ${count} tab(s)`);
         sessionActivity.delete(sessionId);
         sessionToClientId.delete(sessionId);
+        // Clean up any pw-client bindings for this session
+        for (const [pwId, sid] of pwClientToSession) {
+          if (sid === sessionId) pwClientToSession.delete(pwId);
+        }
         relayExecutorManager.remove(sessionId);
       }
     }
@@ -172,6 +193,9 @@ if (SWEEP_INTERVAL > 0) {
 **Replace `checkLeaseEnforcement`** (line 906-923) with `checkOwnership`:
 
 ```typescript
+// Maps pw-* CDP clientId → the agent sessionId that created it
+const pwClientToSession = new Map<string, string>();
+
 function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: number): boolean {
   if (!cdpSessionId) return true;
   const tabId = resolveTabIdFromSession(cdpSessionId);
@@ -179,16 +203,16 @@ function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: 
   const owner = tabOwners.get(tabId);
   if (!owner) return true; // unclaimed tab = open access
 
-  // Find whether this clientId belongs to the owning agent session
+  // Direct CDP client match (e.g. extension WS client)
   const ownerClientId = sessionToClientId.get(owner.sessionId);
   if (ownerClientId === clientId) return true;
 
-  // pw-* clients created by the owning session's executor are allowed
-  // The relay tracks this via sessionToClientId when /cli/execute creates executors
+  // pw-* clients: only allow if explicitly registered to the owning session.
+  // Registration happens in /cli/execute when the executor connects via connectOverCDP().
+  // SECURITY: Do NOT allow arbitrary pw-* prefixed clients — require explicit binding.
   if (clientId.startsWith('pw-')) {
-    // Check if any session that owns this tab has this pw-client
-    // pw-clients register during CDP connect; we track them below
-    return true; // pw-clients are always the session's own executor
+    const boundSession = pwClientToSession.get(clientId);
+    if (boundSession === owner.sessionId) return true;
   }
 
   sendCdpError(clientId, {
@@ -201,7 +225,7 @@ function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: 
 }
 ```
 
-> **Note on pw-client allowance**: When a `PlaywrightExecutor` connects via `chromium.connectOverCDP()`, it creates a CDP client with id `pw-<timestamp>-<random>`. This client is always the executor's own connection. Since the executor is bound to a session that owns the tab, pw-clients are safe to allow. For stricter enforcement, track `sessionId → pw-clientId` mapping when `/cli/execute` triggers `ensureConnection()`.
+> **Note on pw-client allowance**: When a `PlaywrightExecutor` connects via `chromium.connectOverCDP()`, it creates a CDP client with id `pw-<timestamp>-<random>`. This client must be explicitly registered to the owning session via `pwClientToSession.set(clientId, sessionId)`. Registration happens in `/cli/execute` (see below). **Do NOT use prefix-based allowlisting** — the `clientId` comes from the URL path and can be forged by any localhost process connecting to `/cdp/pw-fake`.
 
 **Replace `routeCdpEvent`** (line 925-937):
 
@@ -337,7 +361,18 @@ app.post('/cli/execute', async (c) => {
       }
     }
 
+    // Register pw-client binding: the executor's CDP clientId is bound to this session.
+    // This is checked by checkOwnership() to prevent pw-* prefix spoofing.
+    const pwClientId = executor.getLastCdpClientId?.();
+    if (pwClientId) {
+      pwClientToSession.set(pwClientId, body.sessionId);
+    }
+
     const result = await executor.execute(body.code, body.timeout || 10000);
+
+    // Touch claim after successful execution (avoid re-broadcasting ownership events)
+    if (activeTabId != null) touchClaim(activeTabId, body.sessionId);
+
     return c.json({ text: result.text, images: result.images, screenshots: result.screenshots, isError: result.isError });
   } catch (err: any) {
     return c.json({ text: err.message, images: [], screenshots: [], isError: true }, 500);
@@ -477,6 +512,7 @@ ws.on('close', () => {
   tabOwners.clear();
   sessionActivity.clear();
   sessionToClientId.clear();
+  pwClientToSession.clear();
 
   // ... rest of existing cleanup (detach targets, clear pending requests) unchanged ...
 });
@@ -490,6 +526,8 @@ ws.on('close', () => {
   const current = cdpClients.get(clientId);
   if (current?.ws === ws) {
     cdpClients.delete(clientId);
+    // Clean up pw-client → session binding
+    pwClientToSession.delete(clientId);
     // Find and release tabs owned by sessions using this clientId
     for (const [sid, cid] of sessionToClientId) {
       if (cid === clientId) {
@@ -558,9 +596,11 @@ attachedTargets.delete(detachedSessionId);
 private ownedTabIds = new Set<number>();
 private activeTabId: number | null = null;
 private tabIdToUrl = new Map<number, string>(); // tabId → last known URL
+private lastCdpClientId: string | null = null; // set during ensureConnection()
 
 getActiveTabId(): number | null { return this.activeTabId; }
 getOwnedTabIds(): Set<number> { return this.ownedTabIds; }
+getLastCdpClientId(): string | null { return this.lastCdpClientId; }
 
 claimTab(tabId: number, url?: string): void {
   this.ownedTabIds.add(tabId);
@@ -587,6 +627,12 @@ releaseTab(tabId: number): void {
 ```
 
 **Modify `ensureConnection()`** (line 315-358):
+
+Add `lastCdpClientId` capture (after line 323 where `clientId` is generated):
+
+```typescript
+this.lastCdpClientId = clientId; // stored for pwClientToSession binding in relay
+```
 
 Replace lines 343-344 (`const pages = ...` through `const page = pages[0] ...`):
 
@@ -672,18 +718,27 @@ case 'connect': {
     return { content: [{ type: 'text', text: formatError({ error: `Failed to connect tab: ${(result as any).error || 'Unknown error'}`, recovery: 'reset' }) }], isError: true };
   }
 
-  // Auto-claim the connected tab
+  // Auto-claim the connected tab — relay is the single source of truth
+  let claimStatus = 'unclaimed';
   if (result.tabId != null) {
     const mySessionId = `mcp-${effectiveClientId || 'default'}`;
     try {
-      await fetch(`http://localhost:${port}/cli/tab/claim`, {
+      const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tabId: result.tabId, sessionId: mySessionId }),
       });
-    } catch {}
-    const executor = await getOrCreateExecutor();
-    executor.claimTab(result.tabId, url);
+      if (claimResp.ok) {
+        claimStatus = 'claimed';
+        const executor = await getOrCreateExecutor();
+        executor.claimTab(result.tabId, url);
+      } else {
+        const claimErr = await claimResp.json().catch(() => ({}));
+        claimStatus = `claim failed: ${(claimErr as any).error || claimResp.status}`;
+      }
+    } catch (e: any) {
+      claimStatus = `claim failed: ${e.message}`;
+    }
   }
 
   await sleep(500);
@@ -691,8 +746,8 @@ case 'connect': {
   const newTarget = targets.find(t => t.tabId === result.tabId);
   const created = result.created ? ' (newly created)' : '';
   const info = newTarget
-    ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}\n  Ownership: claimed`
-    : `Tab attached${created} (tabId: ${result.tabId}). Use tab { action: "list" } to see it.`;
+    ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}\n  Ownership: ${claimStatus}`
+    : `Tab attached${created} (tabId: ${result.tabId}). Ownership: ${claimStatus}. Use tab { action: "list" } to see it.`;
   return { content: [{ type: 'text', text: info }] };
 }
 ```
@@ -747,15 +802,21 @@ case 'switch': {
   if (target.owner && target.owner !== mySessionId) {
     return { content: [{ type: 'text', text: formatError({ error: `Tab ${switchTabId} owned by ${target.owner}`, hint: 'You can only switch to tabs you own or unclaimed tabs' }) }], isError: true };
   }
-  // Auto-claim if unclaimed
+  // Auto-claim if unclaimed — must succeed before updating local executor
   if (!target.owner) {
     try {
-      await fetch(`http://localhost:${port}/cli/tab/claim`, {
+      const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tabId: switchTabId, sessionId: mySessionId }),
       });
-    } catch {}
+      if (!claimResp.ok) {
+        const claimErr = await claimResp.json().catch(() => ({}));
+        return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${(claimErr as any).error || claimResp.status}` }) }], isError: true };
+      }
+    } catch (e: any) {
+      return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${e.message}` }) }], isError: true };
+    }
   }
   const executor = await getOrCreateExecutor();
   executor.claimTab(switchTabId, target.url);
@@ -837,6 +898,31 @@ fetch(`http://localhost:${port}/cli/session/activity`, {
   body: JSON.stringify({ sessionId: mcpSessionId }),
 }).catch(() => {});
 ```
+
+**Modify MCP `remoteRelaySendCdp`** (~line 137): Pass `sessionId` through to `/cli/cdp` for ownership enforcement:
+
+```typescript
+async function remoteRelaySendCdp(
+  method: string,
+  params?: Record<string, unknown>,
+  timeout?: number,
+  sessionId?: string,
+): Promise<unknown> {
+  const port = getRelayPort();
+  const mcpSessionId = sessionId || `mcp-${getEffectiveClientId() || 'default'}`;
+  const resp = await fetch(`http://localhost:${port}/cli/cdp`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ method, params, timeout, sessionId: mcpSessionId }),
+    signal: AbortSignal.timeout(timeout || 30000),
+  });
+  const json = await resp.json() as { result?: unknown; error?: string };
+  if (!resp.ok || json.error) throw new Error(json.error || `CDP ${method} failed (${resp.status})`);
+  return json.result;
+}
+```
+
+> **Why this matters**: Without `sessionId` in the `/cli/cdp` request, the relay cannot enforce ownership — it falls back to `getActiveSessionId()` which returns the first attached target, breaking multi-agent isolation. Every code path that sends CDP commands on behalf of an agent session must include the session identity.
 
 ### 5. `spawriter/src/cli.ts` — CLI Commands
 
@@ -1142,14 +1228,35 @@ describe('Tab Ownership — Activity Tracking', () => {
   });
 });
 
-// Additional tests to write during implementation:
-// - Ownership enforcement on /cli/execute (integration test)
-// - Auto-claim finds first unclaimed tab
-// - Stale session TTL cleanup
-// - Extension disconnect clears all ownership
-// - Tab detach removes from tabOwners
-// - CDP WS client rejection when tab owned by another session
+// Additional tests to write during implementation (see Integration Test Plan below)
 ```
+
+**Integration Test Plan** — required before merging the ownership migration:
+
+| # | Category | Test Case | Verification |
+|---|---|---|---|
+| 1 | **Cross-session isolation** | Session A claims tab 42; session B tries `/cli/execute` on tab 42 | B gets 403 with ownership error |
+| 2 | **Cross-session isolation** | Session A claims tab 42; session B sends CDP command targeting tab 42's CDP session | B gets `OWNERSHIP_ERROR_CODE` |
+| 3 | **Auto-claim** | Session A calls `/cli/execute` with no prior claim; one unclaimed tab exists | Tab auto-claimed by A; verify `tabOwners` has entry |
+| 4 | **Auto-claim** | Session A calls `/cli/execute`; all tabs are owned by others | A gets descriptive error, not silent fallback to wrong tab |
+| 5 | **Force takeover** | Session A owns tab 42; session B calls `/cli/tab/claim` with `force: true` | B succeeds; A receives `Target.tabReleased` event with `reason: 'force-takeover'` |
+| 6 | **TTL cleanup** | Set `SPAWRITER_CLAIM_TTL_MS=100`; session A claims tab; wait 200ms | Sweep releases tab; `tabOwners` empty; `sessionActivity` cleaned |
+| 7 | **Session delete** | Session A claims 2 tabs; `POST /cli/session/delete` for A | Both tabs released; ownership snapshot sent to extension |
+| 8 | **Extension disconnect** | Extension WS closes | All `tabOwners` cleared; all CDP clients get `Target.tabReleased` |
+| 9 | **Tab detach** | Extension sends `Target.detachedFromTarget` for owned tab | `tabOwners` entry removed; ownership snapshot sent |
+| 10 | **CDP client disconnect** | CDP WS client for session A disconnects | All tabs owned via that client released |
+| 11 | **pw-client binding** | Connect with `clientId=pw-fake` without registration; target owned tab | Rejected by `checkOwnership` (not in `pwClientToSession`) |
+| 12 | **pw-client binding** | `/cli/execute` registers pw-client; same client targets owned tab | Allowed by `checkOwnership` |
+| 13 | **MCP claim error propagation** | Relay rejects claim (409); MCP `tab connect` | MCP returns error with claim failure detail, NOT silent success |
+| 14 | **MCP claim error propagation** | Relay rejects claim (409); MCP `tab switch` | MCP returns error, local executor NOT updated |
+| 15 | **Read-only bypass** | Session A does NOT own tab 42; calls `tab list` | Succeeds (exempt from ownership) |
+| 16 | **Read-only bypass** | Session A does NOT own tab 42; runs `snapshot()` via `/cli/execute` with `readOnly: true` | Succeeds (exempt from ownership) |
+| 17 | **Session activity** | Session A claims tab; calls `/cli/execute` 5 times | `sessionActivity` timestamp updates each time; no duplicate ownership events |
+| 18 | **touchClaim vs claimTab** | Session A owns tab; `/cli/execute` completes | Only `sessionActivity` updated (touchClaim), no `Target.tabClaimed` re-broadcast |
+| 19 | **`/cli/cdp` session pass-through** | MCP sends CDP via `/cli/cdp` with `sessionId`; targets tab owned by different session | Gets 403 ownership error |
+| 20 | **`/cli/cdp` session pass-through** | MCP sends CDP via `/cli/cdp` without `sessionId` | Falls through to `getActiveSessionId()` (backward compat, single-agent) |
+| 21 | **Orphan session cleanup** | Session has no claims and no activity for `STALE_SESSION_TTL` | `sessionActivity` and `sessionToClientId` entries removed |
+| 22 | **Extension ownership snapshot** | Session A claims tab; extension sends `requestOwnershipSnapshot` | Extension receives `Target.ownershipSnapshot` with correct entries |
 
 ### 8. `spawriter/src/relay.test.ts` — Update References (818 LOC, ~150 lease references)
 
@@ -1269,7 +1376,7 @@ spawriter session delete sw-abc123      # releases all tabs
 - If a session's tool call needs a tab but the session has no default tab, broker calls extension `open_tab({ active: false })` to create a background tab, claims it, and sets it as default. **Design insight: auto-create, not just auto-claim existing tabs**
 
 **`touchClaim` vs `setClaim` distinction** (`broker.cjs`, line 163-180):
-- `setClaim(tabId, sessionId)` — always writes, preserves `claimedAt` if same session
+- `setClaim(tabId, sessionId)` — always writes; preserves `claimedAt` from any previous claim on that tab (regardless of which session held it), only sets fresh `claimedAt` when no prior claim exists. This means a force-takeover retains the original claim timestamp.
 - `touchClaim(tabId, sessionId)` — only updates `lastSeenAt` if already owned by same session, or creates new claim if unclaimed. Rejects silently if owned by different session. **Design insight: touch is safe for implicit operations**
 
 **Force takeover** (`broker.cjs:claim_tab handler`, line 349-362):
@@ -1311,11 +1418,13 @@ spawriter session delete sw-abc123      # releases all tabs
 4. **More protective than playwriter** — upstream has zero isolation, just "create your own page"
 5. **Clean break, not gradual migration** — old lease protocol fully removed, no transition code
 
-**This is a clean-break architecture, not backward-compatible shim.** We:
+**This will be a clean-break migration, not a backward-compatible shim.** The plan:
 - Remove ALL old lease types, functions, CDP commands, and events
 - Replace with entirely new ownership protocol (different data model: keyed by `tabId` not `sessionId`)
 - Single-agent ease is preserved via auto-claim (a UX feature, not a compatibility compromise)
-- No old code paths or fallbacks are retained
+- No old code paths or fallbacks will be retained
+
+> **Current state**: The old lease system is fully operational in the codebase. This migration has not started. See [Implementation Status](#implementation-status) at the top.
 
 **Remaining architectural limitations** (not blockers, but future improvement opportunities):
 1. **URL-based Page → tabId matching** — inherent limitation of vanilla `playwright-core`. Clean fix: fork Playwright to expose `page.targetId()` (as upstream playwriter does with `@xmorse/playwright-core`)
@@ -1400,13 +1509,13 @@ spawriter session delete sw-abc123      # releases all tabs
 | **Ownership enforcement** | Broker (`handleTool` in broker.cjs) | Relay (`checkOwnership` + `/cli/execute` + `/cli/cdp`) |
 | **Tab creation** | Auto-create background tab when session has no tab | Auto-claim existing unclaimed tab (no auto-create) |
 | **Default tab** | `sessionState.defaultTabId` — per session on broker | `executor.activeTabId` — per executor in process |
-| **Touch vs Claim** | `touchClaim()` (update `lastSeenAt` only) vs `setClaim()` | Single `claimTab()` → should add `touchClaim()` |
-| **Force takeover** | `force: true` on `claim_tab` op | Now added to `claimTab()` and `/cli/tab/claim` |
-| **TTL** | 5min default, configurable `OPENCODE_BROWSER_CLAIM_TTL_MS` | 30min default, now configurable `SPAWRITER_CLAIM_TTL_MS` |
-| **Sweep interval** | Self-tuning: `min(max(10s, TTL/2), 60s)` | Now self-tuning (same formula) |
+| **Touch vs Claim** | `touchClaim()` (update `lastSeenAt` only) vs `setClaim()` | Designed: `touchClaim()` + `claimTab()` (see relay.ts section) |
+| **Force takeover** | `force: true` on `claim_tab` op | Designed: `force` param on `claimTab()` and `/cli/tab/claim` |
+| **TTL** | 5min default, configurable `OPENCODE_BROWSER_CLAIM_TTL_MS` | Designed: 30min default, configurable `SPAWRITER_CLAIM_TTL_MS` |
+| **Sweep interval** | Self-tuning: `min(max(10s, TTL/2), 60s)` | Designed: self-tuning (same formula) |
 | **Extension awareness** | Extension knows nothing about ownership | Extension receives ownership events and displays status |
 | **Playwright API** | None (extension-only) or separate `agent-browser` daemon | Full Playwright VM in relay process |
-| **Read-only bypass** | `get_tabs`, `get_active_tab`, `open_tab`, `list_downloads` skip ownership | Should add: `tab list`, `accessibility_snapshot` skip ownership |
+| **Read-only bypass** | `get_tabs`, `get_active_tab`, `open_tab`, `list_downloads` skip ownership | `OWNERSHIP_EXEMPT_OPERATIONS` set: `tab_list`, `accessibility_snapshot`, `console_logs`, `network_log`, `dashboard_state`, `performance_metrics`, `page_content_read`, `css_inspect` |
 | **Tab close** | Auto-releases ownership on `close_tab` | Must ensure `Target.detachedFromTarget` handler covers this |
 | **Agent backend** | Optional headless Playwright daemon (`agent-browser`) | N/A — always uses real Chrome via extension |
 
@@ -1414,7 +1523,26 @@ spawriter session delete sw-abc123      # releases all tabs
 
 1. **`touchClaim()` is important.** Without it, every `execute` call re-broadcasts ownership events unnecessarily. We should use `touchClaim()` in `/cli/execute` after successful execution (already added to relay.ts section above).
 
-2. **Read-only tool bypass.** opencode-browser exempts tools that don't mutate tab state from ownership checks via `wantsTab()`. We should implement the same for `tab list`, `accessibility_snapshot`, `console_logs` (read-only), and `dashboard_state`.
+2. **Read-only tool bypass.** opencode-browser exempts tools that don't mutate tab state from ownership checks via `wantsTab()`. We should implement the equivalent. Concrete design:
+
+   ```typescript
+   // In relay.ts — tools/operations that do NOT require tab ownership
+   const OWNERSHIP_EXEMPT_OPERATIONS = new Set([
+     'tab_list',              // MCP tab { action: "list" } — read-only enumeration
+     'accessibility_snapshot', // snapshot() / accessibilitySnapshot() — read-only
+     'console_logs',          // consoleLogs() — read-only
+     'network_log',           // networkLog() — read-only
+     'dashboard_state',       // singleSpa.status() — read-only
+     'performance_metrics',   // performance() — read-only
+     'page_content_read',     // pageContent("get_text"/"get_metadata") — read-only
+     'css_inspect',           // cssInspect() — read-only
+   ]);
+
+   // In checkOwnership(), add at the top:
+   // if (operationName && OWNERSHIP_EXEMPT_OPERATIONS.has(operationName)) return true;
+   ```
+
+   For MCP tools, the exemption is at the MCP handler level: `tab { action: "list" }` never calls `/cli/tab/claim` and works without ownership. For CLI `/cli/execute`, read-only operations still require the executor to have a page, but the ownership check in the relay can be relaxed. The exact mechanism: add an optional `readOnly?: boolean` flag to the `/cli/execute` request body; when `true`, skip ownership verification but still require the tab to be attached.
 
 3. **Auto-create vs auto-claim.** opencode-browser creates a *new* background tab when a session has no tabs. We auto-claim an *existing* unclaimed tab. Both are valid — our approach is less disruptive (no extra tabs created), but opencode-browser's guarantees every session gets a clean tab.
 
