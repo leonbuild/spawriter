@@ -1,10 +1,11 @@
 # Remaining Optimization & Testing Work
 
 > Generated: 2026-04-14
-> **Last updated: 2026-04-15**
+> **Last updated: 2026-04-15 (second run)**
 > **Status: ALL FUNCTIONAL WORK COMPLETE**
 > - All VM globals fully functional via relay CDP forwarding — zero graceful failures
-> - CLI E2E: 41/41 PASS | MCP E2E: 32/32 PASS | Unit tests: 1421/1421 PASS
+> - Unit tests: 1429/1429 PASS | Runtime tests: 118/118 PASS | Total: 1547/1547 PASS
+> - CLI E2E: 43/43 PASS | MCP E2E: 33/33 PASS (29 VM globals + 4 MCP tools)
 > - Phases A-E of EXECUTOR_REFACTOR_PLAN.md: COMPLETE
 > - Only low-priority quality improvements remain (test migration, relay HTTP tests)
 
@@ -506,13 +507,16 @@ All 32 VM globals tested via MCP `execute` tool — all pass. Additionally teste
 - **`single_spa` tool**: `status` — PASS
 - **`reset` tool**: Full reset — PASS
 
-### Summary Statistics (Latest — 2026-04-15)
+### Summary Statistics (Latest — 2026-04-15, second verified run)
 
-- **Unit tests**: **1547/1547 PASS** (1429 core + 118 runtime)
+- **Unit tests**: **1429/1429 PASS** (280 suites, 0 failures)
+- **Runtime tests**: **118/118 PASS** (23 suites, 0 failures)
+- **Total unit+runtime**: **1547/1547 PASS**
 - **CLI E2E tests**: **43/43 PASS** — zero failures, zero graceful errors
-- **MCP E2E tests**: **32/32 PASS** — zero failures, zero graceful errors
+- **MCP E2E tests**: **33/33 PASS** (29 VM globals via execute + 4 MCP tools) — zero failures
 - **MCP tools**: **4/4 PASS** (execute, reset, single_spa, tab)
 - **Total graceful failures**: **0** (all previously graceful tools now fully functional via relay CDP)
+- **Screenshot verification**: Confirmed working with image output in both CLI and MCP paths
 
 ### Fixes Applied During E2E Testing (2026-04-15)
 
