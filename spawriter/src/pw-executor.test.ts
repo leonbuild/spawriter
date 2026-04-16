@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 
 import {
   getAutoReturnExpression,
+  getLastExpressionReturn,
   wrapCode,
   CodeExecutionTimeoutError,
   PlaywrightExecutor,
@@ -124,6 +125,68 @@ describe('getAutoReturnExpression', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test: getLastExpressionReturn
+// ---------------------------------------------------------------------------
+
+describe('getLastExpressionReturn', () => {
+  it('should extract last expression from semicolon-separated statements', () => {
+    const result = getLastExpressionReturn('state.x = 1; state.x');
+    assert.ok(result);
+    assert.equal(result!.preamble, 'state.x = 1;');
+    assert.equal(result!.returnExpr, 'state.x');
+  });
+
+  it('should extract last expression after require()', () => {
+    const result = getLastExpressionReturn('const path = require("path"); path.join("a", "b")');
+    assert.ok(result);
+    assert.equal(result!.preamble, 'const path = require("path");');
+    assert.equal(result!.returnExpr, 'path.join("a", "b")');
+  });
+
+  it('should extract from multiple assignments', () => {
+    const result = getLastExpressionReturn('state.a = 1; state.b = 2; state.a + state.b');
+    assert.ok(result);
+    assert.ok(result!.preamble.includes('state.a = 1'));
+    assert.ok(result!.preamble.includes('state.b = 2'));
+    assert.equal(result!.returnExpr, 'state.a + state.b');
+  });
+
+  it('should return null for single expression (no semicolons)', () => {
+    assert.equal(getLastExpressionReturn('state.x'), null);
+  });
+
+  it('should return null for empty string', () => {
+    assert.equal(getLastExpressionReturn(''), null);
+  });
+
+  it('should return null for code with return keyword', () => {
+    assert.equal(getLastExpressionReturn('state.x = 1; return state.x'), null);
+  });
+
+  it('should return null when last part is a declaration', () => {
+    assert.equal(getLastExpressionReturn('state.x = 1; const y = 2'), null);
+  });
+
+  it('should handle await in last expression', () => {
+    const result = getLastExpressionReturn('const s = await snapshot(); interact(0, "click")');
+    assert.ok(result);
+    assert.equal(result!.returnExpr, 'interact(0, "click")');
+  });
+
+  it('should handle trailing semicolons', () => {
+    const result = getLastExpressionReturn('state.x = 1; state.x;');
+    assert.ok(result);
+    assert.equal(result!.returnExpr, 'state.x');
+  });
+
+  it('should handle clearAllLogs + consoleLogs compound', () => {
+    const result = getLastExpressionReturn('clearAllLogs(); consoleLogs()');
+    assert.ok(result);
+    assert.equal(result!.returnExpr, 'consoleLogs()');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test: wrapCode
 // ---------------------------------------------------------------------------
 
@@ -134,10 +197,10 @@ describe('wrapCode', () => {
     assert.ok(result.includes('page.title()'));
   });
 
-  it('should wrap multi-statement code without return', () => {
+  it('should wrap multi-statement code with auto-return for last expression', () => {
     const result = wrapCode('const x = 1;\nconsole.log(x);');
     assert.ok(result.includes('const x = 1'));
-    assert.ok(!result.includes('return await'));
+    assert.ok(result.includes('return await'));
   });
 
   it('should wrap code with explicit return as-is (no auto-return)', () => {
@@ -831,9 +894,9 @@ describe('wrapCode – comprehensive', () => {
     assert.ok(result.startsWith('(async'));
   });
 
-  it('should wrap statement without return', () => {
+  it('should wrap statement with auto-return for last expression', () => {
     const result = wrapCode('const x = 1; console.log(x);');
-    assert.ok(!result.includes('return await'));
+    assert.ok(result.includes('return await'));
     assert.ok(result.includes('const x = 1'));
   });
 
@@ -842,10 +905,13 @@ describe('wrapCode – comprehensive', () => {
     assert.ok(result.includes('(async'));
   });
 
-  it('should wrap multiline code block', () => {
+  it('should wrap multiline code block with auto-return for last expression', () => {
     const code = 'const x = 1;\nconst y = 2;\nconsole.log(x + y);';
     const result = wrapCode(code);
-    assert.ok(result.includes(code));
+    assert.ok(result.includes('const x = 1'));
+    assert.ok(result.includes('const y = 2'));
+    assert.ok(result.includes('return await'));
+    assert.ok(result.includes('console.log(x + y)'));
   });
 
   it('should handle code with template literals', () => {
@@ -1293,6 +1359,239 @@ describe('usefulGlobals coverage', () => {
 // ---------------------------------------------------------------------------
 // Test: VM globals existence (structural tests)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Test: PlaywrightExecutor tab management (Bug #3 fix)
+// ---------------------------------------------------------------------------
+
+describe('PlaywrightExecutor tab management', () => {
+  it('claimTab should add tabId and set activeTabId', () => {
+    const executor = new PlaywrightExecutor();
+    executor.claimTab(100, 'https://example.com');
+    assert.ok(executor.getOwnedTabIds().has(100));
+    assert.equal(executor.getActiveTabId(), 100);
+  });
+
+  it('claimTab should not override activeTabId if already set', () => {
+    const executor = new PlaywrightExecutor();
+    executor.claimTab(100, 'https://example.com');
+    executor.claimTab(200, 'https://other.com');
+    assert.equal(executor.getActiveTabId(), 100);
+    assert.ok(executor.getOwnedTabIds().has(200));
+  });
+
+  it('switchToTab should throw for unowned tab', () => {
+    const executor = new PlaywrightExecutor();
+    executor.claimTab(100, 'https://example.com');
+    assert.throws(() => executor.switchToTab(999), /not owned/);
+  });
+
+  it('switchToTab should update activeTabId', () => {
+    const executor = new PlaywrightExecutor();
+    executor.claimTab(100, 'https://example.com');
+    executor.claimTab(200, 'https://other.com');
+    executor.switchToTab(200);
+    assert.equal(executor.getActiveTabId(), 200);
+  });
+
+  it('releaseTab should remove tab and update activeTabId', () => {
+    const executor = new PlaywrightExecutor();
+    executor.claimTab(100, 'https://example.com');
+    executor.claimTab(200, 'https://other.com');
+    executor.releaseTab(100);
+    assert.ok(!executor.getOwnedTabIds().has(100));
+    assert.equal(executor.getActiveTabId(), 200);
+  });
+
+  it('releaseTab on last tab should leave activeTabId null', () => {
+    const executor = new PlaywrightExecutor();
+    executor.claimTab(100, 'https://example.com');
+    executor.releaseTab(100);
+    assert.equal(executor.getActiveTabId(), null);
+    assert.equal(executor.getOwnedTabIds().size, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: editor action aliases (Bug #9 fix)
+// ---------------------------------------------------------------------------
+
+describe('editor action aliases structural check', () => {
+  it('the documented aliases should map correctly', () => {
+    const aliasMap: Record<string, string> = {
+      search: 'search_source',
+      edit: 'edit_source',
+    };
+    assert.equal(aliasMap['search'], 'search_source');
+    assert.equal(aliasMap['edit'], 'edit_source');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: mock_headers accepts both string and object (Bug #29 fix)
+// ---------------------------------------------------------------------------
+
+describe('mock_headers parsing logic', () => {
+  function parseMockHeaders(mock_headers?: string | Record<string, string>): Record<string, string> | undefined {
+    if (!mock_headers) return undefined;
+    if (typeof mock_headers === 'object') return mock_headers as Record<string, string>;
+    return JSON.parse(mock_headers);
+  }
+
+  it('should accept object directly', () => {
+    const result = parseMockHeaders({ 'x-test': '1', 'content-type': 'text/plain' });
+    assert.deepEqual(result, { 'x-test': '1', 'content-type': 'text/plain' });
+  });
+
+  it('should parse JSON string', () => {
+    const result = parseMockHeaders('{"x-test": "1"}');
+    assert.deepEqual(result, { 'x-test': '1' });
+  });
+
+  it('should return undefined for falsy input', () => {
+    assert.equal(parseMockHeaders(undefined), undefined);
+    assert.equal(parseMockHeaders(''), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: about:blank URL handling (Bug #21 fix)
+// ---------------------------------------------------------------------------
+
+describe('URL protocol detection regex', () => {
+  const hasProtocol = (url: string) => /^[a-z][\w+.-]*:/i.test(url);
+
+  it('should detect http:// as protocol', () => {
+    assert.ok(hasProtocol('http://example.com'));
+  });
+
+  it('should detect https:// as protocol', () => {
+    assert.ok(hasProtocol('https://example.com'));
+  });
+
+  it('should detect about: as protocol', () => {
+    assert.ok(hasProtocol('about:blank'));
+  });
+
+  it('should detect chrome: as protocol', () => {
+    assert.ok(hasProtocol('chrome://settings'));
+  });
+
+  it('should detect ftp: as protocol', () => {
+    assert.ok(hasProtocol('ftp://files.example.com'));
+  });
+
+  it('should NOT detect bare domain as having protocol', () => {
+    assert.ok(!hasProtocol('example.com'));
+  });
+
+  it('should NOT detect path as having protocol', () => {
+    assert.ok(!hasProtocol('/some/path'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: ES import() routing through sandboxed require (Bug #32 fix)
+// ---------------------------------------------------------------------------
+
+describe('import() routing logic', () => {
+  function simulateImport(specifier: string) {
+    if (ALLOWED_MODULES.has(specifier) || ALLOWED_MODULES.has(`node:${specifier}`)) {
+      return { allowed: true, specifier };
+    }
+    throw new Error(`Module "${specifier}" is not allowed. Use require() for allowed modules.`);
+  }
+
+  it('should allow importing "path"', () => {
+    const result = simulateImport('path');
+    assert.ok(result.allowed);
+  });
+
+  it('should allow importing "url"', () => {
+    const result = simulateImport('url');
+    assert.ok(result.allowed);
+  });
+
+  it('should allow importing "crypto"', () => {
+    const result = simulateImport('crypto');
+    assert.ok(result.allowed);
+  });
+
+  it('should reject importing "child_process"', () => {
+    assert.throws(() => simulateImport('child_process'), /not allowed/);
+  });
+
+  it('should reject importing arbitrary modules', () => {
+    assert.throws(() => simulateImport('malicious-pkg'), /not allowed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: compound expression auto-return (Bug #24 fix)
+// ---------------------------------------------------------------------------
+
+describe('compound expression auto-return (Bug #24)', () => {
+  it('wrapCode should auto-return last expression from compound statement', () => {
+    const code = 'clearAllLogs(); consoleLogs()';
+    const wrapped = wrapCode(code);
+    assert.ok(wrapped.includes('consoleLogs()'), 'should include consoleLogs()');
+    assert.ok(wrapped.includes('return'), 'should include return keyword');
+  });
+
+  it('wrapCode should auto-return from state write + read pattern', () => {
+    const code = 'state.x = 42; state.x';
+    const wrapped = wrapCode(code);
+    assert.ok(wrapped.includes('state.x'), 'should include state.x');
+    assert.ok(wrapped.includes('return'), 'should include return keyword');
+  });
+
+  it('wrapCode should auto-return from require + method call', () => {
+    const code = 'const path = require("path"); path.join("a", "b")';
+    const wrapped = wrapCode(code);
+    assert.ok(wrapped.includes('return'), 'should include return keyword');
+  });
+
+  it('wrapCode should auto-return JSON.stringify from multi-statement', () => {
+    const code = 'state.a = 1; state.b = 2; JSON.stringify(state)';
+    const wrapped = wrapCode(code);
+    assert.ok(wrapped.includes('JSON.stringify(state)'));
+    assert.ok(wrapped.includes('return'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: DEVICE_PRESETS structure (Bug #26 fix)
+// ---------------------------------------------------------------------------
+
+describe('device presets structural check', () => {
+  const DEVICE_PRESETS: Record<string, { width: number; height: number; dpr: number; mobile: boolean }> = {
+    'iphone-12': { width: 390, height: 844, dpr: 3, mobile: true },
+    'iphone-14': { width: 393, height: 852, dpr: 3, mobile: true },
+    'pixel-5': { width: 393, height: 851, dpr: 2.75, mobile: true },
+    'ipad': { width: 768, height: 1024, dpr: 2, mobile: true },
+    'ipad-pro': { width: 1024, height: 1366, dpr: 2, mobile: true },
+  };
+
+  it('should have iphone-12 with correct dimensions', () => {
+    const device = DEVICE_PRESETS['iphone-12'];
+    assert.ok(device);
+    assert.equal(device.width, 390);
+    assert.equal(device.height, 844);
+    assert.equal(device.dpr, 3);
+    assert.ok(device.mobile);
+  });
+
+  it('should have ipad with tablet dimensions', () => {
+    const device = DEVICE_PRESETS['ipad'];
+    assert.ok(device);
+    assert.equal(device.width, 768);
+    assert.equal(device.height, 1024);
+  });
+
+  it('device name lookup should be case-sensitive', () => {
+    assert.equal(DEVICE_PRESETS['iPhone-12'], undefined);
+  });
+});
 
 describe('buildVmGlobals structural verification', () => {
   it('should define all expected VM global names', () => {

@@ -21,6 +21,7 @@ import {
   formatError,
   withTimeout,
   type ExecuteResult,
+  type ExecuteScreenshot,
 } from './pw-executor.js';
 import {
   buildDashboardStateCode,
@@ -156,6 +157,23 @@ async function getOrCreateExecutor(agentId?: string): Promise<PlaywrightExecutor
   return executorManager.getOrCreate(sessionId);
 }
 
+async function executeViaRelay(code: string, timeout: number): Promise<ExecuteResult> {
+  const port = getRelayPort();
+  const mcpSessionId = `mcp-${getEffectiveClientId() || 'default'}`;
+  const resp = await fetch(`http://localhost:${port}/cli/execute`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId: mcpSessionId, code, timeout }),
+  });
+  const body = await resp.json() as Record<string, unknown>;
+  return {
+    text: (body.text as string) || '',
+    images: (body.images as Array<{ data: string; mimeType: string }>) || [],
+    screenshots: (body.screenshots as ExecuteScreenshot[]) || [],
+    isError: (body.isError as boolean) || false,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // MCP result formatting
 // ---------------------------------------------------------------------------
@@ -190,7 +208,7 @@ async function handleTabAction(
   const port = getRelayPort();
   const sessionId = args.session_id as string | undefined;
   if (sessionId) activeAgentId = sessionId;
-  const effectiveClientId = getEffectiveClientId(sessionId);
+  const effectiveClientId = getEffectiveClientId(sessionId || activeAgentId || undefined);
 
   const mySessionId = `mcp-${effectiveClientId || 'default'}`;
 
@@ -254,8 +272,28 @@ async function handleTabAction(
             const executor = await getOrCreateExecutor();
             executor.claimTab(result.tabId, url);
           } else {
-            const claimErr = await claimResp.json().catch(() => ({}));
-            claimStatus = `claim failed: ${(claimErr as any).error || claimResp.status}`;
+            if (create && url && !result.created) {
+              const fallback = await requestConnectTab(port, { url, create: true, forceCreate: true });
+              if (fallback.success && fallback.created && fallback.tabId != null) {
+                result = fallback;
+                const fc = await fetch(`http://localhost:${port}/cli/tab/claim`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ tabId: fallback.tabId, sessionId: mySessionId }),
+                });
+                if (fc.ok) {
+                  claimStatus = 'claimed (new tab created as fallback)';
+                  const executor = await getOrCreateExecutor();
+                  executor.claimTab(fallback.tabId, url);
+                } else {
+                  claimStatus = 'fallback tab created but claim failed';
+                }
+              }
+            }
+            if (claimStatus === 'unclaimed') {
+              const claimErr = await claimResp.json().catch(() => ({}));
+              claimStatus = `claim failed: ${(claimErr as any).error || claimResp.status}`;
+            }
           }
         } catch (e: any) {
           claimStatus = `claim failed: ${e.message}`;
@@ -311,16 +349,18 @@ async function handleTabAction(
     case 'release': {
       const releaseTabId = args.tabId as number | undefined;
       if (releaseTabId) {
+        let released = false;
         try {
-          await fetch(`http://localhost:${port}/cli/tab/release`, {
+          const resp = await fetch(`http://localhost:${port}/cli/tab/release`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tabId: releaseTabId, sessionId: mySessionId }),
           });
+          released = resp.ok;
         } catch {}
         const executor = await getOrCreateExecutor();
         executor.releaseTab(releaseTabId);
-        return { content: [{ type: 'text', text: `Tab ${releaseTabId} released.` }] };
+        return { content: [{ type: 'text', text: released ? `Tab ${releaseTabId} released.` : `Tab ${releaseTabId} not owned by current session (${mySessionId}).` }] };
       }
       const targets = await getTargets(port);
       let releasedCount = 0;
@@ -366,7 +406,7 @@ async function getTargets(port: number): Promise<TargetListItem[]> {
   }
 }
 
-async function requestConnectTab(port: number, params: { url?: string; tabId?: number; create?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
+async function requestConnectTab(port: number, params: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
   try {
     const response = await fetch(`http://localhost:${port}/connect-tab`, {
       method: 'POST',
@@ -480,22 +520,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter: code' }) }], isError: true };
       }
       await ensureRelayServer();
-      const mcpSessionId = `mcp-${getEffectiveClientId() || 'default'}`;
-      fetch(`http://localhost:${getRelayPort()}/cli/session/activity`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: mcpSessionId }),
-      }).catch(() => {});
-      const executor = await getOrCreateExecutor();
-      const result = await executor.execute(code, timeout);
+      const result = await executeViaRelay(code, timeout);
       return formatMcpResult(result);
     }
 
     if (name === 'reset') {
+      const port = getRelayPort();
+      const sessionsToRelease = new Set<string>();
+      for (const [, sid] of agentSessions) sessionsToRelease.add(`mcp-${sid}`);
+      sessionsToRelease.add(`mcp-${getEffectiveClientId() || 'default'}`);
+
+      for (const sid of sessionsToRelease) {
+        try {
+          await fetch(`http://localhost:${port}/cli/session/delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: sid }),
+          });
+        } catch { /* relay may not be running */ }
+      }
+
       await executorManager.resetAll();
       agentSessions.clear();
       activeAgentId = null;
-      return { content: [{ type: 'text', text: 'Connection reset. All state cleared (console logs, network entries, Playwright state, debugger, intercept rules, snapshots, sessions).' }] };
+      return { content: [{ type: 'text', text: 'Connection reset. All state and tab ownership cleared.' }] };
     }
 
     if (name === 'single_spa') {
@@ -504,7 +552,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const url = args.url as string | undefined;
 
       await ensureRelayServer();
-      const executor = await getOrCreateExecutor();
 
       let code: string;
       switch (action) {
@@ -535,7 +582,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: formatError({ error: `Unknown single_spa action: ${action}`, hint: 'Valid: status, override_set, override_remove, override_enable, override_disable, override_reset_all, mount, unmount, unload' }) }], isError: true };
       }
 
-      const result = await executor.execute(code);
+      const result = await executeViaRelay(code, 30000);
       return formatMcpResult(result);
     }
 

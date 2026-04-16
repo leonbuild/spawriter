@@ -49,6 +49,7 @@ import browser from "webextension-polyfill";
 
   function isRestrictedUrl(url) {
     if (!url) return false;
+    if (url === 'about:blank') return false;
     return (
       url.startsWith("chrome://") ||
       url.startsWith("chrome-extension://") ||
@@ -915,32 +916,35 @@ import browser from "webextension-polyfill";
       }
 
       if (url) {
-        const allTabs = await browser.tabs.query({});
-        let match = allTabs.find(
-          (t) => t.url && t.url.includes(url) && !isRestrictedUrl(t.url)
-        );
-        if (!match) {
-          match = allTabs.find(
-            (t) =>
-              t.title &&
-              t.title.toLowerCase().includes(url.toLowerCase()) &&
-              !isRestrictedUrl(t.url)
+        const forceCreate = message.params?.forceCreate;
+        if (!forceCreate) {
+          const allTabs = await browser.tabs.query({});
+          let match = allTabs.find(
+            (t) => t.url && t.url.includes(url) && !isRestrictedUrl(t.url)
           );
-        }
-
-        if (match) {
-          const needsAttach = !attachedTabs.has(match.id) || !(await isDebuggerAttached(match.id));
-          if (needsAttach) {
-            if (attachedTabs.has(match.id)) {
-              emitDetachedFromTarget(match.id, "stale-entry");
-            }
-            await connectTab(match.id);
+          if (!match) {
+            match = allTabs.find(
+              (t) =>
+                t.title &&
+                t.title.toLowerCase().includes(url.toLowerCase()) &&
+                !isRestrictedUrl(t.url)
+            );
           }
-          return { success: true, tabId: match.id };
+
+          if (match) {
+            const needsAttach = !attachedTabs.has(match.id) || !(await isDebuggerAttached(match.id));
+            if (needsAttach) {
+              if (attachedTabs.has(match.id)) {
+                emitDetachedFromTarget(match.id, "stale-entry");
+              }
+              await connectTab(match.id);
+            }
+            return { success: true, tabId: match.id };
+          }
         }
 
-        if (create) {
-          const fullUrl = url.startsWith("http") ? url : `https://${url}`;
+        if (create || forceCreate) {
+          const fullUrl = /^[a-z][\w+.-]*:/i.test(url) ? url : `https://${url}`;
           const newTab = await browser.tabs.create({ url: fullUrl, active: false });
           await sleep(1000);
           await connectTab(newTab.id);

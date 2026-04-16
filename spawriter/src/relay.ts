@@ -75,6 +75,20 @@ const sessionActivity = new Map<string, number>();
 const sessionToClientId = new Map<string, string>();
 const pwClientToSession = new Map<string, string>();
 
+// ---------------------------------------------------------------------------
+// Virtual CDP session multiplexing — enables newCDPSession() through relay
+// ---------------------------------------------------------------------------
+// When Playwright calls newCDPSession(page), it sends:
+//   1. Target.attachToBrowserTarget → returns virtual browser session
+//   2. Target.attachToTarget via that browser session → returns virtual page session
+// Commands on virtual page sessions are translated to real session IDs.
+// Events for real sessions are duplicated to all mapped virtual sessions.
+
+const virtualBrowserSessions = new Set<string>();
+const virtualToRealSession = new Map<string, string>();
+const realToVirtualSessions = new Map<string, Set<string>>();
+let virtualSessionCounter = 0;
+
 function claimTab(tabId: number, sessionId: string, force?: boolean): { ok: boolean; owner?: string } {
   const existing = tabOwners.get(tabId);
   if (existing && existing.sessionId !== sessionId) {
@@ -333,6 +347,33 @@ app.get('/json/list', (c) => {
   return c.json(targets);
 });
 
+function sendExtensionCommand(method: string, params?: Record<string, unknown>, timeoutMs = 10000): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    if (!isExtensionConnected()) {
+      reject(new Error('Extension not connected'));
+      return;
+    }
+    const relayId = nextExtensionRequestId++;
+    const timeoutId = setTimeout(() => {
+      pendingExtensionCmdRequests.delete(relayId);
+      reject(new Error(`Extension command ${method} timed out`));
+    }, timeoutMs);
+
+    const mockWs = {
+      send(data: string) {
+        clearTimeout(timeoutId);
+        pendingExtensionCmdRequests.delete(relayId);
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error('Invalid response from extension')); }
+      },
+      readyState: 1,
+    } as unknown as WebSocket;
+
+    pendingExtensionCmdRequests.set(relayId, { ws: mockWs, timeoutId });
+    sendToExtension({ id: relayId, method, params });
+  });
+}
+
 function sendToExtension(message: unknown): void {
   if (extensionWs?.readyState === WebSocket.OPEN) {
     extensionWs.send(JSON.stringify(message));
@@ -496,7 +537,14 @@ function addPendingRequest(
 }
 
 function sendAttachedToTargetEvents(clientId: string): void {
+  // Only expose targets that this client's session owns (or unclaimed targets)
+  // to prevent Playwright from initializing pages it can't control
+  const sessionId = pwClientToSession.get(clientId);
   for (const target of attachedTargets.values()) {
+    if (target.tabId != null && sessionId) {
+      const owner = tabOwners.get(target.tabId);
+      if (owner && owner.sessionId !== sessionId) continue;
+    }
     const targetInfo = buildTargetInfo(target);
     sendToCDPClient(clientId, {
       method: 'Target.attachedToTarget',
@@ -513,7 +561,12 @@ function sendAttachedToTargetEvents(clientId: string): void {
 }
 
 function sendTargetCreatedEvents(clientId: string): void {
+  const sessionId = pwClientToSession.get(clientId);
   for (const target of attachedTargets.values()) {
+    if (target.tabId != null && sessionId) {
+      const owner = tabOwners.get(target.tabId);
+      if (owner && owner.sessionId !== sessionId) continue;
+    }
     const targetInfo = buildTargetInfo(target);
     sendToCDPClient(clientId, {
       method: 'Target.targetCreated',
@@ -672,6 +725,13 @@ function handleServerCdpCommand(
       return true;
     }
 
+    case 'Target.attachToBrowserTarget': {
+      const vbsId = `vbs-${Date.now()}-${++virtualSessionCounter}`;
+      virtualBrowserSessions.add(vbsId);
+      sendCdpResponse(clientId, { id, sessionId, result: { sessionId: vbsId } });
+      return true;
+    }
+
     case 'Target.attachToTarget': {
       const requestedTargetId = (params as { targetId?: string } | undefined)?.targetId;
       if (!requestedTargetId) {
@@ -689,6 +749,19 @@ function handleServerCdpCommand(
         return true;
       }
 
+      // If sent through a virtual browser session, create a virtual page session
+      // that maps to the real one — this enables CDP event forwarding
+      if (sessionId && virtualBrowserSessions.has(sessionId)) {
+        const vpsId = `vps-${Date.now()}-${++virtualSessionCounter}`;
+        virtualToRealSession.set(vpsId, target.sessionId);
+        if (!realToVirtualSessions.has(target.sessionId)) {
+          realToVirtualSessions.set(target.sessionId, new Set());
+        }
+        realToVirtualSessions.get(target.sessionId)!.add(vpsId);
+        sendCdpResponse(clientId, { id, sessionId, result: { sessionId: vpsId } });
+        return true;
+      }
+
       sendCdpResponse(clientId, {
         id,
         sessionId,
@@ -696,6 +769,7 @@ function handleServerCdpCommand(
       });
       return true;
     }
+
 
     // -----------------------------------------------------------------------
     // Tab Ownership commands
@@ -916,8 +990,10 @@ function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: 
   if (clientId.startsWith('pw-')) {
     const boundSession = pwClientToSession.get(clientId);
     if (boundSession === owner.sessionId) return true;
+    if (boundSession === undefined) return true;
   }
 
+  log(`OWNERSHIP BLOCKED: client=${clientId}, cdpSession=${cdpSessionId}, tabId=${tabId}, owner=${owner.sessionId}, sessionToClientId=${ownerClientId}, pwBound=${pwClientToSession.get(clientId)}`);
   sendCdpError(clientId, {
     id,
     sessionId: cdpSessionId,
@@ -932,6 +1008,15 @@ function routeCdpEvent(method: string, params: unknown, sessionId?: string): voi
     broadcastToCDPClients({ method, params, sessionId });
     return;
   }
+
+  const sendToPwClients = (sid: string) => {
+    for (const [cid, client] of cdpClients) {
+      if (cid.startsWith('pw-') && client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(JSON.stringify({ method, params, sessionId: sid }));
+      }
+    }
+  };
+
   const tabId = resolveTabIdFromSession(sessionId);
   if (tabId != null) {
     const owner = tabOwners.get(tabId);
@@ -940,15 +1025,21 @@ function routeCdpEvent(method: string, params: unknown, sessionId?: string): voi
       if (ownerClientId) {
         sendToCDPClient(ownerClientId, { method, params, sessionId });
       }
-      for (const [cid, client] of cdpClients) {
-        if (cid.startsWith('pw-') && client.ws.readyState === WebSocket.OPEN) {
-          client.ws.send(JSON.stringify({ method, params, sessionId }));
-        }
+      sendToPwClients(sessionId);
+      // Duplicate events to all virtual sessions mapped to this real session
+      const virtualSessions = realToVirtualSessions.get(sessionId);
+      if (virtualSessions) {
+        for (const vpsId of virtualSessions) sendToPwClients(vpsId);
       }
       return;
     }
   }
   broadcastToCDPClients({ method, params, sessionId });
+  // Also broadcast to virtual sessions
+  const virtualSessions = realToVirtualSessions.get(sessionId);
+  if (virtualSessions) {
+    for (const vpsId of virtualSessions) sendToPwClients(vpsId);
+  }
 }
 
 function handleCDPMessage(data: Buffer, clientId: string) {
@@ -963,13 +1054,18 @@ function handleCDPMessage(data: Buffer, clientId: string) {
         return;
       }
 
-      if (!checkOwnership(clientId, params.sessionId, id)) return;
+      // Translate virtual session IDs to real ones
+      const origSessionId = params.sessionId;
+      const realSid = origSessionId ? (virtualToRealSession.get(origSessionId) ?? origSessionId) : origSessionId;
+      if (realSid !== origSessionId) params.sessionId = realSid;
+
+      if (!checkOwnership(clientId, realSid, id)) return;
 
       const relayId = nextExtensionRequestId++;
       if (!isExtensionConnected()) {
         sendCdpError(clientId, {
           id,
-          sessionId: params.sessionId,
+          sessionId: origSessionId,
           error: 'Extension not connected',
         });
         return;
@@ -977,7 +1073,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       addPendingRequest(relayId, {
         clientId,
         clientMessageId: id,
-        sessionId: params.sessionId,
+        sessionId: origSessionId,  // Keep virtual ID for response routing
       });
       sendToExtension({
         id: relayId,
@@ -1005,7 +1101,10 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       return;
     }
 
-    if (!checkOwnership(clientId, sessionId, id)) return;
+    // Translate virtual session IDs to real ones before forwarding
+    const realSessionId = sessionId ? (virtualToRealSession.get(sessionId) ?? sessionId) : sessionId;
+
+    if (!checkOwnership(clientId, realSessionId, id)) return;
 
     const relayId = nextExtensionRequestId++;
     if (!isExtensionConnected()) {
@@ -1019,7 +1118,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
     addPendingRequest(relayId, {
       clientId,
       clientMessageId: id,
-      sessionId,
+      sessionId,  // Keep the original (virtual) session ID for the response
     });
 
     sendToExtension({
@@ -1027,7 +1126,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       method: 'forwardCDPCommand',
       params: {
         method,
-        sessionId,
+        sessionId: realSessionId,  // Forward with real session ID
         params,
       },
     });
@@ -1126,19 +1225,59 @@ app.post('/cli/execute', async (c) => {
     sessionActivity.set(body.sessionId, Date.now());
 
     if (executor.getActiveTabId() == null) {
-      for (const target of attachedTargets.values()) {
-        if (target.tabId != null && !tabOwners.has(target.tabId)) {
-          const claim = claimTab(target.tabId, body.sessionId);
-          if (claim.ok) {
-            executor.claimTab(target.tabId, target.targetInfo?.url);
-            break;
+      const ownedTabId = getOwnedTabs(body.sessionId)[0];
+      if (ownedTabId != null) {
+        const url = [...attachedTargets.values()].find(t => t.tabId === ownedTabId)?.targetInfo?.url;
+        executor.claimTab(ownedTabId, url);
+      } else if (isExtensionConnected()) {
+        // Try to create a dedicated tab for this session
+        let tabCreated = false;
+        try {
+          const result = await sendExtensionCommand('connectTabByMatch', {
+            url: 'about:blank',
+            forceCreate: true,
+          });
+          if (result.success && typeof result.tabId === 'number') {
+            for (let i = 0; i < 20; i++) {
+              const found = [...attachedTargets.values()].find(t => t.tabId === result.tabId);
+              if (found) break;
+              await new Promise(r => setTimeout(r, 200));
+            }
+            const claim = claimTab(result.tabId as number, body.sessionId);
+            if (claim.ok) {
+              const tabUrl = [...attachedTargets.values()].find(t => t.tabId === result.tabId)?.targetInfo?.url || 'about:blank';
+              executor.claimTab(result.tabId as number, tabUrl);
+              tabCreated = true;
+            }
+          }
+        } catch (e: any) {
+          log(`Tab creation failed for session ${body.sessionId}: ${e.message}`);
+        }
+        // Fallback: claim first unclaimed tab if creation failed
+        if (!tabCreated) {
+          for (const target of attachedTargets.values()) {
+            if (target.tabId == null) continue;
+            const owner = getTabOwner(target.tabId);
+            if (!owner) {
+              const claim = claimTab(target.tabId, body.sessionId);
+              if (claim.ok) {
+                executor.claimTab(target.tabId, target.targetInfo?.url);
+                break;
+              }
+            }
           }
         }
       }
     }
 
     const activeTabId = executor.getActiveTabId();
-    if (activeTabId != null) {
+    if (activeTabId == null) {
+      return c.json({
+        text: 'No tab connected to this session. Use the CLI: spawriter -s <id> tab connect <url>',
+        images: [], screenshots: [], isError: true,
+      }, 400);
+    }
+    {
       const owner = getTabOwner(activeTabId);
       if (owner && owner !== body.sessionId) {
         return c.json({
@@ -1154,6 +1293,7 @@ app.post('/cli/execute', async (c) => {
     }
     executor.onCdpClientCreated = (newClientId: string) => {
       pwClientToSession.set(newClientId, body.sessionId);
+      sessionToClientId.set(body.sessionId, newClientId);
     };
 
     const result = await executor.execute(body.code, body.timeout || 10000);
