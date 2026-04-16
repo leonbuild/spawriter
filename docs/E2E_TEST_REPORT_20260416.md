@@ -551,7 +551,7 @@ These observations emerged during testing but don't rise to the level of numbere
 
 ## Full Test Execution Log
 
-Total commands executed: 425 across MCP and CLI (151 initial + 15 supplementary + 18 verification + 46 CDP/isolation + 195 comprehensive suite).
+Total commands executed: 455 across MCP and CLI (151 initial + 15 supplementary + 18 verification + 46 CDP/isolation + 195 comprehensive suite + 30 fix verification).
 
 ### Misc Failed Attempts (not in numbered sequence)
 
@@ -1270,11 +1270,63 @@ All tests executed via MCP unless marked CLI. Each test was executed and verifie
 | CLI Session Management | 10 | 10 | 0 | 0 |
 | **TOTAL** | **195** | **195** | **0** | **0** |
 
-**All 195 comprehensive tests pass. Previous 4 warnings have been fixed:**
+**All 195 + 30 = 225 comprehensive tests pass (0 warnings, 0 failures).**
+
+Previous 4 warnings fixed:
 - ~~#307~~: `set_cookie` now auto-derives domain from `page.url()` when no explicit domain is provided
 - ~~#308~~: `get_local_storage` now returns a structured error message on restricted pages instead of crashing
 - ~~#372~~: `require("child_process")` now shows a clear `ModuleNotAllowedError` with list of allowed modules
 - ~~#392~~: `clearCacheAndReload({clear:"session_storage"})` now uses `page.evaluate("sessionStorage.clear()")` instead of unsupported CDP command
+
+### 23. Cookie Auto-Domain Fix (Tests 426-433)
+
+| # | Path | Command | Expected | Actual | ✅/❌ |
+|---|------|---------|----------|--------|-------|
+| 426 | MCP | `storage("set_cookie", {name:"t", value:"v"})` no domain | Auto-derive domain from page.url() | "Cookie t set." | ✅ |
+| 427 | MCP | `storage("get_cookies")` after #426 | Cookie visible with auto domain | `t=v (domain=submit.the-innovation-academy.org)` | ✅ |
+| 428 | MCP | `storage("delete_cookie", {name:"t"})` no domain | Auto-derive domain | "Cookie t deleted." | ✅ |
+| 429 | MCP | `storage("get_cookies")` after #428 | Cookie removed | "No cookies found for current page." | ✅ |
+| 430 | MCP | `storage("set_cookie", {name:"e", value:"v", domain:"submit.the-innovation-academy.org"})` | Explicit domain still works | "Cookie e set." | ✅ |
+| 431 | MCP | `storage("delete_cookie", {name:"e", domain:"submit.the-innovation-academy.org"})` | Explicit domain delete | "Cookie e deleted." | ✅ |
+| 432 | MCP | `storage("get_local_storage")` on https page | Normal access | "localStorage (5 entries): ..." | ✅ |
+| 433 | MCP | `storage("get_local_storage", {key:"usp_loginType"})` | Specific key | "localStorage[usp_loginType] = local" | ✅ |
+
+### 24. Storage on Restricted Pages Fix (Tests 434-437)
+
+| # | Path | Command | Expected | Actual | ✅/❌ |
+|---|------|---------|----------|--------|-------|
+| 434 | MCP | `storage("get_local_storage")` on normal page | Entries returned | 5 entries with auth tokens, settings | ✅ |
+| 435 | MCP | `storage("get_session_storage")` on normal page | Empty or entries | "sessionStorage is empty." | ✅ |
+| 436 | MCP | URL check before storage access | Non-http pages rejected | Structured error with "Navigate to an http/https page first" | ✅ |
+| 437 | MCP | `storage("get_local_storage")` after navigation | Works after navigating back | localStorage entries returned | ✅ |
+
+### 25. clearCacheAndReload session_storage Fix (Tests 438-443)
+
+| # | Path | Command | Expected | Actual | ✅/❌ |
+|---|------|---------|----------|--------|-------|
+| 438 | MCP | `clearCacheAndReload({clear:"session_storage", reload:false})` | session_storage cleared via evaluate | "Cleared: session_storage" | ✅ |
+| 439 | MCP | `clearCacheAndReload({clear:"local_storage", reload:false})` | local_storage cleared via CDP | "Cleared: local_storage (https://...)" | ✅ |
+| 440 | MCP | `clearCacheAndReload({clear:"local_storage,session_storage", reload:false})` | Both cleared | "Cleared: local_storage (...); session_storage" | ✅ |
+| 441 | MCP | `clearCacheAndReload({clear:"cache,local_storage,session_storage", reload:true})` | All three + reload | "Cleared: cache ...; local_storage ...; session_storage; page reloaded" | ✅ |
+| 442 | MCP | `page.url()` after #441 reload | Page still accessible | `https://submit.the-innovation-academy.org/` | ✅ |
+| 443 | MCP | `clearCacheAndReload({clear:"cache", reload:true})` | Cache only + reload | "Cleared: cache ...; page reloaded (cache bypassed)" | ✅ |
+
+### 26. Module Sandbox Security (Tests 444-455)
+
+| # | Path | Command | Expected | Actual | ✅/❌ |
+|---|------|---------|----------|--------|-------|
+| 444 | MCP | `require("child_process")` | ModuleNotAllowedError | Clear error: "Module child_process is not allowed in the sandbox" | ✅ |
+| 445 | MCP | `require("net")` | ModuleNotAllowedError | Clear error: "Module net is not allowed" | ✅ |
+| 446 | MCP | `require("nonexistent-module")` | ModuleNotAllowedError | Clear error with allowed module list | ✅ |
+| 447 | MCP | `require("path").join("a","b")` | Allowed module works | `"a\\b"` | ✅ |
+| 448 | MCP | `require("crypto").randomUUID()` | Allowed module works | Valid UUID string | ✅ |
+| 449 | MCP | `require("os").hostname()` | Allowed module works | Hostname string | ✅ |
+| 450 | MCP | `require("util").format("hello %s", "world")` | Allowed module works | `"hello world"` | ✅ |
+| 451 | MCP | `require("fs")` — returns ScopedFS | ScopedFS object | `typeof fs.readFile === "function"` | ✅ |
+| 452 | MCP | `await import("url")` | ES import allowed | Module with parse() function | ✅ |
+| 453 | MCP | `await import("path")` | ES import allowed | Module with join(), basename() | ✅ |
+| 454 | MCP | `await import("child_process")` | ES import blocked | Error: "Module child_process is not allowed" | ✅ |
+| 455 | MCP | Error message includes allowed module list | List present | "path, url, querystring, punycode, crypto, ..." | ✅ |
 
 ---
 
