@@ -124,6 +124,13 @@ export default function useImportMapOverrides() {
   const isVerifyingRef = useRef(false);
   // 新增：是否正在从已保存配置中应用到页面，避免重复触发
   const isApplyingSavedRef = useRef(false);
+  // 内部操作进行中时，禁止 detectExternalChanges 修改 savedOverrides
+  const internalOpActiveRef = useRef(false);
+  // 内部操作完成后的冷却时间戳，冷却期间也禁止 polling 修改
+  const internalOpCooldownUntilRef = useRef(0);
+  // savedOverrides 的最新值引用，供 polling 读取（避免将 savedOverrides 放入 dependency array）
+  const savedOverridesRef = useRef(savedOverrides);
+  savedOverridesRef.current = savedOverrides;
 
   if (appError) {
     throw appError;
@@ -163,13 +170,9 @@ export default function useImportMapOverrides() {
 
   // 确保页面上的 import map 与保存的状态一致（用于页面刷新/重新进入）
   async function ensureSavedOverridesApplied(reason = "unknown", overridesMap = savedOverrides) {
-    if (!importMapsEnabled) {
-      return;
-    }
+    if (!importMapsEnabled) return;
     const effectiveOverrides = overridesMap || {};
-    if (Object.keys(effectiveOverrides).length === 0) {
-      return;
-    }
+    if (Object.keys(effectiveOverrides).length === 0) return;
     if (isApplyingSavedRef.current) {
       console.debug("[spawriter] Skipping ensureSavedOverridesApplied - already running");
       return;
@@ -196,7 +199,6 @@ export default function useImportMapOverrides() {
 
       let changed = false;
 
-      // 遍历保存的配置，确保页面状态一致
       for (const [appName, saved] of Object.entries(effectiveOverrides)) {
         const expectedUrl = saved?.url;
         const expectedEnabled = saved?.enabled && !!expectedUrl;
@@ -219,7 +221,6 @@ export default function useImportMapOverrides() {
         }
       }
 
-      // 如果页面上有额外的 override 但未在 savedOverrides 中，也移除以保持一致
       for (const pageAppName of Object.keys(pageMap)) {
         if (!effectiveOverrides[pageAppName]) {
           console.debug(`[spawriter] Removing extra override ${pageAppName} not in savedOverrides (reason=${reason})`);
@@ -238,7 +239,6 @@ export default function useImportMapOverrides() {
       isApplyingSavedRef.current = false;
     }
 
-    // 需要重试时安排一次延时重试
     if (needsRetry && importMapsEnabled && Object.keys(effectiveOverrides).length > 0) {
       setTimeout(() => {
         ensureSavedOverridesApplied(`${reason}-retry`, effectiveOverrides);
@@ -248,13 +248,11 @@ export default function useImportMapOverrides() {
 
   // 验证页面状态是否与期望状态一致
   async function verifyAndSyncState(appName, expectedEnabled, expectedUrl, operationVersion) {
-    // 如果不是最新操作，跳过验证
     if (operationVersion !== currentOperationRef.current) {
       console.debug(`[spawriter] Skipping verification for outdated operation (v${operationVersion}, current: v${currentOperationRef.current})`);
       return;
     }
 
-    // 避免验证时的无限循环
     if (isVerifyingRef.current) {
       console.debug("[spawriter] Skipping verification - already verifying");
       return;
@@ -262,46 +260,21 @@ export default function useImportMapOverrides() {
 
     try {
       isVerifyingRef.current = true;
-      
-      // 等待页面加载完成
       await waitForPageLoad();
       
-      // 再次检查是否仍是最新操作
-      if (operationVersion !== currentOperationRef.current) {
-        console.debug(`[spawriter] Operation outdated after page load (v${operationVersion}, current: v${currentOperationRef.current})`);
-        return;
-      }
+      if (operationVersion !== currentOperationRef.current) return;
 
-      // 等待一小段时间让 importMapOverrides 初始化
       await delay(500);
 
-      // 获取页面上的实际状态
       const pageOverrideUrl = await getPageOverrideState(appName);
-      
-      // 判断页面状态是否正确
       const pageHasOverride = !!pageOverrideUrl;
       const shouldHaveOverride = expectedEnabled && !!expectedUrl;
 
-      console.debug(`[spawriter] Verifying state for ${appName}:`, {
-        pageHasOverride,
-        pageOverrideUrl,
-        shouldHaveOverride,
-        expectedEnabled,
-        expectedUrl,
-        operationVersion
-      });
-
-      // 如果状态不一致，需要修复
       if (pageHasOverride !== shouldHaveOverride) {
         console.warn(`[spawriter] State mismatch detected for ${appName}! Page: ${pageHasOverride}, Expected: ${shouldHaveOverride}. Resyncing...`);
         
-        // 再次检查是否仍是最新操作
-        if (operationVersion !== currentOperationRef.current) {
-          console.debug("[spawriter] Operation outdated, skipping resync");
-          return;
-        }
+        if (operationVersion !== currentOperationRef.current) return;
 
-        // 重新应用正确的状态
         let ok = true;
         if (shouldHaveOverride) {
           ok = await addOverride(appName, expectedUrl);
@@ -310,17 +283,12 @@ export default function useImportMapOverrides() {
         }
 
         if (ok) {
-          // 再次刷新页面
           await reloadWithBypassCache();
         } else {
-          // 如果仍未就绪，稍后再补偿
           setTimeout(() => {
             ensureSavedOverridesApplied("verify-retry");
           }, 400);
         }
-        
-        // 递归验证，但只验证一次（通过 isVerifyingRef 控制）
-        // 注意：这里不再递归验证，因为我们已经设置了 isVerifyingRef
       }
     } catch (err) {
       console.warn("[spawriter] Error during state verification:", err);
@@ -489,6 +457,7 @@ export default function useImportMapOverrides() {
   // 保存单个 override 到 storage，并应用到页面
   const saveOverride = useCallback(async (appName, url) => {
     try {
+      internalOpActiveRef.current = true;
       // 递增全局操作版本号
       globalOperationVersion++;
       const thisOperationVersion = globalOperationVersion;
@@ -527,11 +496,16 @@ export default function useImportMapOverrides() {
       // 使用 bypassCache 刷新，确保加载新的 override 资源
       await reloadWithBypassCache();
 
+      internalOpActiveRef.current = false;
+      internalOpCooldownUntilRef.current = Date.now() + 8000;
+
       // 页面刷新后验证状态
       setTimeout(() => {
         verifyAndSyncState(appName, true, url, thisOperationVersion);
       }, 100);
     } catch (err) {
+      internalOpActiveRef.current = false;
+      internalOpCooldownUntilRef.current = Date.now() + 8000;
       err.message = `Error saving override: ${err.message}`;
       setAppError(err);
     }
@@ -543,6 +517,7 @@ export default function useImportMapOverrides() {
       const saved = savedOverrides[appName];
       if (!saved) return;
 
+      internalOpActiveRef.current = true;
       // 递增全局操作版本号，标记这是最新的操作
       globalOperationVersion++;
       const thisOperationVersion = globalOperationVersion;
@@ -589,6 +564,9 @@ export default function useImportMapOverrides() {
       // 使用 bypassCache 刷新，确保加载正确的资源（override 或原版）
       await reloadWithBypassCache();
 
+      internalOpActiveRef.current = false;
+      internalOpCooldownUntilRef.current = Date.now() + 8000;
+
       // 页面刷新后验证状态是否正确
       // 使用 setTimeout 让刷新先开始，然后异步验证
       setTimeout(() => {
@@ -596,6 +574,8 @@ export default function useImportMapOverrides() {
       }, 100);
       
     } catch (err) {
+      internalOpActiveRef.current = false;
+      internalOpCooldownUntilRef.current = Date.now() + 8000;
       err.message = `Error toggling override: ${err.message}`;
       setAppError(err);
     }
@@ -603,6 +583,7 @@ export default function useImportMapOverrides() {
 
   // 清除已保存的 override
   const clearSavedOverride = useCallback(async (appName) => {
+    internalOpActiveRef.current = true;
     // 递增全局操作版本号
     globalOperationVersion++;
     const thisOperationVersion = globalOperationVersion;
@@ -645,6 +626,9 @@ export default function useImportMapOverrides() {
     // 无论如何都刷新页面，使用 bypassCache 确保加载原版资源
     await reloadWithBypassCache();
 
+    internalOpActiveRef.current = false;
+    internalOpCooldownUntilRef.current = Date.now() + 8000;
+
     // 页面刷新后验证状态
     setTimeout(() => {
       verifyAndSyncState(appName, false, null, thisOperationVersion);
@@ -653,6 +637,7 @@ export default function useImportMapOverrides() {
 
   // 清除所有已保存的 overrides
   const clearAllOverrides = useCallback(async () => {
+    internalOpActiveRef.current = true;
     // 递增全局操作版本号
     globalOperationVersion++;
     const thisOperationVersion = globalOperationVersion;
@@ -683,6 +668,9 @@ export default function useImportMapOverrides() {
       // 使用 bypassCache 刷新页面，确保加载原版资源
       await reloadWithBypassCache();
 
+      internalOpActiveRef.current = false;
+      internalOpCooldownUntilRef.current = Date.now() + 8000;
+
       // 对于 clearAll，我们不需要单独验证每个 app，
       // 但如果需要，可以在这里添加批量验证逻辑
       if (anyRemoveFailed) {
@@ -691,6 +679,8 @@ export default function useImportMapOverrides() {
         }, 400);
       }
     } catch (err) {
+      internalOpActiveRef.current = false;
+      internalOpCooldownUntilRef.current = Date.now() + 8000;
       err.message = `Error clearing all overrides: ${err.message}`;
       setAppError(err);
     }
@@ -744,7 +734,6 @@ export default function useImportMapOverrides() {
         setImportMapEnabled(hasImportMapsEnabled);
         await getImportMapOverrides();
         let saved = await loadSavedOverrides();
-        // Sync page-level overrides into savedOverrides (handles fresh extension install)
         saved = await importPageOverridesIfNeeded(saved);
         await ensureSavedOverridesApplied("init", saved);
       }
@@ -770,13 +759,15 @@ export default function useImportMapOverrides() {
       }
     };
 
-    // 监听从 background script 通过 port 转发的事件
     window.addEventListener("ext-content-script", handler);
     return () => window.removeEventListener("ext-content-script", handler);
   }, [importMapsEnabled, savedOverrides]);
 
   // Detect external override changes (e.g. from MCP tools) and sync savedOverrides.
-  // Polls the page's importMapOverrides.getOverrideMap() and compares with savedOverrides.
+  // Polls the page's importMapOverrides.getOverrideMap() and compares with savedOverridesRef.
+  // IMPORTANT: uses savedOverridesRef (not savedOverrides state) to avoid re-mounting
+  // the interval on every savedOverrides change, which was the root cause of the
+  // flip-flop infinite-reload bug.
   useEffect(() => {
     if (!importMapsEnabled) return;
 
@@ -785,20 +776,21 @@ export default function useImportMapOverrides() {
 
     async function detectExternalChanges() {
       if (cancelled) return;
+      if (internalOpActiveRef.current || Date.now() < internalOpCooldownUntilRef.current) return;
       try {
+        const currentSaved = savedOverridesRef.current;
         const pageMap = await getCurrentOverrideMap();
         if (cancelled || pageMap === null) return;
 
         const pageKeys = new Set(Object.keys(pageMap));
-        const savedKeys = new Set(Object.keys(savedOverrides));
+        const savedKeys = new Set(Object.keys(currentSaved));
 
         let hasChanges = false;
-        const newSavedOverrides = { ...savedOverrides };
+        const newSavedOverrides = { ...currentSaved };
 
-        // Detect new overrides added externally (e.g. by MCP)
         for (const appName of pageKeys) {
           const pageUrl = pageMap[appName];
-          const saved = savedOverrides[appName];
+          const saved = currentSaved[appName];
           if (!saved || saved.url !== pageUrl) {
             newSavedOverrides[appName] = { url: pageUrl, enabled: true };
             hasChanges = true;
@@ -808,10 +800,9 @@ export default function useImportMapOverrides() {
           }
         }
 
-        // Detect overrides removed externally
         for (const appName of savedKeys) {
-          if (savedOverrides[appName]?.enabled && !pageKeys.has(appName)) {
-            newSavedOverrides[appName] = { ...savedOverrides[appName], enabled: false };
+          if (currentSaved[appName]?.enabled && !pageKeys.has(appName)) {
+            newSavedOverrides[appName] = { ...currentSaved[appName], enabled: false };
             hasChanges = true;
           }
         }
@@ -829,13 +820,12 @@ export default function useImportMapOverrides() {
     }
 
     const timerId = setInterval(detectExternalChanges, POLL_INTERVAL_MS);
-    detectExternalChanges();
 
     return () => {
       cancelled = true;
       clearInterval(timerId);
     };
-  }, [importMapsEnabled, savedOverrides]);
+  }, [importMapsEnabled]);
 
   // ========== 原有方法 ==========
 
