@@ -188,7 +188,20 @@ function formatMcpResult(result: ExecuteResult): {
     content.push({ type: 'text', text: result.text });
   }
   for (const img of result.images) {
-    content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+    if (img.mimeType === 'image/png' || img.mimeType === 'image/jpeg') {
+      content.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+    }
+  }
+  const hasUnsupportedImages = result.images.some(i => i.mimeType !== 'image/png' && i.mimeType !== 'image/jpeg');
+  if (hasUnsupportedImages && result.screenshots && result.screenshots.length > 0) {
+    const textFallbacks: string[] = [];
+    for (const ss of result.screenshots) {
+      if (ss.snapshot) textFallbacks.push(ss.snapshot);
+      if (ss.labelCount != null) textFallbacks.push(`(${ss.labelCount} interactive elements labeled)`);
+    }
+    if (textFallbacks.length > 0) {
+      content.push({ type: 'text', text: `[Screenshot: image/webp not supported by client, text fallback below]\n${textFallbacks.join('\n')}` });
+    }
   }
   if (content.length === 0) {
     content.push({ type: 'text', text: 'Code executed successfully (no output)' });

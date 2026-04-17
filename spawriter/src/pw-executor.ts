@@ -2,6 +2,7 @@ import { chromium, type Browser, type BrowserContext, type Page } from 'playwrig
 import * as vm from 'node:vm';
 import * as util from 'node:util';
 import * as crypto from 'node:crypto';
+import * as acorn from 'acorn';
 import { getCdpUrl, getRelayPort, getRelayToken, log, error } from './utils.js';
 import {
   type AXNode,
@@ -107,18 +108,17 @@ export function isPlaywrightChannelOwner(value: unknown): boolean {
 export function getAutoReturnExpression(code: string): string | null {
   const trimmed = code.replace(/;+\s*$/, '').trim();
   if (!trimmed) return null;
-  if (/^\s*(const|let|var|function|class|if|for|while|do|switch|try|throw|import|export)\b/.test(trimmed)) return null;
-  if (/^\s*return\b/.test(trimmed)) return null;
-  const lines = trimmed.split('\n');
-  if (lines.length > 1) {
-    for (const line of lines) {
-      const stripped = line.trim();
-      if (stripped.endsWith(';') || stripped.endsWith('{') || stripped.endsWith('}')) return null;
-    }
-  }
   try {
-    new Function(`return async function() { return (${trimmed}) }`);
-    return trimmed;
+    const ast = acorn.parse(trimmed, {
+      ecmaVersion: 'latest',
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+      sourceType: 'module',
+    } as acorn.Options);
+    if (ast.body.length !== 1) return null;
+    const stmt = ast.body[0] as acorn.ExpressionStatement;
+    if (stmt.type !== 'ExpressionStatement') return null;
+    return trimmed.slice(stmt.start, stmt.end).replace(/;+\s*$/, '');
   } catch {
     return null;
   }
@@ -134,18 +134,20 @@ export function getLastExpressionReturn(code: string): { preamble: string; retur
   if (!trimmed) return null;
   if (/\breturn\b/.test(trimmed)) return null;
 
-  const lastSemicolon = trimmed.lastIndexOf(';');
-  if (lastSemicolon === -1) return null;
-
-  const preamble = trimmed.slice(0, lastSemicolon + 1);
-  const lastPart = trimmed.slice(lastSemicolon + 1).trim();
-  if (!lastPart) return null;
-
-  if (/^\s*(const|let|var|function|class|if|for|while|do|switch|try|throw|import|export)\b/.test(lastPart)) return null;
-
   try {
-    new Function(`return async function() { ${preamble} return (${lastPart}) }`);
-    return { preamble, returnExpr: lastPart };
+    const ast = acorn.parse(trimmed, {
+      ecmaVersion: 'latest',
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+      sourceType: 'module',
+    } as acorn.Options);
+    if (ast.body.length < 2) return null;
+    const lastStmt = ast.body[ast.body.length - 1] as acorn.ExpressionStatement;
+    if (lastStmt.type !== 'ExpressionStatement') return null;
+    const preamble = trimmed.slice(0, lastStmt.start).trim();
+    const returnExpr = trimmed.slice(lastStmt.start, lastStmt.end).replace(/;+\s*$/, '');
+    if (!preamble || !returnExpr) return null;
+    return { preamble, returnExpr };
   } catch {
     return null;
   }
@@ -733,9 +735,16 @@ export class PlaywrightExecutor {
       const isRecoverableContextError =
         /Execution context was destroyed/i.test(e.message) || /Cannot find context with specified id/i.test(e.message);
 
-      if (retryOnContextError && isRecoverableContextError) {
-        this.logger.log('Playwright execution context stale, retrying once...');
-        await new Promise(resolve => setTimeout(resolve, 150));
+      const isCdpSessionError = /Session.*not found|Target closed|Protocol error/i.test(e.message);
+
+      if (retryOnContextError && (isRecoverableContextError || isCdpSessionError)) {
+        const reason = isCdpSessionError ? 'CDP session stale' : 'execution context stale';
+        this.logger.log(`Playwright ${reason}, resetting connection and retrying once...`);
+        this.page = null;
+        this.cachedCdpSession = null;
+        this.isConnected = false;
+        await this.closeQuietly();
+        await new Promise(resolve => setTimeout(resolve, 300));
         return this.execute(code, timeout, false);
       }
 
@@ -1159,7 +1168,7 @@ export class PlaywrightExecutor {
             }
             await route.continue();
           });
-          return `Network interception enabled (Playwright route). ${self.networkMonitor.listInterceptRules().length} rules active.`;
+          return `Network interception enabled (Playwright route). ${self.networkMonitor.listInterceptRules().length} rules active.\nNote: browserFetch() bypasses interception. Use page.evaluate(() => fetch(...)) to test mock rules.`;
         },
         disable: async () => {
           await page.unrouteAll({ behavior: 'ignoreErrors' }).catch(() => {});
@@ -1304,6 +1313,7 @@ export class PlaywrightExecutor {
           await relayCdp('Debugger.enable');
           await relayCdp('Runtime.enable');
           self.debugger.enabled = true;
+          await new Promise(r => setTimeout(r, 300));
           return 'Debugger enabled. Scripts will be parsed and breakpoints can be set.';
         },
         disable: async () => {
@@ -1403,6 +1413,9 @@ export class PlaywrightExecutor {
       },
 
       // --- Browser fetch ---
+      // NOTE: browserFetch executes in the browser context (page.evaluate) and does NOT go through
+      // Playwright's route interception. To test networkIntercept mock rules, use
+      // page.evaluate(() => fetch(...)) instead, which follows the browser's normal fetch path.
       browserFetch: async (url: string, options?: { method?: string; headers?: string; body?: string; max_body_size?: number }) => {
         const method = options?.method || 'GET';
         const headers = options?.headers;
