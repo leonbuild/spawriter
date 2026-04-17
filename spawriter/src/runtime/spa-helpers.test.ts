@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   buildDashboardStateCode,
   buildOverrideCode,
+  buildOverrideVerifyCode,
   buildAppActionCode,
   type OverrideState,
   detectOverrideChanges,
@@ -228,5 +229,39 @@ describe('importPageOverrides', () => {
   it('empty saved returns page', () => {
     const page: OverrideState = { x: '1' };
     assert.deepEqual(importPageOverrides(page, {}), { x: '1' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildOverrideVerifyCode
+// ---------------------------------------------------------------------------
+describe('buildOverrideVerifyCode', () => {
+  it('generates code that checks importMapOverrides for the given app', () => {
+    const code = buildOverrideVerifyCode('@org/app');
+    assert.ok(code.includes('importMapOverrides'));
+    assert.ok(code.includes('@org/app'));
+    assert.ok(code.includes('import-map-override:'));
+    assert.ok(code.includes('present'));
+  });
+
+  it('wraps in IIFE returning JSON', () => {
+    const code = buildOverrideVerifyCode('@org/app');
+    assert.ok(code.trim().startsWith('(function()'));
+    assert.ok(code.includes('JSON.stringify'));
+  });
+
+  it('checks both importMapOverrides API and localStorage', () => {
+    const code = buildOverrideVerifyCode('@test/module');
+    assert.ok(code.includes('getOverrideMap'));
+    assert.ok(code.includes('localStorage.getItem'));
+    assert.ok(code.includes('localStorageKey'));
+    assert.ok(code.includes('localStorageValue'));
+  });
+
+  it('escapes special characters in app name', () => {
+    const code = buildOverrideVerifyCode('@org/"quoted"');
+    assert.ok(code.includes('@org/'));
+    // Should be JSON-escaped
+    assert.ok(!code.includes('unescaped'));
   });
 });

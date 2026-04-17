@@ -296,9 +296,23 @@ import browser from "webextension-polyfill";
   };
   const ALL_PREFIXES_RE_SRC = "^(?:🟢 |🟡 |🔴 |🔵 )+";
 
-  async function markTabTitle(tabId, stateOrBool) {
+  const pendingTitleUpdates = new Map();
+
+  function markTabTitle(tabId, stateOrBool) {
     const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
     const prefix = state ? TAB_TITLE_PREFIXES[state] || null : null;
+
+    const existing = pendingTitleUpdates.get(tabId);
+    if (existing) clearTimeout(existing.timer);
+
+    const timer = setTimeout(() => {
+      pendingTitleUpdates.delete(tabId);
+      _applyTabTitle(tabId, prefix).catch(() => {});
+    }, 50);
+    pendingTitleUpdates.set(tabId, { timer, prefix });
+  }
+
+  async function _applyTabTitle(tabId, prefix) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
@@ -317,7 +331,7 @@ import browser from "webextension-polyfill";
         args: [prefix, ALL_PREFIXES_RE_SRC],
       });
     } catch (e) {
-      warn(`markTabTitle failed for tab ${tabId} (state=${state}):`, e?.message || e);
+      warn(`markTabTitle failed for tab ${tabId}:`, e?.message || e);
     }
   }
 

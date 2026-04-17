@@ -126,6 +126,22 @@ function createRelayState() {
     }
   }
 
+  const SAFE_AUTO_CLAIM_URLS = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
+
+  function safeAutoClaimTab(sessionId: string): { tabId: number; url: string } | null {
+    for (const target of attachedTargets.values()) {
+      if (target.tabId == null) continue;
+      const owner = getTabOwner(target.tabId);
+      if (owner) continue;
+      const tabUrl = target.targetInfo?.url || '';
+      const isSafeTab = SAFE_AUTO_CLAIM_URLS.some(safe => tabUrl === safe || tabUrl.startsWith(safe));
+      if (!isSafeTab) continue;
+      const claim = claimTab(target.tabId, sessionId);
+      if (claim.ok) return { tabId: target.tabId, url: tabUrl };
+    }
+    return null;
+  }
+
   return {
     attachedTargets,
     tabOwners,
@@ -139,6 +155,7 @@ function createRelayState() {
     listTargets,
     routeCdpEvent,
     handleTabInfoChanged,
+    safeAutoClaimTab,
   };
 }
 
@@ -827,5 +844,102 @@ describe('handleTabInfoChanged — title/URL sync from extension', () => {
     const target = relay.attachedTargets.get('session-1');
     assert.equal(target?.targetInfo?.title, 'Step 3');
     assert.equal(target?.targetInfo?.url, 'https://step3.com');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Safe auto-claim tab restriction
+// ---------------------------------------------------------------------------
+describe('safeAutoClaimTab', () => {
+  let relay: ReturnType<typeof createRelayState>;
+
+  beforeEach(() => {
+    relay = createRelayState();
+  });
+
+  it('should auto-claim about:blank tabs', () => {
+    relay.attachedTargets.set('target-blank', {
+      sessionId: 'target-blank',
+      tabId: 1,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 1 },
+    });
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 1);
+    assert.equal(result!.url, 'about:blank');
+  });
+
+  it('should auto-claim chrome://newtab/ tabs', () => {
+    relay.attachedTargets.set('target-newtab', {
+      sessionId: 'target-newtab',
+      tabId: 2,
+      targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 2 },
+    });
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 2);
+  });
+
+  it('should NOT auto-claim tabs with real website URLs', () => {
+    relay.attachedTargets.set('target-real', {
+      sessionId: 'target-real',
+      tabId: 3,
+      targetInfo: { title: 'Google', url: 'https://www.google.com', type: 'page', tabId: 3 },
+    });
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.equal(result, null);
+  });
+
+  it('should NOT auto-claim tabs with http:// URLs', () => {
+    relay.attachedTargets.set('target-local', {
+      sessionId: 'target-local',
+      tabId: 4,
+      targetInfo: { title: 'Local Dev', url: 'http://localhost:3000', type: 'page', tabId: 4 },
+    });
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.equal(result, null);
+  });
+
+  it('should NOT auto-claim tabs already owned by another session', () => {
+    relay.attachedTargets.set('target-owned', {
+      sessionId: 'target-owned',
+      tabId: 5,
+      targetInfo: { title: 'Blank', url: 'about:blank', type: 'page', tabId: 5 },
+    });
+    relay.claimTab(5, 'sw-other');
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.equal(result, null);
+  });
+
+  it('should skip non-safe tabs and claim the first safe one', () => {
+    relay.attachedTargets.set('target-web', {
+      sessionId: 'target-web',
+      tabId: 10,
+      targetInfo: { title: 'Reddit', url: 'https://reddit.com', type: 'page', tabId: 10 },
+    });
+    relay.attachedTargets.set('target-safe', {
+      sessionId: 'target-safe',
+      tabId: 11,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 11 },
+    });
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 11);
+  });
+
+  it('should auto-claim edge://newtab/ tabs', () => {
+    relay.attachedTargets.set('target-edge', {
+      sessionId: 'target-edge',
+      tabId: 20,
+      targetInfo: { title: 'New Tab', url: 'edge://newtab/', type: 'page', tabId: 20 },
+    });
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 20);
+  });
+
+  it('should return null when no tabs exist', () => {
+    const result = relay.safeAutoClaimTab('sw-test');
+    assert.equal(result, null);
   });
 });

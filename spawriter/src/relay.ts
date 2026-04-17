@@ -1253,17 +1253,23 @@ app.post('/cli/execute', async (c) => {
         } catch (e: any) {
           log(`Tab creation failed for session ${body.sessionId}: ${e.message}`);
         }
-        // Fallback: claim first unclaimed tab if creation failed
+        // Fallback: only auto-claim empty/new-tab pages to avoid hijacking user's active browsing tabs
         if (!tabCreated) {
+          const safeAutoClaimUrls = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
           for (const target of attachedTargets.values()) {
             if (target.tabId == null) continue;
             const owner = getTabOwner(target.tabId);
-            if (!owner) {
-              const claim = claimTab(target.tabId, body.sessionId);
-              if (claim.ok) {
-                executor.claimTab(target.tabId, target.targetInfo?.url);
-                break;
-              }
+            if (owner) continue;
+            const tabUrl = target.targetInfo?.url || '';
+            const isSafeTab = safeAutoClaimUrls.some(safe => tabUrl === safe || tabUrl.startsWith(safe));
+            if (!isSafeTab) {
+              log(`Skipping auto-claim of tab ${target.tabId} (${tabUrl}) — not a blank/new-tab page. Use 'tab connect' to claim explicitly.`);
+              continue;
+            }
+            const claim = claimTab(target.tabId, body.sessionId);
+            if (claim.ok) {
+              executor.claimTab(target.tabId, tabUrl);
+              break;
             }
           }
         }
@@ -1284,6 +1290,16 @@ app.post('/cli/execute', async (c) => {
           text: `Tab ${activeTabId} is owned by session "${owner}". Use tab list to see available tabs.`,
           images: [], screenshots: [], isError: true,
         }, 403);
+      }
+      if (!owner) {
+        const claim = claimTab(activeTabId, body.sessionId);
+        if (!claim.ok) {
+          return c.json({
+            text: `Failed to claim tab ${activeTabId} (owned by ${claim.owner}). Use tab list to see available tabs.`,
+            images: [], screenshots: [], isError: true,
+          }, 403);
+        }
+        log(`Auto-claimed unowned tab ${activeTabId} for session ${body.sessionId} before execute`);
       }
     }
 

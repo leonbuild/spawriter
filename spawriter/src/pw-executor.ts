@@ -25,6 +25,7 @@ import {
 import {
   buildDashboardStateCode,
   buildOverrideCode,
+  buildOverrideVerifyCode,
   buildAppActionCode,
   detectOverrideChanges,
   importPageOverrides,
@@ -1214,24 +1215,98 @@ export class PlaywrightExecutor {
           return typeof value === 'string' ? value : JSON.stringify(value, null, 2);
         },
         override: async (action: string, appName?: string, url?: string) => {
+          if (action === 'set' && url) {
+            try {
+              const reachable = await page.evaluate(
+                `fetch(${JSON.stringify(url)}, { method: 'HEAD', mode: 'cors' })` +
+                `.then(r => ({ ok: r.ok, status: r.status }))` +
+                `.catch(e => ({ ok: false, error: e.message }))`
+              );
+              const r = typeof reachable === 'string' ? JSON.parse(reachable) : reachable;
+              if (!r?.ok) {
+                const detail = r?.error || `HTTP ${r?.status}`;
+                return JSON.stringify({
+                  success: false,
+                  error: `Override URL unreachable or CORS-blocked: ${url} (${detail}). Override NOT set — this prevents reload loops.`
+                });
+              }
+            } catch (e: any) {
+              return JSON.stringify({
+                success: false,
+                error: `Failed to verify override URL: ${url} (${e.message}). Override NOT set.`
+              });
+            }
+          }
+
           const { code, error: err } = buildOverrideCode(action, appName, url);
           if (err) return err;
           const value = await evaluateJs(code);
           const resultText = typeof value === 'string' ? value : JSON.stringify(value);
-          let reloaded = false;
+
+          let parsed: any;
           try {
-            const parsed = typeof value === 'string' ? JSON.parse(value) : value;
-            if (parsed?.success) {
+            parsed = typeof value === 'string' ? JSON.parse(value) : value;
+          } catch { parsed = null; }
+
+          if (!parsed?.success) return resultText;
+          if (action !== 'set' && action !== 'enable') {
+            return resultText;
+          }
+
+          if (cdpSession) {
+            await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+          } else {
+            await page.evaluate('window.location.reload()');
+          }
+          await new Promise(r => setTimeout(r, 3000));
+
+          try {
+            const readyState = await Promise.race([
+              page.evaluate('document.readyState'),
+              new Promise<string>((_, rej) => setTimeout(() => rej(new Error('readyState timeout')), 5000)),
+            ]);
+            if (readyState !== 'complete' && readyState !== 'interactive') throw new Error('page not ready');
+          } catch {
+            const lsKey = `import-map-override:${appName}`;
+            try {
               if (cdpSession) {
-                await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
+                await sendCdpCmd('Runtime.evaluate', {
+                  expression: `localStorage.removeItem(${JSON.stringify(lsKey)})`,
+                }, 3000);
+                await sendCdpCmd('Page.reload', { ignoreCache: true }, 3000);
               } else {
+                await page.evaluate(`localStorage.removeItem(${JSON.stringify(lsKey)})`);
                 await page.evaluate('window.location.reload()');
               }
-              await new Promise(r => setTimeout(r, 2000));
-              reloaded = true;
-            }
-          } catch { /* skip reload */ }
-          return reloaded ? resultText + ' (page reloaded)' : resultText;
+            } catch { /* last-resort rollback */ }
+            return JSON.stringify({
+              success: false,
+              error: `Page became unresponsive after setting override for "${appName}". ` +
+                `This usually means the module at ${url} is incompatible (wrong format, CORS, or bootstrap error). ` +
+                `Emergency rollback attempted — override removed from localStorage.`,
+              rolledBack: true,
+            });
+          }
+
+          if (appName) {
+            try {
+              const verifyCode = buildOverrideVerifyCode(appName);
+              const verifyRaw = await page.evaluate(verifyCode);
+              const verify = typeof verifyRaw === 'string' ? JSON.parse(verifyRaw) : verifyRaw;
+              if (!verify?.present) {
+                return JSON.stringify({
+                  success: false,
+                  warning: `Override was set but did NOT survive the reload. ` +
+                    `The import-map-overrides library or the page itself removed it — ` +
+                    `likely because the module at ${url} failed to load as a valid SystemJS/ESM module. ` +
+                    `Verify the URL serves a single-spa lifecycle module (not a standalone SPA bundle).`,
+                  localStorageValue: verify?.localStorageValue,
+                });
+              }
+            } catch { /* verification failed, proceed with cautious success */ }
+          }
+
+          return resultText + ' (page reloaded)';
         },
         mount: async (appName: string) => {
           const code = buildAppActionCode('mount', appName);
@@ -2135,13 +2210,56 @@ export class PlaywrightExecutor {
       },
 
       ensureFreshRender: async () => {
+        let hasOverrides = false;
+        try {
+          hasOverrides = await page.evaluate(`(function() {
+            var imo = window.importMapOverrides;
+            if (!imo || typeof imo.getOverrideMap !== 'function') return false;
+            var m = imo.getOverrideMap();
+            return m && m.imports ? Object.keys(m.imports).length > 0 : false;
+          })()`);
+        } catch { /* ignore */ }
+
         if (cdpSession) {
           await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
         } else {
           await page.evaluate('window.location.reload()');
         }
-        await new Promise(r => setTimeout(r, 2000));
-        return 'Page reloaded with fresh cache';
+        await new Promise(r => setTimeout(r, 3000));
+
+        try {
+          const readyState = await Promise.race([
+            page.evaluate('document.readyState'),
+            new Promise<string>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+          ]);
+          if (readyState === 'complete' || readyState === 'interactive') {
+            const note = hasOverrides ? ' (import-map overrides are active)' : '';
+            return `Page reloaded with fresh cache${note}`;
+          }
+        } catch { /* page didn't stabilize */ }
+
+        if (hasOverrides) {
+          try {
+            if (cdpSession) {
+              await sendCdpCmd('Runtime.evaluate', {
+                expression: `(function() {
+                  var keys = [];
+                  for (var i = 0; i < localStorage.length; i++) {
+                    var k = localStorage.key(i);
+                    if (k && k.indexOf('import-map-override:') === 0) keys.push(k);
+                  }
+                  keys.forEach(function(k) { localStorage.removeItem(k); });
+                  return keys.length;
+                })()`,
+              }, 3000);
+              await sendCdpCmd('Page.reload', { ignoreCache: true }, 3000);
+            }
+          } catch { /* best-effort */ }
+          return 'WARNING: Page failed to stabilize after reload — active import-map overrides may have caused a reload loop. ' +
+            'Emergency cleanup attempted: all import-map-override entries removed from localStorage.';
+        }
+
+        return 'Page reloaded but may not have fully stabilized — verify with screenshot() or snapshot()';
       },
 
       // --- Reset (callable from VM) ---

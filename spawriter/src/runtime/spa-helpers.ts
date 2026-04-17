@@ -116,6 +116,20 @@ export function buildAppActionCode(action: string, appName: string): string {
   })()`;
 }
 
+export function buildOverrideVerifyCode(appName: string): string {
+  return `(function() {
+    var imo = window.importMapOverrides;
+    if (!imo || typeof imo.getOverrideMap !== 'function') return JSON.stringify({ present: false, reason: 'importMapOverrides not available' });
+    var overrideMap = imo.getOverrideMap();
+    var imports = overrideMap && overrideMap.imports ? overrideMap.imports : {};
+    var url = imports[${JSON.stringify(appName)}] || null;
+    var lsKey = 'import-map-override:' + ${JSON.stringify(appName)};
+    var lsVal = null;
+    try { lsVal = localStorage.getItem(lsKey); } catch(e) {}
+    return JSON.stringify({ present: !!url, url: url, localStorageKey: lsKey, localStorageValue: lsVal });
+  })()`;
+}
+
 export interface OverrideState {
   [key: string]: string;
 }
