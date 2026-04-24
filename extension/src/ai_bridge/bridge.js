@@ -91,6 +91,53 @@ import browser from "webextension-polyfill";
     return tabOwnership.has(tabId);
   }
 
+  function normalizeUrlHint(url) {
+    if (!url || typeof url !== "string") return "";
+    const trimmed = url.trim().toLowerCase();
+    if (!trimmed) return "";
+    if (/^[a-z][\w+.-]*:/i.test(trimmed)) return trimmed;
+    if (trimmed.startsWith("//")) return `https:${trimmed}`;
+    if (trimmed.startsWith("/")) return trimmed;
+    return `https://${trimmed}`;
+  }
+
+  function tabMatchesHint(tab, urlHint) {
+    const rawHint = (urlHint || "").trim().toLowerCase();
+    if (!rawHint) return false;
+    const normalizedHint = normalizeUrlHint(urlHint);
+    const tabUrl = (tab?.url || "").toLowerCase();
+    const tabTitle = (tab?.title || "").toLowerCase();
+
+    if (tabUrl && !isRestrictedUrl(tab.url)) {
+      if (
+        tabUrl.includes(rawHint) ||
+        (normalizedHint && tabUrl.includes(normalizedHint))
+      ) {
+        return true;
+      }
+    }
+
+    return !!tabTitle && tabTitle.includes(rawHint);
+  }
+
+  function tabReuseScore(tab) {
+    const tabId = tab?.id;
+    if (tabId == null) return Number.MAX_SAFE_INTEGER;
+    const attached = attachedTabs.has(tabId);
+    const owned = isTabOwned(tabId);
+    if (attached && !owned) return 0;
+    if (!attached && !owned) return 1;
+    if (attached && owned) return 2;
+    return 3;
+  }
+
+  function pickBestMatchingTab(allTabs, urlHint) {
+    const matches = allTabs
+      .filter((tab) => tab?.id != null && tabMatchesHint(tab, urlHint))
+      .sort((a, b) => tabReuseScore(a) - tabReuseScore(b));
+    return matches[0];
+  }
+
   function syncOwnershipStates() {
     for (const [tabId] of attachedTabs.entries()) {
       const owned = tabOwnership.has(tabId);
@@ -933,17 +980,7 @@ import browser from "webextension-polyfill";
         const forceCreate = message.params?.forceCreate;
         if (!forceCreate) {
           const allTabs = await browser.tabs.query({});
-          let match = allTabs.find(
-            (t) => t.url && t.url.includes(url) && !isRestrictedUrl(t.url)
-          );
-          if (!match) {
-            match = allTabs.find(
-              (t) =>
-                t.title &&
-                t.title.toLowerCase().includes(url.toLowerCase()) &&
-                !isRestrictedUrl(t.url)
-            );
-          }
+          const match = pickBestMatchingTab(allTabs, url);
 
           if (match) {
             const needsAttach = !attachedTabs.has(match.id) || !(await isDebuggerAttached(match.id));

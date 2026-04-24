@@ -128,6 +128,85 @@ function createRelayState() {
 
   const SAFE_AUTO_CLAIM_URLS = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
 
+  function normalizeUrlHint(rawUrl: string): string | null {
+    const trimmed = rawUrl.trim();
+    if (!trimmed) return null;
+    if (/^[a-z][\w+.-]*:/i.test(trimmed)) return trimmed.toLowerCase();
+    if (trimmed.startsWith('//')) return `https:${trimmed}`.toLowerCase();
+    if (trimmed.startsWith('/')) return null;
+    return `https://${trimmed}`.toLowerCase();
+  }
+
+  function urlMatchesHint(tabUrl: string, preferredUrlHint: string): boolean {
+    const normalizedHint = normalizeUrlHint(preferredUrlHint);
+    if (!normalizedHint) return false;
+    const normalizedTab = normalizeUrlHint(tabUrl) ?? tabUrl.trim().toLowerCase();
+    if (!normalizedTab) return false;
+    if (
+      normalizedTab === normalizedHint
+      || normalizedTab.startsWith(normalizedHint)
+      || normalizedHint.startsWith(normalizedTab)
+    ) {
+      return true;
+    }
+    try {
+      const tab = new URL(normalizedTab);
+      const hint = new URL(normalizedHint);
+      if (tab.origin !== hint.origin) return false;
+      if (tab.pathname === hint.pathname) return true;
+      return tab.pathname.startsWith(hint.pathname) || hint.pathname.startsWith(tab.pathname);
+    } catch {
+      return normalizedTab.includes(normalizedHint) || normalizedHint.includes(normalizedTab);
+    }
+  }
+
+  function extractTargetUrlHint(code: string): string | undefined {
+    const patterns = [
+      /(?:\bawait\s+)?navigate\(\s*(['"`])([^'"`]+)\1/,
+      /page\.goto\(\s*(['"`])([^'"`]+)\1/,
+      /browserFetch\(\s*(['"`])([^'"`]+)\1/,
+    ];
+    for (const pattern of patterns) {
+      const match = pattern.exec(code);
+      if (match?.[2]?.trim()) return match[2].trim();
+    }
+    return undefined;
+  }
+
+  function pickReusableTab(code: string): { tabId: number; url: string; reason: string } | null {
+    const preferredUrlHint = extractTargetUrlHint(code);
+    const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
+    for (const target of attachedTargets.values()) {
+      if (target.tabId == null) continue;
+      if (getTabOwner(target.tabId)) continue;
+      const tabUrl = target.targetInfo?.url || '';
+      const safe = SAFE_AUTO_CLAIM_URLS.some(safeUrl => tabUrl === safeUrl || tabUrl.startsWith(safeUrl));
+      candidates.push({ tabId: target.tabId, url: tabUrl, safe });
+    }
+    if (candidates.length === 0) return null;
+
+    if (preferredUrlHint) {
+      const matched = candidates.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
+      if (matched) return { tabId: matched.tabId, url: matched.url, reason: 'url-match' };
+    }
+
+    const safeCandidate = candidates.find(candidate => candidate.safe);
+    if (safeCandidate) {
+      return {
+        tabId: safeCandidate.tabId,
+        url: safeCandidate.url,
+        reason: preferredUrlHint ? 'safe-fallback' : 'safe-reuse',
+      };
+    }
+
+    const firstCandidate = candidates[0];
+    return {
+      tabId: firstCandidate.tabId,
+      url: firstCandidate.url,
+      reason: preferredUrlHint ? 'idle-fallback' : 'idle-reuse',
+    };
+  }
+
   function safeAutoClaimTab(sessionId: string): { tabId: number; url: string } | null {
     for (const target of attachedTargets.values()) {
       if (target.tabId == null) continue;
@@ -156,6 +235,8 @@ function createRelayState() {
     routeCdpEvent,
     handleTabInfoChanged,
     safeAutoClaimTab,
+    extractTargetUrlHint,
+    pickReusableTab,
   };
 }
 
@@ -941,5 +1022,109 @@ describe('safeAutoClaimTab', () => {
   it('should return null when no tabs exist', () => {
     const result = relay.safeAutoClaimTab('sw-test');
     assert.equal(result, null);
+  });
+});
+
+describe('extractTargetUrlHint', () => {
+  let relay: ReturnType<typeof createRelayState>;
+
+  beforeEach(() => {
+    relay = createRelayState();
+  });
+
+  it('should parse URL from navigate call', () => {
+    const result = relay.extractTargetUrlHint('await navigate("https://example.com/path")');
+    assert.equal(result, 'https://example.com/path');
+  });
+
+  it('should parse URL from page.goto call', () => {
+    const result = relay.extractTargetUrlHint("await page.goto('http://localhost:3000/app')");
+    assert.equal(result, 'http://localhost:3000/app');
+  });
+
+  it('should return undefined for non-literal target', () => {
+    const result = relay.extractTargetUrlHint('await navigate(targetUrl)');
+    assert.equal(result, undefined);
+  });
+});
+
+describe('pickReusableTab', () => {
+  let relay: ReturnType<typeof createRelayState>;
+
+  beforeEach(() => {
+    relay = createRelayState();
+  });
+
+  it('should prioritize URL-matched unowned attached tab', () => {
+    relay.attachedTargets.set('target-safe', {
+      sessionId: 'target-safe',
+      tabId: 1,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 1 },
+    });
+    relay.attachedTargets.set('target-match', {
+      sessionId: 'target-match',
+      tabId: 2,
+      targetInfo: { title: 'Example', url: 'https://example.com/dashboard', type: 'page', tabId: 2 },
+    });
+
+    const result = relay.pickReusableTab('await navigate("https://example.com")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 2);
+    assert.equal(result!.reason, 'url-match');
+  });
+
+  it('should fall back to safe blank tab when URL hint misses', () => {
+    relay.attachedTargets.set('target-web', {
+      sessionId: 'target-web',
+      tabId: 10,
+      targetInfo: { title: 'Docs', url: 'https://docs.example.com', type: 'page', tabId: 10 },
+    });
+    relay.attachedTargets.set('target-safe', {
+      sessionId: 'target-safe',
+      tabId: 11,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 11 },
+    });
+
+    const result = relay.pickReusableTab('await navigate("https://not-found.example.com")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 11);
+    assert.equal(result!.reason, 'safe-fallback');
+  });
+
+  it('should ignore owned URL matches and reuse available tab', () => {
+    relay.attachedTargets.set('target-owned', {
+      sessionId: 'target-owned',
+      tabId: 21,
+      targetInfo: { title: 'Target', url: 'https://target.example.com', type: 'page', tabId: 21 },
+    });
+    relay.attachedTargets.set('target-available', {
+      sessionId: 'target-available',
+      tabId: 22,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 22 },
+    });
+    relay.claimTab(21, 'sw-other');
+
+    const result = relay.pickReusableTab('await navigate("https://target.example.com")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 22);
+    assert.equal(result!.reason, 'safe-fallback');
+  });
+
+  it('should fall back to first idle tab when no hint and no safe tab', () => {
+    relay.attachedTargets.set('target-a', {
+      sessionId: 'target-a',
+      tabId: 31,
+      targetInfo: { title: 'A', url: 'https://a.example.com', type: 'page', tabId: 31 },
+    });
+    relay.attachedTargets.set('target-b', {
+      sessionId: 'target-b',
+      tabId: 32,
+      targetInfo: { title: 'B', url: 'https://b.example.com', type: 'page', tabId: 32 },
+    });
+
+    const result = relay.pickReusableTab('state.count = (state.count || 0) + 1');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 31);
+    assert.equal(result!.reason, 'idle-reuse');
   });
 });

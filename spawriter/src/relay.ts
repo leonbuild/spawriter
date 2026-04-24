@@ -140,6 +140,96 @@ function getTabOwner(tabId: number): string | undefined {
   return tabOwners.get(tabId)?.sessionId;
 }
 
+const SAFE_AUTO_REUSE_URLS = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
+
+function isSafeAutoReuseUrl(url: string): boolean {
+  const normalized = url.trim().toLowerCase();
+  return SAFE_AUTO_REUSE_URLS.some((safe) => normalized === safe || normalized.startsWith(safe));
+}
+
+function normalizeUrlHint(rawUrl: string): string | null {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  if (/^[a-z][\w+.-]*:/i.test(trimmed)) return trimmed.toLowerCase();
+  if (trimmed.startsWith('//')) return `https:${trimmed}`.toLowerCase();
+  if (trimmed.startsWith('/')) return null;
+  return `https://${trimmed}`.toLowerCase();
+}
+
+function urlMatchesHint(tabUrl: string, preferredUrlHint: string): boolean {
+  const normalizedHint = normalizeUrlHint(preferredUrlHint);
+  if (!normalizedHint) return false;
+  const normalizedTab = normalizeUrlHint(tabUrl) ?? tabUrl.trim().toLowerCase();
+  if (!normalizedTab) return false;
+
+  if (
+    normalizedTab === normalizedHint
+    || normalizedTab.startsWith(normalizedHint)
+    || normalizedHint.startsWith(normalizedTab)
+  ) {
+    return true;
+  }
+
+  try {
+    const tab = new URL(normalizedTab);
+    const hint = new URL(normalizedHint);
+    if (tab.origin !== hint.origin) return false;
+    if (tab.pathname === hint.pathname) return true;
+    return tab.pathname.startsWith(hint.pathname) || hint.pathname.startsWith(tab.pathname);
+  } catch {
+    return normalizedTab.includes(normalizedHint) || normalizedHint.includes(normalizedTab);
+  }
+}
+
+function extractTargetUrlHint(code: string): string | undefined {
+  const patterns = [
+    /(?:\bawait\s+)?navigate\(\s*(['"`])([^'"`]+)\1/,
+    /page\.goto\(\s*(['"`])([^'"`]+)\1/,
+    /browserFetch\(\s*(['"`])([^'"`]+)\1/,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(code);
+    if (match?.[2]?.trim()) return match[2].trim();
+  }
+  return undefined;
+}
+
+function pickReusableAttachedTab(preferredUrlHint?: string): { tabId: number; url: string; reason: string } | null {
+  const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
+  for (const target of attachedTargets.values()) {
+    if (target.tabId == null) continue;
+    if (getTabOwner(target.tabId)) continue;
+    const tabUrl = target.targetInfo?.url || '';
+    candidates.push({
+      tabId: target.tabId,
+      url: tabUrl,
+      safe: isSafeAutoReuseUrl(tabUrl),
+    });
+  }
+  if (candidates.length === 0) return null;
+
+  if (preferredUrlHint) {
+    const urlMatched = candidates.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
+    if (urlMatched) return { tabId: urlMatched.tabId, url: urlMatched.url, reason: 'url-match' };
+  }
+
+  const safeCandidate = candidates.find(candidate => candidate.safe);
+  if (safeCandidate) {
+    return {
+      tabId: safeCandidate.tabId,
+      url: safeCandidate.url,
+      reason: preferredUrlHint ? 'safe-fallback' : 'safe-reuse',
+    };
+  }
+
+  const firstCandidate = candidates[0];
+  return {
+    tabId: firstCandidate.tabId,
+    url: firstCandidate.url,
+    reason: preferredUrlHint ? 'idle-fallback' : 'idle-reuse',
+  };
+}
+
 function resolveTabIdFromSession(cdpSessionId: string): number | undefined {
   return attachedTargets.get(cdpSessionId)?.tabId ?? undefined;
 }
@@ -1225,51 +1315,72 @@ app.post('/cli/execute', async (c) => {
     sessionActivity.set(body.sessionId, Date.now());
 
     if (executor.getActiveTabId() == null) {
-      const ownedTabId = getOwnedTabs(body.sessionId)[0];
+      const targetUrlHint = extractTargetUrlHint(body.code);
+      const ownedTabIds = getOwnedTabs(body.sessionId);
+      const ownedTabId = targetUrlHint
+        ? (
+          ownedTabIds.find((tabId) => {
+            const tabUrl = [...attachedTargets.values()].find(t => t.tabId === tabId)?.targetInfo?.url || '';
+            return urlMatchesHint(tabUrl, targetUrlHint);
+          }) ?? ownedTabIds[0]
+        )
+        : ownedTabIds[0];
       if (ownedTabId != null) {
         const url = [...attachedTargets.values()].find(t => t.tabId === ownedTabId)?.targetInfo?.url;
         executor.claimTab(ownedTabId, url);
-      } else if (isExtensionConnected()) {
-        // Try to create a dedicated tab for this session
-        let tabCreated = false;
-        try {
-          const result = await sendExtensionCommand('connectTabByMatch', {
-            url: 'about:blank',
-            forceCreate: true,
-          });
-          if (result.success && typeof result.tabId === 'number') {
+      } else {
+        const reusableTab = pickReusableAttachedTab(targetUrlHint);
+        if (reusableTab) {
+          const claim = claimTab(reusableTab.tabId, body.sessionId);
+          if (claim.ok) {
+            executor.claimTab(reusableTab.tabId, reusableTab.url);
+            log(`Auto-reused attached tab ${reusableTab.tabId} for session ${body.sessionId} (${reusableTab.reason}${targetUrlHint ? `, hint=${targetUrlHint}` : ''})`);
+          }
+        }
+
+        if (executor.getActiveTabId() == null && isExtensionConnected()) {
+          const claimConnectedTab = async (tabId: number, fallbackUrl: string): Promise<boolean> => {
             for (let i = 0; i < 20; i++) {
-              const found = [...attachedTargets.values()].find(t => t.tabId === result.tabId);
+              const found = [...attachedTargets.values()].find(t => t.tabId === tabId);
               if (found) break;
               await new Promise(r => setTimeout(r, 200));
             }
-            const claim = claimTab(result.tabId as number, body.sessionId);
-            if (claim.ok) {
-              const tabUrl = [...attachedTargets.values()].find(t => t.tabId === result.tabId)?.targetInfo?.url || 'about:blank';
-              executor.claimTab(result.tabId as number, tabUrl);
-              tabCreated = true;
+            const claim = claimTab(tabId, body.sessionId);
+            if (!claim.ok) return false;
+            const tabUrl = [...attachedTargets.values()].find(t => t.tabId === tabId)?.targetInfo?.url || fallbackUrl;
+            executor.claimTab(tabId, tabUrl);
+            return true;
+          };
+
+          let tabPrepared = false;
+          if (targetUrlHint) {
+            try {
+              const result = await sendExtensionCommand('connectTabByMatch', {
+                url: targetUrlHint,
+                create: false,
+              });
+              if (result.success && typeof result.tabId === 'number') {
+                tabPrepared = await claimConnectedTab(result.tabId as number, targetUrlHint);
+                if (tabPrepared) {
+                  log(`Auto-connected existing tab ${result.tabId} by URL hint for session ${body.sessionId}: ${targetUrlHint}`);
+                }
+              }
+            } catch (e: any) {
+              log(`URL-hint tab connect failed for session ${body.sessionId}: ${e.message}`);
             }
           }
-        } catch (e: any) {
-          log(`Tab creation failed for session ${body.sessionId}: ${e.message}`);
-        }
-        // Fallback: only auto-claim empty/new-tab pages to avoid hijacking user's active browsing tabs
-        if (!tabCreated) {
-          const safeAutoClaimUrls = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
-          for (const target of attachedTargets.values()) {
-            if (target.tabId == null) continue;
-            const owner = getTabOwner(target.tabId);
-            if (owner) continue;
-            const tabUrl = target.targetInfo?.url || '';
-            const isSafeTab = safeAutoClaimUrls.some(safe => tabUrl === safe || tabUrl.startsWith(safe));
-            if (!isSafeTab) {
-              log(`Skipping auto-claim of tab ${target.tabId} (${tabUrl}) — not a blank/new-tab page. Use 'tab connect' to claim explicitly.`);
-              continue;
-            }
-            const claim = claimTab(target.tabId, body.sessionId);
-            if (claim.ok) {
-              executor.claimTab(target.tabId, tabUrl);
-              break;
+
+          if (!tabPrepared) {
+            try {
+              const result = await sendExtensionCommand('connectTabByMatch', {
+                url: 'about:blank',
+                forceCreate: true,
+              });
+              if (result.success && typeof result.tabId === 'number') {
+                tabPrepared = await claimConnectedTab(result.tabId as number, 'about:blank');
+              }
+            } catch (e: any) {
+              log(`Tab creation failed for session ${body.sessionId}: ${e.message}`);
             }
           }
         }
