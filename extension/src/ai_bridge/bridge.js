@@ -134,6 +134,7 @@ import browser from "webextension-polyfill";
   function pickBestMatchingTab(allTabs, urlHint) {
     const matches = allTabs
       .filter((tab) => tab?.id != null && tabMatchesHint(tab, urlHint))
+      .filter((tab) => attachedTabs.has(tab.id) && !isTabOwned(tab.id))
       .sort((a, b) => tabReuseScore(a) - tabReuseScore(b));
     return matches[0];
   }
@@ -1008,8 +1009,7 @@ import browser from "webextension-polyfill";
         };
       }
 
-      const activeTabId = await ensureActiveTabAttached();
-      return { success: true, tabId: activeTabId };
+      return { success: false, error: 'No url or tabId provided for connectTabByMatch' };
     }
 
     if (message.method === "clearCacheAndReload") {

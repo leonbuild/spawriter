@@ -190,21 +190,17 @@ function createRelayState() {
       if (matched) return { tabId: matched.tabId, url: matched.url, reason: 'url-match' };
     }
 
-    const safeCandidate = candidates.find(candidate => candidate.safe);
-    if (safeCandidate) {
+    const safeCandidates = candidates.filter(c => c.safe);
+    if (safeCandidates.length > 0) {
+      const pick = safeCandidates[Math.floor(Math.random() * safeCandidates.length)];
       return {
-        tabId: safeCandidate.tabId,
-        url: safeCandidate.url,
-        reason: preferredUrlHint ? 'safe-fallback' : 'safe-reuse',
+        tabId: pick.tabId,
+        url: pick.url,
+        reason: preferredUrlHint ? 'safe-fallback' : 'idle-random',
       };
     }
 
-    const firstCandidate = candidates[0];
-    return {
-      tabId: firstCandidate.tabId,
-      url: firstCandidate.url,
-      reason: preferredUrlHint ? 'idle-fallback' : 'idle-reuse',
-    };
+    return null;
   }
 
   function safeAutoClaimTab(sessionId: string): { tabId: number; url: string } | null {
@@ -1110,7 +1106,7 @@ describe('pickReusableTab', () => {
     assert.equal(result!.reason, 'safe-fallback');
   });
 
-  it('should fall back to first idle tab when no hint and no safe tab', () => {
+  it('should return null when no safe tabs and no URL match (never take user tabs)', () => {
     relay.attachedTargets.set('target-a', {
       sessionId: 'target-a',
       tabId: 31,
@@ -1123,8 +1119,170 @@ describe('pickReusableTab', () => {
     });
 
     const result = relay.pickReusableTab('state.count = (state.count || 0) + 1');
+    assert.equal(result, null);
+  });
+
+  it('should randomly pick among multiple safe tabs', () => {
+    relay.attachedTargets.set('target-blank-1', {
+      sessionId: 'target-blank-1',
+      tabId: 40,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 40 },
+    });
+    relay.attachedTargets.set('target-blank-2', {
+      sessionId: 'target-blank-2',
+      tabId: 41,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 41 },
+    });
+
+    const result = relay.pickReusableTab('state.count = 1');
     assert.notEqual(result, null);
-    assert.equal(result!.tabId, 31);
-    assert.equal(result!.reason, 'idle-reuse');
+    assert.ok([40, 41].includes(result!.tabId));
+    assert.equal(result!.reason, 'idle-random');
+  });
+
+  it('should return null when all tabs are owned', () => {
+    relay.attachedTargets.set('t1', {
+      sessionId: 't1', tabId: 50,
+      targetInfo: { title: 'Tab A', url: 'about:blank', type: 'page', tabId: 50 },
+    });
+    relay.attachedTargets.set('t2', {
+      sessionId: 't2', tabId: 51,
+      targetInfo: { title: 'Tab B', url: 'https://example.com', type: 'page', tabId: 51 },
+    });
+    relay.claimTab(50, 'sw-x');
+    relay.claimTab(51, 'sw-y');
+
+    const result = relay.pickReusableTab('await navigate("https://example.com")');
+    assert.equal(result, null);
+  });
+
+  it('should return null when no attached targets exist', () => {
+    const result = relay.pickReusableTab('await screenshot()');
+    assert.equal(result, null);
+  });
+
+  it('should skip targets without tabId', () => {
+    relay.attachedTargets.set('no-tab', { sessionId: 'no-tab' });
+    relay.attachedTargets.set('has-tab', {
+      sessionId: 'has-tab', tabId: 60,
+      targetInfo: { title: 'Blank', url: 'about:blank', type: 'page', tabId: 60 },
+    });
+
+    const result = relay.pickReusableTab('state.x = 1');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 60);
+  });
+
+  it('should prefer URL match over safe tab even when both exist', () => {
+    relay.attachedTargets.set('safe', {
+      sessionId: 'safe', tabId: 70,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 70 },
+    });
+    relay.attachedTargets.set('match', {
+      sessionId: 'match', tabId: 71,
+      targetInfo: { title: 'App', url: 'https://myapp.com/dashboard', type: 'page', tabId: 71 },
+    });
+
+    const result = relay.pickReusableTab('await navigate("https://myapp.com")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 71);
+    assert.equal(result!.reason, 'url-match');
+  });
+
+  it('should not match URL on an owned tab even if URL matches', () => {
+    relay.attachedTargets.set('owned-match', {
+      sessionId: 'owned-match', tabId: 80,
+      targetInfo: { title: 'App', url: 'https://myapp.com', type: 'page', tabId: 80 },
+    });
+    relay.claimTab(80, 'sw-busy');
+
+    const result = relay.pickReusableTab('await navigate("https://myapp.com")');
+    assert.equal(result, null);
+  });
+
+  it('should handle chrome://newtab/ as safe for random pick', () => {
+    relay.attachedTargets.set('newtab', {
+      sessionId: 'newtab', tabId: 90,
+      targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 90 },
+    });
+
+    const result = relay.pickReusableTab('console.log("hi")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 90);
+    assert.equal(result!.reason, 'idle-random');
+  });
+
+  it('should handle edge://newtab/ as safe for random pick', () => {
+    relay.attachedTargets.set('edge-newtab', {
+      sessionId: 'edge-newtab', tabId: 91,
+      targetInfo: { title: 'New Tab', url: 'edge://newtab/', type: 'page', tabId: 91 },
+    });
+
+    const result = relay.pickReusableTab('console.log("hi")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 91);
+    assert.equal(result!.reason, 'idle-random');
+  });
+
+  it('should return null when only non-safe unowned tabs with no URL hint', () => {
+    relay.attachedTargets.set('user-tab', {
+      sessionId: 'user-tab', tabId: 100,
+      targetInfo: { title: 'Gmail', url: 'https://mail.google.com', type: 'page', tabId: 100 },
+    });
+
+    const result = relay.pickReusableTab('state.data = []');
+    assert.equal(result, null);
+  });
+
+  it('should return null when URL hint matches but only non-safe candidates remain after excluding owned', () => {
+    relay.attachedTargets.set('match-owned', {
+      sessionId: 'match-owned', tabId: 110,
+      targetInfo: { title: 'API', url: 'https://api.example.com', type: 'page', tabId: 110 },
+    });
+    relay.attachedTargets.set('user-tab', {
+      sessionId: 'user-tab', tabId: 111,
+      targetInfo: { title: 'Twitter', url: 'https://twitter.com', type: 'page', tabId: 111 },
+    });
+    relay.claimTab(110, 'sw-other');
+
+    const result = relay.pickReusableTab('await navigate("https://api.example.com")');
+    assert.equal(result, null);
+  });
+
+  it('should use safe-fallback reason when URL hint is present but no URL match found', () => {
+    relay.attachedTargets.set('safe-tab', {
+      sessionId: 'safe-tab', tabId: 120,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 120 },
+    });
+    relay.attachedTargets.set('unrelated', {
+      sessionId: 'unrelated', tabId: 121,
+      targetInfo: { title: 'Docs', url: 'https://docs.example.com', type: 'page', tabId: 121 },
+    });
+
+    const result = relay.pickReusableTab('await navigate("https://totally-different.com")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 120);
+    assert.equal(result!.reason, 'safe-fallback');
+  });
+
+  it('should handle mixed owned/safe/user tabs correctly', () => {
+    relay.attachedTargets.set('owned-safe', {
+      sessionId: 'owned-safe', tabId: 130,
+      targetInfo: { title: 'Blank', url: 'about:blank', type: 'page', tabId: 130 },
+    });
+    relay.attachedTargets.set('user-gmail', {
+      sessionId: 'user-gmail', tabId: 131,
+      targetInfo: { title: 'Gmail', url: 'https://mail.google.com', type: 'page', tabId: 131 },
+    });
+    relay.attachedTargets.set('free-safe', {
+      sessionId: 'free-safe', tabId: 132,
+      targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 132 },
+    });
+    relay.claimTab(130, 'sw-busy');
+
+    const result = relay.pickReusableTab('state.x = 1');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 132);
+    assert.equal(result!.reason, 'idle-random');
   });
 });

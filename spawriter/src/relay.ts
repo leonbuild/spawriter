@@ -213,21 +213,17 @@ function pickReusableAttachedTab(preferredUrlHint?: string): { tabId: number; ur
     if (urlMatched) return { tabId: urlMatched.tabId, url: urlMatched.url, reason: 'url-match' };
   }
 
-  const safeCandidate = candidates.find(candidate => candidate.safe);
-  if (safeCandidate) {
+  const safeCandidates = candidates.filter(c => c.safe);
+  if (safeCandidates.length > 0) {
+    const pick = safeCandidates[Math.floor(Math.random() * safeCandidates.length)];
     return {
-      tabId: safeCandidate.tabId,
-      url: safeCandidate.url,
-      reason: preferredUrlHint ? 'safe-fallback' : 'safe-reuse',
+      tabId: pick.tabId,
+      url: pick.url,
+      reason: preferredUrlHint ? 'safe-fallback' : 'idle-random',
     };
   }
 
-  const firstCandidate = candidates[0];
-  return {
-    tabId: firstCandidate.tabId,
-    url: firstCandidate.url,
-    reason: preferredUrlHint ? 'idle-fallback' : 'idle-reuse',
-  };
+  return null;
 }
 
 function resolveTabIdFromSession(cdpSessionId: string): number | undefined {
@@ -1339,49 +1335,27 @@ app.post('/cli/execute', async (c) => {
         }
 
         if (executor.getActiveTabId() == null && isExtensionConnected()) {
-          const claimConnectedTab = async (tabId: number, fallbackUrl: string): Promise<boolean> => {
-            for (let i = 0; i < 20; i++) {
-              const found = [...attachedTargets.values()].find(t => t.tabId === tabId);
-              if (found) break;
-              await new Promise(r => setTimeout(r, 200));
-            }
-            const claim = claimTab(tabId, body.sessionId);
-            if (!claim.ok) return false;
-            const tabUrl = [...attachedTargets.values()].find(t => t.tabId === tabId)?.targetInfo?.url || fallbackUrl;
-            executor.claimTab(tabId, tabUrl);
-            return true;
-          };
-
-          let tabPrepared = false;
-          if (targetUrlHint) {
-            try {
-              const result = await sendExtensionCommand('connectTabByMatch', {
-                url: targetUrlHint,
-                create: false,
-              });
-              if (result.success && typeof result.tabId === 'number') {
-                tabPrepared = await claimConnectedTab(result.tabId as number, targetUrlHint);
-                if (tabPrepared) {
-                  log(`Auto-connected existing tab ${result.tabId} by URL hint for session ${body.sessionId}: ${targetUrlHint}`);
-                }
+          try {
+            const createUrl = targetUrlHint || 'about:blank';
+            const result = await sendExtensionCommand('connectTabByMatch', {
+              url: createUrl,
+              forceCreate: true,
+            });
+            if (result.success && typeof result.tabId === 'number') {
+              for (let i = 0; i < 20; i++) {
+                if ([...attachedTargets.values()].find(t => t.tabId === result.tabId)) break;
+                await new Promise(r => setTimeout(r, 200));
               }
-            } catch (e: any) {
-              log(`URL-hint tab connect failed for session ${body.sessionId}: ${e.message}`);
-            }
-          }
-
-          if (!tabPrepared) {
-            try {
-              const result = await sendExtensionCommand('connectTabByMatch', {
-                url: 'about:blank',
-                forceCreate: true,
-              });
-              if (result.success && typeof result.tabId === 'number') {
-                tabPrepared = await claimConnectedTab(result.tabId as number, 'about:blank');
+              const claim = claimTab(result.tabId as number, body.sessionId);
+              if (claim.ok) {
+                const tabUrl = [...attachedTargets.values()]
+                  .find(t => t.tabId === result.tabId)?.targetInfo?.url || createUrl;
+                executor.claimTab(result.tabId as number, tabUrl);
+                log(`Created new tab ${result.tabId} for session ${body.sessionId}${targetUrlHint ? ` (hint: ${targetUrlHint})` : ''}`);
               }
-            } catch (e: any) {
-              log(`Tab creation failed for session ${body.sessionId}: ${e.message}`);
             }
+          } catch (e: any) {
+            log(`Tab creation failed for session ${body.sessionId}: ${e.message}`);
           }
         }
       }
