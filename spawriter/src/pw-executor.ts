@@ -65,6 +65,22 @@ export class CodeExecutionTimeoutError extends Error {
   }
 }
 
+export class NavigationBudgetError extends Error {
+  constructor(remainingExecutionMs: number) {
+    super(`Insufficient execution time remaining for navigate(): ${Math.floor(remainingExecutionMs)}ms`);
+    this.name = 'NavigationBudgetError';
+  }
+}
+
+export function isExecutionTimeoutLikeError(err: Error): boolean {
+  return (
+    err instanceof CodeExecutionTimeoutError
+    || err instanceof NavigationBudgetError
+    || err.name === 'TimeoutError'
+    || err.name === 'AbortError'
+  );
+}
+
 export interface ExecuteScreenshot {
   path: string;
   base64: string;
@@ -210,6 +226,19 @@ const SLOW_CDP_COMMANDS = new Set([
 
 function getCommandTimeout(method: string): number {
   return SLOW_CDP_COMMANDS.has(method) ? 60000 : 30000;
+}
+
+const NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS = 250;
+const NAVIGATE_MIN_COMMAND_TIMEOUT_MS = 500;
+
+export function computeNavigateCommandTimeout(remainingExecutionMs: number): number {
+  const remaining = Math.floor(remainingExecutionMs);
+  const budget = remaining - NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS;
+  const capped = Math.min(getCommandTimeout('Page.navigate'), budget);
+  if (capped < NAVIGATE_MIN_COMMAND_TIMEOUT_MS) {
+    throw new NavigationBudgetError(remaining);
+  }
+  return capped;
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +692,8 @@ export class PlaywrightExecutor {
       const sendCdpCmd: CdpSender = (method, params, cmdTimeout) =>
         self.sendCdp(cdpSession, method, params, cmdTimeout) as Promise<any>;
 
+      const executionDeadlineMs = Date.now() + timeout;
+
       const vmContextObj: Record<string, unknown> = {
         page,
         context,
@@ -670,7 +701,7 @@ export class PlaywrightExecutor {
         state: this.userState,
         console: customConsole,
         ...usefulGlobals,
-        ...this.buildVmGlobals(page, cdpSession, sendCdpCmd, screenshots, images),
+        ...this.buildVmGlobals(page, cdpSession, sendCdpCmd, screenshots, images, executionDeadlineMs),
         ...this.customGlobals,
       };
 
@@ -732,7 +763,7 @@ export class PlaywrightExecutor {
     } catch (err: unknown) {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       const e = err as Error;
-      const isTimeoutError = e instanceof CodeExecutionTimeoutError || e.name === 'TimeoutError' || e.name === 'AbortError';
+      const isTimeoutError = isExecutionTimeoutLikeError(e);
       const isRecoverableContextError =
         /Execution context was destroyed/i.test(e.message) || /Cannot find context with specified id/i.test(e.message);
 
@@ -797,6 +828,7 @@ export class PlaywrightExecutor {
     sendCdpCmd: CdpSender,
     screenshots: ExecuteScreenshot[],
     images: Array<{ data: string; mimeType: string }>,
+    executionDeadlineMs: number,
   ): Record<string, unknown> {
     const self = this;
 
@@ -2200,13 +2232,28 @@ export class PlaywrightExecutor {
 
       // --- Navigate ---
       navigate: async (url: string) => {
+        const remainingExecutionMs = executionDeadlineMs - Date.now();
+        if (remainingExecutionMs <= 0) {
+          throw new NavigationBudgetError(remainingExecutionMs);
+        }
         if (cdpSession) {
-          await sendCdpCmd('Page.navigate', { url }, getCommandTimeout('Page.navigate'));
+          const cdpTimeout = computeNavigateCommandTimeout(remainingExecutionMs);
+          await sendCdpCmd('Page.navigate', { url }, cdpTimeout);
         } else {
           await page.evaluate(`window.location.href = ${JSON.stringify(url)}`);
         }
-        await new Promise(r => setTimeout(r, 2000));
-        return `Navigated to ${url}`;
+        let readyState = 'unknown';
+        const remainingAfterNavigate = executionDeadlineMs - Date.now();
+        if (remainingAfterNavigate > NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS) {
+          try {
+            const readyStateBudget = Math.min(1200, remainingAfterNavigate - NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS);
+            readyState = await Promise.race([
+              page.evaluate('document.readyState') as Promise<string>,
+              new Promise<string>((_, reject) => setTimeout(() => reject(new Error('readyState timeout')), readyStateBudget)),
+            ]);
+          } catch { /* best-effort state probe */ }
+        }
+        return `Navigated to ${url} (readyState=${readyState}, currentUrl=${page.url()})`;
       },
 
       ensureFreshRender: async () => {

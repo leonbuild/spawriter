@@ -12,6 +12,9 @@ import {
   getLastExpressionReturn,
   wrapCode,
   CodeExecutionTimeoutError,
+  NavigationBudgetError,
+  isExecutionTimeoutLikeError,
+  computeNavigateCommandTimeout,
   PlaywrightExecutor,
   ExecutorManager,
   isPlaywrightChannelOwner,
@@ -233,6 +236,73 @@ describe('CodeExecutionTimeoutError', () => {
   it('should be an instance of Error', () => {
     const err = new CodeExecutionTimeoutError(5000);
     assert.ok(err instanceof Error);
+  });
+});
+
+describe('NavigationBudgetError', () => {
+  it('should have correct name', () => {
+    const err = new NavigationBudgetError(1234);
+    assert.equal(err.name, 'NavigationBudgetError');
+  });
+
+  it('should include remaining milliseconds in message', () => {
+    const err = new NavigationBudgetError(987);
+    assert.ok(err.message.includes('987ms'));
+  });
+});
+
+describe('isExecutionTimeoutLikeError', () => {
+  it('should classify CodeExecutionTimeoutError as timeout-like', () => {
+    assert.equal(isExecutionTimeoutLikeError(new CodeExecutionTimeoutError(1000)), true);
+  });
+
+  it('should classify NavigationBudgetError as timeout-like', () => {
+    assert.equal(isExecutionTimeoutLikeError(new NavigationBudgetError(800)), true);
+  });
+
+  it('should classify TimeoutError/AbortError by name as timeout-like', () => {
+    const timeoutByName = new Error('x');
+    timeoutByName.name = 'TimeoutError';
+    const abortByName = new Error('x');
+    abortByName.name = 'AbortError';
+    assert.equal(isExecutionTimeoutLikeError(timeoutByName), true);
+    assert.equal(isExecutionTimeoutLikeError(abortByName), true);
+  });
+
+  it('should reject regular errors', () => {
+    assert.equal(isExecutionTimeoutLikeError(new Error('regular')), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: navigate timeout budget
+// ---------------------------------------------------------------------------
+
+describe('computeNavigateCommandTimeout', () => {
+  it('should reserve a safety buffer from remaining time', () => {
+    assert.equal(computeNavigateCommandTimeout(30000), 29750);
+  });
+
+  it('should cap to Page.navigate command max timeout (60s)', () => {
+    assert.equal(computeNavigateCommandTimeout(90000), 60000);
+  });
+
+  it('should throw when remaining time is too small', () => {
+    assert.throws(
+      () => computeNavigateCommandTimeout(600),
+      /Insufficient execution time remaining for navigate/
+    );
+  });
+
+  it('should honor lower-bound threshold exactly at 750ms remaining', () => {
+    assert.equal(computeNavigateCommandTimeout(750), 500);
+  });
+
+  it('should throw below lower-bound threshold', () => {
+    assert.throws(
+      () => computeNavigateCommandTimeout(749),
+      /Insufficient execution time remaining for navigate/
+    );
   });
 });
 
