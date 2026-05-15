@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <rect x="0" y="0" width="48" height="48" rx="5.76" ry="5.76" fill="#1B5E20"/>
+  
+  <!-- Eye shape (almond) using two arcs -->
+  <path d="M 3.84 24 Q 24 2.879999999999999, 44.16 24 Q 24 45.120000000000005, 3.84 24 Z" 
+        fill="#E8F5E9" />
+  
+  <!-- Upper eyelid line -->
+  <path d="M 3.84 24 Q 24 2.879999999999999, 44.16 24" 
+        fill="none" stroke="#A5D6A7" stroke-width="0.96" />
+  
+  <!-- Lower eyelid line -->
+  <path d="M 3.84 24 Q 24 45.120000000000005, 44.16 24" 
+        fill="none" stroke="#A5D6A7" stroke-width="0.96" />
+  
+  <!-- Iris circle -->
+  <circle cx="24" cy="24" r="7.68" fill="#4CAF50" />
+  
+  <!-- Pupil circle -->
+  <circle cx="24" cy="24" r="4.32" fill="#1B5E20" />
+  
+  <!-- S letter in pupil -->
+  <text x="24" y="26.0064" 
+        text-anchor="middle" 
+        font-family="Arial, Helvetica, sans-serif" 
+        font-weight="bold" 
+        font-size="5.28" 
+        fill="#E8F5E9">S</text>
+  
+  <!-- Highlight/glint on iris -->
+  <circle cx="21.312" cy="21.312" r="1.44" fill="rgba(255,255,255,0.7)" />
+</svg>
