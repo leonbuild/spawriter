@@ -18,17 +18,32 @@ Each session runs in an **isolated sandbox** with its own `state` object. Use se
 - Avoid interference when multiple agents use spawriter simultaneously
 
 ```bash
-spawriter session new          # create a new session, prints ID
-spawriter session list         # list all active sessions
-spawriter session reset <id>   # reset browser connection for a session
-spawriter session delete <id>  # delete a session
-spawriter -s <id> -e '<code>' # execute code in a session
-spawriter relay                # start the relay server
-spawriter relay --replace      # replace existing relay server
-spawriter logfile              # prints the log file path
+spawriter session new                   # create a new session, prints ID
+spawriter session list                  # list all active sessions
+spawriter session reset <id>            # reset browser connection for a session
+spawriter session delete <id>           # delete a session
+spawriter session bind <tabId> -s <id>  # bind session to a specific Chrome tab
+spawriter -s <id> -e '<code>'           # execute code in a session
+spawriter relay                         # start the relay server
+spawriter relay --replace               # replace existing relay server
+spawriter logfile                       # prints the log file path
 ```
 
 **Always use your own session** — pass `-s <id>` to all `-e` commands.
+
+## Tab Acquisition & Recovery
+
+On first `-e` execute, spawriter auto-acquires a browser tab (reuses idle tabs → creates new tab). If you get `No tab connected to this session`, recover in this order:
+
+1. `spawriter session reset <id>` — retries auto-acquisition
+2. If still fails, manually bind:
+   ```bash
+   curl -s -X POST http://localhost:19989/connect-active-tab   # → { "tabId": 12345 }
+   spawriter session bind 12345 -s <id>
+   ```
+3. If relay is down: `spawriter relay --replace`
+
+After binding, `-e` commands work normally.
 
 ## VM Globals Reference
 
@@ -234,22 +249,13 @@ spawriter -s sw-1 -e 'page.url()'
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| Tool timeout | `spawriter session reset <id>` |
+Do not ask the user for help — recover autonomously using this table:
+
+| Symptom | Recovery |
+|---------|----------|
+| `No tab connected to this session` | `spawriter session reset <id>` → if still fails: `curl -s -X POST http://localhost:19989/connect-active-tab` then `spawriter session bind <tabId> -s <id>` |
+| Tool timeout / connection error | `spawriter session reset <id>` then retry |
+| Relay not running | `spawriter relay --replace` then retry |
 | Override not reflected | `await ensureFreshRender()` |
 | App not mounting | Navigate to the app's route first |
-| Connection error | `spawriter session reset <id>` then retry |
-| Relay not running | `spawriter relay --replace` |
 | Playwright locator timeout | Use `page.evaluate()` or `interact()` instead |
-
-## Architecture Notes
-
-The CLI communicates with the relay server via HTTP:
-- `/cli/execute` — runs code in the Playwright VM
-- `/cli/session/*` — session management
-- `/cli/cdp` — raw CDP command forwarding
-
-CDP-dependent features work through a three-tier fallback: Direct CDP → Relay CDP (via extension WebSocket) → Playwright-native / `page.evaluate()`.
-
-Tab ownership is universally enforced across all paths (CLI HTTP, MCP, CDP WebSocket). Unclaimed tabs are auto-claimed on first `execute`.

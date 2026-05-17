@@ -51,22 +51,26 @@ spawriter serve              # same as above, explicit
 
 # Code execution (Playwright API + spawriter extensions)
 spawriter session new                        # create a session, prints ID
-spawriter -s <id> -e 'await page.goto("https://example.com")'
-spawriter -s <id> -e 'return await singleSpa("status")'
-spawriter -s <id> -e 'await tab("connect", { url: "http://localhost:9000", create: true })'
+spawriter -s <id> -e 'page.url()'            # execute code in the session
+spawriter -s <id> -e 'await navigate("https://example.com")'
+spawriter -s <id> -e 'await screenshot()'
 
 # Session management
-spawriter session list       # list active sessions
-spawriter session reset <id> # reset a session's browser connection
-spawriter session delete <id># delete a session
+spawriter session list                       # list active sessions
+spawriter session reset <id>                 # reset a session's browser connection
+spawriter session delete <id>                # delete a session
+spawriter session bind <tabId> -s <id>       # bind session to a specific Chrome tab
 
 # Other
 spawriter relay              # start CDP relay only
+spawriter relay --replace    # replace existing relay server
 spawriter skill              # print CLI documentation
 spawriter logfile            # print log file paths
 spawriter --version          # show version
 spawriter --help             # show help
 ```
+
+On first `execute`, spawriter auto-acquires a browser tab (reuses idle attached tabs or creates a new one). If auto-acquisition fails, use `session bind` to manually bind a tab. See `AGENTS_CLI.md` for details.
 
 Run `spawriter skill` for the full CLI reference.
 
@@ -147,7 +151,8 @@ args = ["/path/to/spawriter/spawriter/dist/cli.js", "serve"]
 ## Architecture
 
 ```
-AI Agent -> MCP Server (stdio) -> CDP Relay (:19989) -> Chrome Extension -> Browser Tab
+AI Agent ──→ MCP Server (stdio) ──→ CDP Relay (:19989) ←──→ Chrome Extension ←──→ Browser Tab
+         or  CLI (-e)           HTTP                    WS                    chrome.debugger
 ```
 
 Monorepo with two packages managed via **npm workspaces**:
@@ -158,11 +163,12 @@ Monorepo with two packages managed via **npm workspaces**:
 | `spawriter/` | `spawriter` | MCP server + CDP relay + CLI |
 
 Key features:
-- **4 core MCP tools**: `execute`, `reset`, `single_spa`, `tab` (legacy tools deprecated but still available)
-- **CLI `-e` code execution**: `spawriter -s <id> -e '<code>'` — Playwright API + spawriter extensions
-- **Zero-touch tab management** — agents create/attach/navigate tabs programmatically
-- **Multi-agent isolation** — Tab Ownership System ensures exclusive tab ownership per session
+- **4 core MCP tools**: `execute`, `reset`, `single_spa`, `tab`
+- **CLI `-e` code execution**: `spawriter -s <id> -e '<code>'` — Playwright API + spawriter extensions in an isolated VM sandbox
+- **Auto tab acquisition** — first execute auto-acquires a tab (idle reuse → create new); fallback to manual `session bind`
+- **Multi-agent isolation** — Tab Ownership System ensures exclusive tab ownership per session; idle sessions cleaned up after 30 min
 - **Persistent connection** — offscreen document survives MV3 service worker restarts
+- **User tab safety** — only uses spawriter-managed idle tabs or creates new ones; never hijacks user's browsing tabs
 
 ## Scripts
 
@@ -183,4 +189,6 @@ Key features:
 | Chrome: "manifest file missing" | Load `extension/dist-chrome/`, not `extension/`. Run `npm run setup` first. |
 | `Cannot find module` | Run `npm run setup` or `npm run build:mcp` |
 | MCP connected but no page | Navigate to a normal web page (not `chrome://` or `edge://`) |
+| `No tab connected to this session` | Use `spawriter session bind <tabId> -s <id>` — see `AGENTS_CLI.md` for details |
+| Relay not running | `spawriter relay` or `spawriter relay --replace` |
 | webpack OpenSSL error | Use Node.js 18+ LTS |

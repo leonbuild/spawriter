@@ -15,7 +15,8 @@ Controls the user's **real Chrome tab** via CDP. Not headless — all actions af
 
 1. Determine a `session_id` (use agent transcript UUID if available). Pass on `tab { action: "connect" }`, `tab { action: "list" }`, etc.
 2. Proactively call `tab { action: "connect", url: "target-url", create: true, session_id: "..." }` when you anticipate needing browser access.
-3. On connection error: retry → `reset` + retry → ask user to check Chrome/extension/relay.
+3. On `execute` error "No tab connected": call `tab { action: "connect", url: "target-url", create: true }` first, then retry `execute`.
+4. On connection error: retry → `reset` + retry → ask user to check Chrome/extension/relay.
 
 ## When to Proactively Use the Browser
 
@@ -65,7 +66,9 @@ After any UI code change, automatically:
 ### tab
 
 - On `switch`: console/network/debugger/intercept state is cleared; `state` persists
-- `connect { url, create: true }` creates a new tab if no matching tab exists
+- `connect { url, create: true }` creates a new tab if no matching idle tab exists
+- `connect` only searches idle attached tabs (never touches user's unmanaged tabs)
+- `list` shows all attached tabs with ownership info — useful to find available tabIds
 
 ## Safety Rules
 
@@ -78,11 +81,13 @@ After any UI code change, automatically:
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| Tool timeout | `reset` to re-establish connections |
+Do not ask the user for help — recover autonomously using this table:
+
+| Symptom | Recovery |
+|---------|----------|
+| `No tab connected` on execute | `tab { action: "connect", url: "about:blank", create: true }` then retry execute |
+| Tool timeout / connection error | `reset` then retry |
 | Override not reflected | `execute` → `ensureFreshRender()` or `clearCacheAndReload({ clear: "cache" })` |
 | App not mounting after override | Navigate to the app's route first |
 | Debugger not pausing | `execute` → `dbg.enable()` first |
-| Connection error | `reset` then retry |
-| All tabs owned by others | `tab { action: "connect", url: "...", create: true }` |
+| All tabs owned by others | `tab { action: "connect", url: "about:blank", create: true }` |
