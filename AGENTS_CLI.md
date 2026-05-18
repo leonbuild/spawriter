@@ -22,7 +22,7 @@ spawriter session new                   # create a new session, prints ID
 spawriter session list                  # list all active sessions
 spawriter session reset <id>            # reset browser connection for a session
 spawriter session delete <id>           # delete a session
-spawriter session bind <tabId> -s <id>  # bind session to a specific Chrome tab
+spawriter session bind <tabId> -s <id>  # bind only to a safe tabId you created or own
 spawriter -s <id> -e '<code>'           # execute code in a session
 spawriter relay                         # start the relay server
 spawriter relay --replace               # replace existing relay server
@@ -31,16 +31,27 @@ spawriter logfile                       # prints the log file path
 
 **Always use your own session** — pass `-s <id>` to all `-e` commands.
 
+## Tab Isolation Policy
+
+Agents must never take over a tab the user is reading. Use tabs in this order only:
+
+1. A tab already owned by your session.
+2. An idle spawriter-attached tab shown as a blue dot / `AVAILABLE`.
+3. A newly created tab.
+
+Never use `/connect-active-tab`, never bind the current Chrome tab, and never bind an arbitrary existing tab just because its URL matches. If no owned or blue-dot idle tab is available, create a new tab.
+
 ## Tab Acquisition & Recovery
 
-On first `-e` execute, spawriter auto-acquires a browser tab (reuses idle tabs → creates new tab). If you get `No tab connected to this session`, recover in this order:
+On first `-e` execute, spawriter auto-acquires safely: owned session tab -> blue-dot idle attached tab -> newly created inactive tab. It must not attach the user's active tab or any unmanaged existing tab. If you get `No tab connected to this session`, recover in this order:
 
-1. `spawriter session reset <id>` — retries auto-acquisition
-2. If still fails, manually bind:
+1. `spawriter session reset <id>` — retries safe auto-acquisition
+2. If still fails, manually create and bind a new tab:
    ```bash
-   curl -s -X POST http://localhost:19989/connect-active-tab   # → { "tabId": 12345 }
+   curl -s -X POST http://localhost:19989/connect-tab -H 'Content-Type: application/json' -d '{"url":"about:blank","create":true,"forceCreate":true}'   # -> { "tabId": 12345, "created": true }
    spawriter session bind 12345 -s <id>
    ```
+   Use the target URL instead of `about:blank` when you already know where the agent should work.
 3. If relay is down: `spawriter relay --replace`
 
 After binding, `-e` commands work normally.
@@ -235,10 +246,11 @@ spawriter -s sw-1 -e 'page.url()'
 ## Safety Rules
 
 1. Only operate on normal web pages — never `chrome://` or extension pages
-2. **CRITICAL: All cache/cookie/storage clearing is automatically scoped to the current tab's origin. Never attempt to clear storage for other origins — this will destroy the user's login sessions on all sites.**
-3. Screenshot between major actions for verification
-4. Don't assume code changes are live — verify with `screenshot()` or `snapshot()`
-5. Mock rules persist until disabled — always clean up with `networkIntercept.disable()`
+2. Never use `/connect-active-tab` or bind arbitrary active/existing Chrome tabs. Only use your owned tab, a blue-dot idle spawriter tab, or a newly created tab.
+3. **CRITICAL: All cache/cookie/storage clearing is automatically scoped to the current tab's origin. Never attempt to clear storage for other origins — this will destroy the user's login sessions on all sites.**
+4. Screenshot between major actions for verification
+5. Don't assume code changes are live — verify with `screenshot()` or `snapshot()`
+6. Mock rules persist until disabled — always clean up with `networkIntercept.disable()`
 
 ## Best Practices
 
@@ -253,7 +265,7 @@ Do not ask the user for help — recover autonomously using this table:
 
 | Symptom | Recovery |
 |---------|----------|
-| `No tab connected to this session` | `spawriter session reset <id>` → if still fails: `curl -s -X POST http://localhost:19989/connect-active-tab` then `spawriter session bind <tabId> -s <id>` |
+| `No tab connected to this session` | `spawriter session reset <id>` → if still fails: create a new tab with `/connect-tab` + `forceCreate:true`, then `spawriter session bind <tabId> -s <id>` |
 | Tool timeout / connection error | `spawriter session reset <id>` then retry |
 | Relay not running | `spawriter relay --replace` then retry |
 | Override not reflected | `await ensureFreshRender()` |

@@ -11,12 +11,23 @@ Controls the user's **real Chrome tab** via CDP. Not headless — all actions af
 - **`single_spa`** — Override management, app lifecycle (status/set/remove/enable/disable/reset_all/mount/unmount/unload)
 - **`tab`** — Tab management (connect/list/switch/release) with ownership isolation
 
+## Tab Isolation Policy
+
+Agents must never take over a tab the user is reading. Use tabs in this order only:
+
+1. A tab already owned by this `session_id` (`MINE` in `tab { action: "list" }`).
+2. An idle spawriter-attached tab (`AVAILABLE`, the blue-dot tab).
+3. A newly created tab.
+
+Never use the user's active/current tab, `/connect-active-tab`, unmanaged existing Chrome tabs, or a tabId copied from the Chrome UI. URL matches do not make a user tab safe. If no owned or blue-dot idle tab is available, create a new tab.
+
 ## Connection Protocol
 
 1. Determine a `session_id` (use agent transcript UUID if available). Pass on `tab { action: "connect" }`, `tab { action: "list" }`, etc.
-2. Proactively call `tab { action: "connect", url: "target-url", create: true, session_id: "..." }` when you anticipate needing browser access.
-3. On `execute` error "No tab connected": call `tab { action: "connect", url: "target-url", create: true }` first, then retry `execute`.
-4. On connection error: retry → `reset` + retry → ask user to check Chrome/extension/relay.
+2. If your session already owns a tab, keep using it; do not reconnect just to navigate.
+3. Proactively call `tab { action: "connect", url: "target-url", create: true, session_id: "..." }` when you anticipate needing browser access. This may claim a blue-dot idle tab or create a new tab; it must not claim an unmanaged user tab.
+4. On `execute` error "No tab connected": call `tab { action: "connect", url: "about:blank", create: true, session_id: "..." }` first, then retry `execute`.
+5. On connection error: retry → `reset` + retry → ask user to check Chrome/extension/relay.
 
 ## When to Proactively Use the Browser
 
@@ -66,18 +77,20 @@ After any UI code change, automatically:
 ### tab
 
 - On `switch`: console/network/debugger/intercept state is cleared; `state` persists
-- `connect { url, create: true }` creates a new tab if no matching idle tab exists
+- `connect { url, create: true, session_id }` claims a blue-dot idle tab or creates a new tab if no matching idle tab exists
 - `connect` only searches idle attached tabs (never touches user's unmanaged tabs)
-- `list` shows all attached tabs with ownership info — useful to find available tabIds
+- `list` shows all attached tabs with ownership info — use only `MINE` or `AVAILABLE` tabIds
+- `switch` only to tabIds shown as `MINE` or `AVAILABLE`; never switch to a user/current tab not returned by `list`
 
 ## Safety Rules
 
 1. Only operate on normal web pages — never `chrome://` or extension pages
-2. Verify state via `single_spa { action: "status" }` / `execute`, not static assumptions
-3. Screenshot between major actions
-4. Don't assume code changes are live — confirm visually
-5. **CRITICAL: All cache/cookie/storage clearing is automatically origin-scoped — never affects other sites**
-6. Mock rules persist until disabled — always clean up
+2. Never use `/connect-active-tab`, the user's active/current tab, or arbitrary existing Chrome tabs
+3. Verify state via `single_spa { action: "status" }` / `execute`, not static assumptions
+4. Screenshot between major actions
+5. Don't assume code changes are live — confirm visually
+6. **CRITICAL: All cache/cookie/storage clearing is automatically origin-scoped — never affects other sites**
+7. Mock rules persist until disabled — always clean up
 
 ## Troubleshooting
 
@@ -85,9 +98,9 @@ Do not ask the user for help — recover autonomously using this table:
 
 | Symptom | Recovery |
 |---------|----------|
-| `No tab connected` on execute | `tab { action: "connect", url: "about:blank", create: true }` then retry execute |
+| `No tab connected` on execute | `tab { action: "connect", url: "about:blank", create: true, session_id: "..." }` then retry execute |
 | Tool timeout / connection error | `reset` then retry |
 | Override not reflected | `execute` → `ensureFreshRender()` or `clearCacheAndReload({ clear: "cache" })` |
 | App not mounting after override | Navigate to the app's route first |
 | Debugger not pausing | `execute` → `dbg.enable()` first |
-| All tabs owned by others | `tab { action: "connect", url: "about:blank", create: true }` |
+| All tabs owned by others | `tab { action: "connect", url: "about:blank", create: true, session_id: "..." }` to create a new tab |
