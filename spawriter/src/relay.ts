@@ -29,6 +29,8 @@ interface PendingRequest {
   clientMessageId: number;
   sessionId?: string;
   timeoutId: ReturnType<typeof setTimeout>;
+  method?: string;
+  createdAt: number;
 }
 
 interface TargetInfo {
@@ -65,6 +67,39 @@ let activeDownloadBehavior: DownloadBehavior | null = null;
 const pendingRequests = new Map<number, PendingRequest>();
 const pendingExtensionCmdRequests = new Map<number, ExtensionCmdPending>();
 let nextExtensionRequestId = 1;
+let relayProcessErrorHandlersInstalled = false;
+
+export function isRecoverablePlaywrightDialogRace(reason: unknown): boolean {
+  const text = reason instanceof Error
+    ? `${reason.name}: ${reason.message}\n${reason.stack ?? ''}`
+    : String(reason);
+  return text.includes('Page.handleJavaScriptDialog') && text.includes('No dialog is showing');
+}
+
+function installRelayProcessErrorHandlers(): void {
+  if (relayProcessErrorHandlersInstalled) return;
+  relayProcessErrorHandlersInstalled = true;
+
+  process.on('unhandledRejection', (reason) => {
+    if (isRecoverablePlaywrightDialogRace(reason)) {
+      error('Recovered Playwright dialog race:', reason);
+      return;
+    }
+    error('Unhandled rejection in relay, exiting:', reason);
+    process.exitCode = 1;
+    setImmediate(() => process.exit(1));
+  });
+
+  process.on('uncaughtException', (err, origin) => {
+    if (isRecoverablePlaywrightDialogRace(err)) {
+      error(`Recovered Playwright dialog race (${origin}):`, err);
+      return;
+    }
+    error(`Uncaught exception in relay (${origin}), exiting:`, err);
+    process.exitCode = 1;
+    setImmediate(() => process.exit(1));
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Tab Ownership System — multi-agent tab isolation
@@ -598,17 +633,36 @@ function sendCdpError(clientId: string, payload: { id: number; sessionId?: strin
 }
 
 const RELAY_REQUEST_TIMEOUT_MS = 90000;
+const RECENTLY_DELETED_MAX = 200;
+const recentlyDeletedRequests = new Map<number, { method?: string; deleteReason: string; deletedAt: number; createdAt: number }>();
+
+function deletePendingRequest(relayId: number, reason: string): PendingRequest | undefined {
+  const entry = pendingRequests.get(relayId);
+  if (!entry) return undefined;
+  clearTimeout(entry.timeoutId);
+  pendingRequests.delete(relayId);
+  recentlyDeletedRequests.set(relayId, {
+    method: entry.method,
+    deleteReason: reason,
+    deletedAt: Date.now(),
+    createdAt: entry.createdAt,
+  });
+  if (recentlyDeletedRequests.size > RECENTLY_DELETED_MAX) {
+    const oldest = recentlyDeletedRequests.keys().next().value;
+    if (oldest !== undefined) recentlyDeletedRequests.delete(oldest);
+  }
+  return entry;
+}
 
 function addPendingRequest(
   relayId: number,
   pending: Omit<PendingRequest, 'timeoutId'>
 ): void {
   const timeoutId = setTimeout(() => {
-    const timeoutPending = pendingRequests.get(relayId);
+    const timeoutPending = deletePendingRequest(relayId, 'timeout');
     if (!timeoutPending) {
       return;
     }
-    pendingRequests.delete(relayId);
     sendCdpError(timeoutPending.clientId, {
       id: timeoutPending.clientMessageId,
       sessionId: timeoutPending.sessionId,
@@ -1046,12 +1100,17 @@ function handleExtensionMessage(data: Buffer) {
 
       const pending = pendingRequests.get(response.id);
       if (!pending) {
-        error(`Received response for unknown request id: ${response.id}`);
+        const deleted = recentlyDeletedRequests.get(response.id);
+        if (deleted) {
+          const ageMs = Date.now() - deleted.createdAt;
+          error(`Late response for relay id ${response.id}: method=${deleted.method ?? '?'}, deletedReason=${deleted.deleteReason}, age=${(ageMs / 1000).toFixed(1)}s`);
+        } else {
+          error(`Received response for unknown request id: ${response.id}`);
+        }
         return;
       }
 
-      clearTimeout(pending.timeoutId);
-      pendingRequests.delete(response.id);
+      deletePendingRequest(response.id, 'completed');
       const payload = response.error
         ? { id: pending.clientMessageId, sessionId: pending.sessionId, error: { message: response.error } }
         : { id: pending.clientMessageId, sessionId: pending.sessionId, result: response.result };
@@ -1159,7 +1218,9 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       addPendingRequest(relayId, {
         clientId,
         clientMessageId: id,
-        sessionId: origSessionId,  // Keep virtual ID for response routing
+        sessionId: origSessionId,
+        method: params.method as string | undefined,
+        createdAt: Date.now(),
       });
       sendToExtension({
         id: relayId,
@@ -1204,7 +1265,9 @@ function handleCDPMessage(data: Buffer, clientId: string) {
     addPendingRequest(relayId, {
       clientId,
       clientMessageId: id,
-      sessionId,  // Keep the original (virtual) session ID for the response
+      sessionId,
+      method,
+      createdAt: Date.now(),
     });
 
     sendToExtension({
@@ -1212,7 +1275,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
       method: 'forwardCDPCommand',
       params: {
         method,
-        sessionId: realSessionId,  // Forward with real session ID
+        sessionId: realSessionId,
         params,
       },
     });
@@ -1508,6 +1571,7 @@ app.post('/cli/cdp', async (c) => {
 });
 
 export async function startRelayServer(): Promise<void> {
+  installRelayProcessErrorHandlers();
   const port = getRelayPort();
   if (ALLOW_ANY_EXTENSION) {
     error('No SSPA_EXTENSION_IDS configured. Allowing any chrome-extension origin.');
@@ -1658,8 +1722,7 @@ export async function startRelayServer(): Promise<void> {
         }
         for (const [requestId, pending] of pendingRequests.entries()) {
           if (pending.clientId === clientId) {
-            clearTimeout(pending.timeoutId);
-            pendingRequests.delete(requestId);
+            deletePendingRequest(requestId, 'client-disconnect');
           }
         }
         checkIdleShutdown();

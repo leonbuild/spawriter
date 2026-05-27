@@ -88,7 +88,7 @@ async function executeCode(options: {
     await ensureRelayServer();
   }
 
-  try {
+  const doFetch = async () => {
     const response = await fetch(`${serverUrl}/cli/execute`, {
       method: 'POST',
       headers: {
@@ -104,11 +104,27 @@ async function executeCode(options: {
       process.exit(1);
     }
 
-    const result = (await response.json()) as {
+    return (await response.json()) as {
       text: string;
       images: Array<{ data: string; mimeType: string }>;
       isError: boolean;
     };
+  };
+
+  try {
+    let result: Awaited<ReturnType<typeof doFetch>>;
+    try {
+      result = await doFetch();
+    } catch (firstError: any) {
+      if (firstError.cause?.code === 'ECONNREFUSED') {
+        console.error('Relay not reachable, restarting and retrying...');
+        await ensureRelayServer({ force: true });
+        await new Promise(r => setTimeout(r, 1500));
+        result = await doFetch();
+      } else {
+        throw firstError;
+      }
+    }
 
     if (result.text) {
       if (result.isError) {
@@ -127,8 +143,8 @@ async function executeCode(options: {
     if (result.isError) process.exit(1);
   } catch (error: any) {
     if (error.cause?.code === 'ECONNREFUSED') {
-      console.error('Error: Cannot connect to relay server.');
-      console.error('The relay server should start automatically. Check logs.');
+      console.error('Error: Cannot connect to relay server after retry.');
+      console.error('Check `spawriter relay` or logs.');
     } else {
       console.error(`Error: ${error.message}`);
     }

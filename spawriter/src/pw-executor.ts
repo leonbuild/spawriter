@@ -1,4 +1,4 @@
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright-core';
+import { chromium, type Browser, type BrowserContext, type Dialog, type Page } from 'playwright-core';
 import * as vm from 'node:vm';
 import * as util from 'node:util';
 import * as crypto from 'node:crypto';
@@ -230,15 +230,30 @@ function getCommandTimeout(method: string): number {
 
 const NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS = 250;
 const NAVIGATE_MIN_COMMAND_TIMEOUT_MS = 500;
+const NAVIGATE_DEFAULT_COMMAND_TIMEOUT_MS = 30000;
+const NAVIGATE_MIN_POST_ACTION_RESERVE_MS = 3000;
+const NAVIGATE_MAX_POST_ACTION_RESERVE_MS = 15000;
+const NAVIGATE_POST_ACTION_RESERVE_RATIO = 0.2;
 
 export function computeNavigateCommandTimeout(remainingExecutionMs: number): number {
   const remaining = Math.floor(remainingExecutionMs);
-  const budget = remaining - NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS;
-  const capped = Math.min(getCommandTimeout('Page.navigate'), budget);
+  const postActionReserve = Math.min(
+    NAVIGATE_MAX_POST_ACTION_RESERVE_MS,
+    Math.max(NAVIGATE_MIN_POST_ACTION_RESERVE_MS, Math.floor(remaining * NAVIGATE_POST_ACTION_RESERVE_RATIO)),
+  );
+  const budget = remaining - postActionReserve - NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS;
+  const capped = Math.min(NAVIGATE_DEFAULT_COMMAND_TIMEOUT_MS, getCommandTimeout('Page.navigate'), budget);
   if (capped < NAVIGATE_MIN_COMMAND_TIMEOUT_MS) {
     throw new NavigationBudgetError(remaining);
   }
   return capped;
+}
+
+export function isNoDialogShowingRace(err: unknown): boolean {
+  const text = err instanceof Error
+    ? `${err.name}: ${err.message}\n${err.stack ?? ''}`
+    : String(err);
+  return text.includes('Page.handleJavaScriptDialog') && text.includes('No dialog is showing');
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +542,17 @@ export class PlaywrightExecutor {
     if (this.pagesWithListeners.has(page)) return;
     this.pagesWithListeners.add(page);
 
+    page.on('dialog', (dialog: Dialog) => {
+      const action = dialog.type() === 'beforeunload'
+        ? dialog.accept()
+        : dialog.dismiss();
+      action.catch((err: unknown) => {
+        if (!isNoDialogShowingRace(err)) {
+          this.logger.error('Dialog handling failed:', err instanceof Error ? err.message : String(err));
+        }
+      });
+    });
+
     page.on('close', () => {
       if (this.page === page) {
         this.logger.log('Active page closed, looking for replacement...');
@@ -663,10 +689,12 @@ export class PlaywrightExecutor {
     const abortController = new AbortController();
     this.activeAbortController = abortController;
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let cdpSessionForExecution: any = null;
 
     try {
       const { page, context, browser } = await this.ensureConnection();
       const cdpSession = await this.getCDPSession(page);
+      cdpSessionForExecution = cdpSession;
 
       const prevDefaultTimeout = 30000;
       page.setDefaultTimeout(Math.min(timeout, prevDefaultTimeout));
@@ -783,25 +811,13 @@ export class PlaywrightExecutor {
       this.logger.error('Error in playwright execute:', e.stack || e.message);
 
       if (isTimeoutError) {
-        let tabResponsive = false;
-        try {
-          if (this.page && !this.page.isClosed()) {
-            await Promise.race([
-              this.page.evaluate('1').then(() => { tabResponsive = true; }),
-              new Promise((_, reject) => setTimeout(() => reject(new Error('post-timeout check')), 3000)),
-            ]);
-          }
-        } catch { /* tab is unresponsive */ }
-        if (!tabResponsive && this.page) {
-          this.logger.log('Tab unresponsive after timeout, forcing reconnect on next call');
-          this.page = null;
-          this.cachedCdpSession = null;
-        }
+        this.logger.log('Execution timed out, resetting Playwright/CDP connection before next call');
+        await this.recoverAfterExecutionTimeout(cdpSessionForExecution);
       }
 
       const logsText = PlaywrightExecutor.formatConsoleLogs(consoleLogs, 'Console output (before error)');
       const resetHint = isTimeoutError
-        ? '\n\n[HINT: Execution timed out. The operation may still be running in the browser. Use reset if the browser is in a bad state.]'
+        ? '\n\n[HINT: Execution timed out. The Playwright/CDP connection was reset; retry with a larger timeout or split navigation/wait/extraction into separate commands.]'
         : '\n\n[HINT: If this is a Playwright connection error, call reset to reconnect.]';
       const errorText = isTimeoutError ? e.message : (e.stack || e.message);
 
@@ -2419,9 +2435,29 @@ export class PlaywrightExecutor {
     // Preserve ownedTabIds/activeTabId/tabIdToUrl — they are logical ownership, not connection state
   }
 
-  private async closeQuietly(): Promise<void> {
+  private async recoverAfterExecutionTimeout(cdpSession: any): Promise<void> {
+    try {
+      if (cdpSession) {
+        await withTimeout(cdpSession.send('Runtime.terminateExecution', {}), 1000, 'Runtime.terminateExecution');
+      } else if (this.relaySendCdp) {
+        await this.relaySendCdp('Runtime.terminateExecution', {}, 1000);
+      }
+    } catch { /* best-effort only */ }
+
+    await this.closeQuietly(3000);
+  }
+
+  private async closeQuietly(timeoutMs = 5000): Promise<void> {
     if (this.browser) {
-      try { await this.browser.close(); } catch { /* ignore */ }
+      const browser = this.browser;
+      this.clearConnectionState();
+      try {
+        await Promise.race([
+          browser.close(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Browser close timeout')), timeoutMs)),
+        ]);
+      } catch { /* ignore */ }
+      return;
     }
     this.clearConnectionState();
   }

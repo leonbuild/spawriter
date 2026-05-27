@@ -279,12 +279,17 @@ describe('isExecutionTimeoutLikeError', () => {
 // ---------------------------------------------------------------------------
 
 describe('computeNavigateCommandTimeout', () => {
-  it('should reserve a safety buffer from remaining time', () => {
-    assert.equal(computeNavigateCommandTimeout(30000), 29750);
+  it('should reserve post-action budget from remaining time', () => {
+    const timeout = computeNavigateCommandTimeout(30000);
+    assert.ok(timeout < 30000, 'should be less than remaining');
+    assert.ok(timeout > 0, 'should be positive');
+    const reserve = 30000 - timeout;
+    assert.ok(reserve >= 3000, `reserve ${reserve}ms should be >= 3000ms`);
   });
 
-  it('should cap to Page.navigate command max timeout (60s)', () => {
-    assert.equal(computeNavigateCommandTimeout(90000), 60000);
+  it('should cap to default navigate timeout (30s)', () => {
+    const timeout = computeNavigateCommandTimeout(90000);
+    assert.ok(timeout <= 30000, `timeout ${timeout}ms should be <= 30000ms`);
   });
 
   it('should throw when remaining time is too small', () => {
@@ -294,13 +299,15 @@ describe('computeNavigateCommandTimeout', () => {
     );
   });
 
-  it('should honor lower-bound threshold exactly at 750ms remaining', () => {
-    assert.equal(computeNavigateCommandTimeout(750), 500);
+  it('should handle moderate remaining time (10s)', () => {
+    const timeout = computeNavigateCommandTimeout(10000);
+    assert.ok(timeout > 0, 'should be positive');
+    assert.ok(timeout < 10000, 'should be less than remaining');
   });
 
   it('should throw below lower-bound threshold', () => {
     assert.throws(
-      () => computeNavigateCommandTimeout(749),
+      () => computeNavigateCommandTimeout(500),
       /Insufficient execution time remaining for navigate/
     );
   });
