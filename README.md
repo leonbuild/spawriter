@@ -13,8 +13,8 @@ Other browser MCPs spawn a fresh Chrome — no logins, no extensions, instantly 
 ```bash
 git clone <repo-url> spawriter
 cd spawriter
-npm run setup          # install deps + build extension + build MCP server
-npm run link           # optional: makes `spawriter` command available system-wide
+npm run setup
+npm run link
 ```
 
 After linking, you can use `spawriter` directly from any terminal:
@@ -87,7 +87,7 @@ Run `spawriter skill` for the full CLI reference.
   "mcpServers": {
     "spawriter": {
       "command": "node",
-      "args": ["/path/to/spawriter/spawriter/dist/cli.js", "serve"]
+      "args": ["D:\\dev\\side\\spawriter\\spawriter\\dist\\cli.js", "serve"]
     }
   }
 }
