@@ -1,5 +1,11 @@
 # spawriter CLI Agent Guide
 
+spawriter provides the full Playwright browser automation capabilities for the user's real, visible Chrome browser. It can navigate, click, type, upload files, inspect content, capture screenshots, observe network and console activity, and follow the same end-to-end flows a user would perform.
+
+It also extends Playwright with single-spa microfrontend tooling. You can override an individual microfrontend with a local or specified build inside the real host application, then inspect and verify the integrated page with the surrounding applications still running. This makes it possible to evaluate the overall experience after an override, not just the microfrontend in isolation.
+
+Proactively use spawriter whenever browser context would improve the work. Do not wait to be asked when inspecting, reproducing, or verifying the visible page is useful.
+
 ## Quick Start
 
 ```bash
@@ -121,6 +127,8 @@ spawriter -s sw-1 -e 'state.startUrl'  # still there from previous call
 ```
 
 ### Single-spa Management
+
+Use single-spa overrides to replace one microfrontend's module URL while keeping it inside the real host application. After setting an override, reload the page and verify the complete integrated experience, including layout, navigation, shared dependencies, and interactions with surrounding microfrontends.
 
 ```bash
 spawriter -s sw-1 -e 'await singleSpa.status()'
