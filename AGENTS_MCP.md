@@ -1,8 +1,10 @@
 # spawriter MCP Tools
 
-Controls the user's **real Chrome tab** via CDP. Not headless — all actions affect the visible browser.
+spawriter provides the full Playwright browser automation capabilities for the user's **real, visible Chrome browser** through CDP. It can navigate, click, type, upload files, inspect content, capture screenshots, observe network and console activity, and follow the same end-to-end flows a user would perform. It is not headless; all actions affect the visible browser.
 
-**Proactively use these tools whenever browser context would improve your work.** Don't wait to be asked — if seeing the page helps, just do it. Tool parameters are self-documented via MCP tool definitions; this file covers behavioral guidance and non-obvious details.
+spawriter also extends Playwright with single-spa microfrontend tooling. You can override an individual microfrontend with a local or specified build inside the real host application, then inspect and verify the integrated page with the surrounding applications still running. This makes it possible to evaluate the overall experience after an override, not just the microfrontend in isolation.
+
+**Proactively use these tools whenever browser context would improve your work.** Don't wait to be asked — if seeing, reproducing, or verifying the page helps, just do it. Tool parameters are self-documented via MCP tool definitions; this file covers behavioral guidance and non-obvious details.
 
 ## Tool Catalog (4 tools)
 
@@ -70,6 +72,8 @@ After any UI code change, automatically:
 
 ### single_spa
 
+- Use overrides to replace one microfrontend's module URL while keeping it inside the real host application
+- After setting an override, verify the complete integrated experience, including layout, navigation, shared dependencies, and interactions with surrounding microfrontends
 - After `override_set`, call `execute` → `ensureFreshRender()` to reload with the override
 - `status` returns app list, statuses, and active import-map-overrides
 - Extension panel auto-syncs within ~3s
