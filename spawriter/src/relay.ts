@@ -230,11 +230,20 @@ function extractTargetUrlHint(code: string): string | undefined {
   return undefined;
 }
 
+// The tab the user is currently looking at (reported by the extension via
+// activeTabChanged). Auto-reuse must never take it over, even on URL match.
+let lastActiveTabId: number | null = null;
+
+export function setLastActiveTabId(tabId: number | null): void {
+  lastActiveTabId = tabId;
+}
+
 function pickReusableAttachedTab(preferredUrlHint?: string): { tabId: number; url: string; reason: string } | null {
   const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
   for (const target of attachedTargets.values()) {
     if (target.tabId == null) continue;
     if (getTabOwner(target.tabId)) continue;
+    if (target.tabId === lastActiveTabId) continue;
     const tabUrl = target.targetInfo?.url || '';
     candidates.push({
       tabId: target.tabId,
@@ -978,6 +987,12 @@ function handleExtensionMessage(data: Buffer) {
           }
         }
       }
+      return;
+    }
+
+    if (message.method === 'activeTabChanged') {
+      const tabId = (message as any).params?.tabId;
+      setLastActiveTabId(typeof tabId === 'number' ? tabId : null);
       return;
     }
 

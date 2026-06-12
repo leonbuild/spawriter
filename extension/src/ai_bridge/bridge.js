@@ -329,7 +329,31 @@ import browser from "webextension-polyfill";
       }
     });
 
+    // Keep the relay informed of the tab the user is looking at, so
+    // auto-reuse never takes over the active tab.
+    browser.tabs.onActivated.addListener(({ tabId }) => {
+      reportActiveTab(tabId);
+    });
+    browser.windows.onFocusChanged.addListener(async (windowId) => {
+      if (windowId === browser.windows.WINDOW_ID_NONE) return;
+      try {
+        const [tab] = await browser.tabs.query({ active: true, windowId });
+        if (tab?.id != null) reportActiveTab(tab.id);
+      } catch (_) {}
+    });
+
     debuggerEventListenerRegistered = true;
+  }
+
+  function reportActiveTab(tabId) {
+    sendMessage({ method: "activeTabChanged", params: { tabId } });
+  }
+
+  async function reportCurrentActiveTab() {
+    try {
+      const [tab] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+      if (tab?.id != null) reportActiveTab(tab.id);
+    } catch (_) {}
   }
 
   function emitDetachedFromTarget(tabId, reason) {
@@ -974,6 +998,7 @@ import browser from "webextension-polyfill";
             resyncAttachedTabs().then(async () => {
               await sleep(500);
               sendMessage({ method: "requestOwnershipSnapshot" });
+              reportCurrentActiveTab();
             });
           }
         } catch (_) {}
@@ -1023,6 +1048,7 @@ import browser from "webextension-polyfill";
         resyncAttachedTabs().then(async () => {
           await sleep(500);
           sendMessage({ method: "requestOwnershipSnapshot" });
+          reportCurrentActiveTab();
           syncTabGroup();
         });
       }

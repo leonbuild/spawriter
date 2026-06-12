@@ -175,12 +175,18 @@ function createRelayState() {
     return undefined;
   }
 
+  let activeTabId: number | null = null;
+  function setActiveTabId(tabId: number | null): void {
+    activeTabId = tabId;
+  }
+
   function pickReusableTab(code: string): { tabId: number; url: string; reason: string } | null {
     const preferredUrlHint = extractTargetUrlHint(code);
     const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
     for (const target of attachedTargets.values()) {
       if (target.tabId == null) continue;
       if (getTabOwner(target.tabId)) continue;
+      if (target.tabId === activeTabId) continue;
       const tabUrl = target.targetInfo?.url || '';
       const safe = SAFE_AUTO_CLAIM_URLS.some(safeUrl => tabUrl === safeUrl || tabUrl.startsWith(safeUrl));
       candidates.push({ tabId: target.tabId, url: tabUrl, safe });
@@ -235,6 +241,7 @@ function createRelayState() {
     safeAutoClaimTab,
     extractTargetUrlHint,
     pickReusableTab,
+    setActiveTabId,
   };
 }
 
@@ -1108,6 +1115,37 @@ describe('pickReusableTab', () => {
     assert.equal(result!.reason, 'safe-fallback');
   });
 
+  it('must not reuse the tab the user is looking at, even on URL match', () => {
+    relay.attachedTargets.set('target-active', {
+      sessionId: 'target-active',
+      tabId: 41,
+      targetInfo: { title: 'App', url: 'https://app.example.com/page', type: 'page', tabId: 41 },
+    });
+    relay.attachedTargets.set('target-safe', {
+      sessionId: 'target-safe',
+      tabId: 42,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 42 },
+    });
+    relay.setActiveTabId(41);
+
+    const result = relay.pickReusableTab('await navigate("https://app.example.com")');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 42, 'must skip the active tab and fall back to the safe one');
+    assert.equal(result!.reason, 'safe-fallback');
+  });
+
+  it('must not reuse an active about:blank tab; create instead (null)', () => {
+    relay.attachedTargets.set('target-safe-active', {
+      sessionId: 'target-safe-active',
+      tabId: 43,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 43 },
+    });
+    relay.setActiveTabId(43);
+
+    const result = relay.pickReusableTab('page.url()');
+    assert.equal(result, null);
+  });
+
   it('should return null when no safe tabs and no URL match (never take user tabs)', () => {
     relay.attachedTargets.set('target-a', {
       sessionId: 'target-a',
@@ -1402,6 +1440,42 @@ describe('regression: live target lifecycle events are browser-level', () => {
     assert.ok(block.includes('broadcastToCDPClients({'), 'expected browser-level broadcast');
     assert.ok(block.includes('return;'), 'must return instead of falling through to routeCdpEvent');
     assert.ok(!block.includes('routeCdpEvent(method'), 'must not route with top-level sessionId');
+  });
+});
+
+// ===========================================================================
+// Tests: the user's active tab must never be auto-reused (source-level
+// wiring; the logic itself is covered in the pickReusableTab suite above).
+// ===========================================================================
+
+describe('regression: active user tab is excluded from auto-reuse', () => {
+  const relaySource = readFileSync(new URL('./relay.ts', import.meta.url), 'utf-8');
+  const bridgeSource = readFileSync(
+    new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url),
+    'utf-8',
+  );
+
+  it('relay tracks activeTabChanged from the extension', () => {
+    assert.ok(relaySource.includes("message.method === 'activeTabChanged'"));
+    assert.ok(relaySource.includes('setLastActiveTabId('));
+  });
+
+  it('pickReusableAttachedTab skips the active tab before URL matching', () => {
+    const fn = relaySource.slice(
+      relaySource.indexOf('function pickReusableAttachedTab'),
+      relaySource.indexOf('function resolveTabIdFromSession'),
+    );
+    const exclusion = fn.indexOf('lastActiveTabId) continue');
+    const urlMatch = fn.indexOf('urlMatchesHint');
+    assert.ok(exclusion > -1, 'expected active-tab exclusion in candidate loop');
+    assert.ok(urlMatch > -1 && exclusion < urlMatch, 'exclusion must apply before URL matching');
+  });
+
+  it('extension reports active tab on activation, focus change, and resync', () => {
+    assert.ok(bridgeSource.includes('browser.tabs.onActivated.addListener'));
+    assert.ok(bridgeSource.includes('browser.windows.onFocusChanged.addListener'));
+    assert.ok(bridgeSource.includes('method: "activeTabChanged"'));
+    assert.ok(bridgeSource.includes('reportCurrentActiveTab()'), 'must push active tab after resync');
   });
 });
 

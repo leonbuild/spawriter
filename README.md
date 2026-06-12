@@ -182,7 +182,7 @@ Key features:
 - **Multi-agent isolation** — Tab Ownership System ensures exclusive tab ownership per session; idle sessions cleaned up after 30 min
 - **Per-tab status markers** — attached tabs show a dot in the tab title: 🟢 claimed by an agent session, 🔵 attached but idle (reusable); markers are applied idempotently by the extension only
 - **Persistent connection** — offscreen document survives MV3 service worker restarts
-- **User tab safety** — only uses spawriter-managed idle tabs or creates new ones; never hijacks user's browsing tabs
+- **User tab safety** — only uses spawriter-managed idle tabs or creates new ones; the extension reports the tab the user is currently viewing and the relay never auto-reuses it, even when its URL matches
 
 ## Scripts
 

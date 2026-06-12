@@ -12,6 +12,8 @@
 > **S6 设计演进（同日，依据用户反馈）**：彻底移除 title 小点后用户失去了 tab 级可视化（badge/icon 是全局的，无法在标签条上区分单个 tab）。最终方案改为**重新引入 title 小点标记，但以单写者幂等设计实现**：仅扩展一处写入（`setTabState`/`emitDetachedFromTarget`/`tabs.onUpdated` 汇聚到 `scheduleTitleMarker`），标记从权威状态（attachedTabs + tabOwnership）即时推导（🟢=被会话占用，🔵=已附加空闲），注入脚本先剥离已有标记且仅在变化时写入。双绿点的根因（扩展 markTabTitle 与 executor 注入的 MutationObserver 两个写者竞争）不复存在——pw-executor 侧无任何 title 写入（回归测试断言此不变量）。
 >
 > **MCP/CLI 对齐补全（同日）**：新增 CLI `tabs list` / `tabs connect <url> [--create|--force-create]` / `tabs release [tabId]` 三个命令（`ControlClient` 增加 `listTabs`/`connectTab`/`releaseTab`），与 MCP `tab` 工具的 connect/list/release 动作一一对应；`tab switch` 的 CLI 等价物为既有 `session bind <tabId>`（同一 `/cli/tab/claim` 路径）。`relay.test.ts` 新增行为级测试：以子进程启动真实 relay，用假扩展 + 假 Playwright 客户端走完整 WS 链路，断言 live attach/detach 以浏览器级事件送达（防止协议 bug 1/2 回归）。`cli.test.ts` 新增 MCP/CLI parity 源级断言。测试总数 1569。
+>
+> **活跃 tab 保护（同日，依据用户反馈）**：`pickReusableAttachedTab` 原先只排除"已被占用"的 tab，**不知道用户正在看哪个 tab**——若用户正浏览的页面恰好是已附加的空闲 tab（蓝点），且 URL 与 agent 代码中的 hint 匹配，自动复用会直接抢走用户眼前的标签页。修复：扩展通过 `tabs.onActivated` / `windows.onFocusChanged` 实时上报 `activeTabChanged`（初始化与重连 resync 后也推送一次），relay 记录 `lastActiveTabId` 并在 `pickReusableAttachedTab` 候选构建阶段无条件排除该 tab（URL 匹配分支与 safe 兜底分支同时生效）。被排除后若无其它候选则走"新建 tab"路径，用户体验不受影响。回归测试：`relay.test.ts` 逻辑用例（活跃 tab 即使 URL 匹配也跳过、活跃 about:blank 不复用）+ 源级接线断言（relay 处理 `activeTabChanged`、排除先于 URL 匹配、扩展三处上报）。测试总数 1577。
 
 - 配套审计报告：`docs/spawriter-full-audit-20260612.md`（问题编号 S1–S12 与此文一致）
 - 本文目标：针对每个问题给出**确切到文件/函数/行**的修复代码（before → after）、验证方法与回归测试要点，达到可直接照改的程度。
