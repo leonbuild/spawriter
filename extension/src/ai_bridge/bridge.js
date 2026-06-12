@@ -145,7 +145,10 @@ import browser from "webextension-polyfill";
         target: { tabId },
         func: (newPrefix, stripReSrc) => {
           const clean = document.title.replace(new RegExp(stripReSrc, "u"), "");
-          const next = (newPrefix || "") + clean;
+          // Blank pages have an empty title; a bare dot would be invisible
+          // in the tab strip, so fall back to the URL as the title base.
+          const base = clean || (newPrefix ? document.URL : "");
+          const next = (newPrefix || "") + base;
           if (document.title !== next) document.title = next;
         },
         args: [prefix, TITLE_PREFIX_STRIP_RE_SRC],
