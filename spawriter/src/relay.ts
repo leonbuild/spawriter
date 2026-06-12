@@ -23,6 +23,10 @@ import { ExecutorManager } from './pw-executor.js';
 
 interface CDPClient {
   ws: WebSocket;
+  /** sessionId → targetId already delivered to this client via Target.attachedToTarget.
+   *  Playwright hard-asserts ("Duplicate target") on a second attach for a known
+   *  targetId, so every announce path must consult and update this map. */
+  announcedTargets: Map<string, string>;
 }
 
 interface PendingRequest {
@@ -77,25 +81,48 @@ export function isRecoverablePlaywrightDialogRace(reason: unknown): boolean {
   return text.includes('Page.handleJavaScriptDialog') && text.includes('No dialog is showing');
 }
 
+// Playwright's CRBrowser hard-asserts when its page registry sees an attach for
+// a targetId it already knows (or similar registry corruption). That rejection
+// fires inside playwright-core's event handler — no executor call site can catch
+// it. It only poisons the in-process Playwright connections, never the relay's
+// own state, so the correct blast radius is "reset the executors", not "kill
+// the relay" (which would tear down the extension bridge and every CLI session).
+export function isPlaywrightTargetRegistryAssert(reason: unknown): boolean {
+  const text = reason instanceof Error
+    ? `${reason.name}: ${reason.message}\n${reason.stack ?? ''}`
+    : String(reason);
+  if (text.includes('Duplicate target ')) return true;
+  return text.includes('Assertion error') && /[\\/]chromium[\\/]cr(?:Browser|Connection|ServiceWorker|Page)/.test(text);
+}
+
+function handleRecoverableProcessError(reason: unknown, origin: string): boolean {
+  if (isRecoverablePlaywrightDialogRace(reason)) {
+    error(`Recovered Playwright dialog race (${origin}):`, reason);
+    return true;
+  }
+  if (isPlaywrightTargetRegistryAssert(reason)) {
+    error(`Playwright target-registry assert (${origin}); resetting executors instead of exiting:`, reason);
+    void relayExecutorManager.resetAll().catch((e) => {
+      error('Executor reset after target-registry assert failed:', e);
+    });
+    return true;
+  }
+  return false;
+}
+
 function installRelayProcessErrorHandlers(): void {
   if (relayProcessErrorHandlersInstalled) return;
   relayProcessErrorHandlersInstalled = true;
 
   process.on('unhandledRejection', (reason) => {
-    if (isRecoverablePlaywrightDialogRace(reason)) {
-      error('Recovered Playwright dialog race:', reason);
-      return;
-    }
+    if (handleRecoverableProcessError(reason, 'unhandledRejection')) return;
     error('Unhandled rejection in relay, exiting:', reason);
     process.exitCode = 1;
     setImmediate(() => process.exit(1));
   });
 
   process.on('uncaughtException', (err, origin) => {
-    if (isRecoverablePlaywrightDialogRace(err)) {
-      error(`Recovered Playwright dialog race (${origin}):`, err);
-      return;
-    }
+    if (handleRecoverableProcessError(err, origin)) return;
     error(`Uncaught exception in relay (${origin}), exiting:`, err);
     process.exitCode = 1;
     setImmediate(() => process.exit(1));
@@ -648,16 +675,28 @@ function addPendingRequest(
   });
 }
 
+// Forget a session's announce bookkeeping once a detach for it has been
+// broadcast, so a later legitimate re-attach is forwarded again.
+function clearAnnouncedTarget(sessionId: string): void {
+  for (const client of cdpClients.values()) {
+    client.announcedTargets.delete(sessionId);
+  }
+}
+
 function sendAttachedToTargetEvents(clientId: string): void {
   // Only expose targets that this client's session owns (or unclaimed targets)
   // to prevent Playwright from initializing pages it can't control
   const sessionId = pwClientToSession.get(clientId);
+  const client = cdpClients.get(clientId);
   for (const target of attachedTargets.values()) {
     if (target.tabId != null && sessionId) {
       const owner = tabOwners.get(target.tabId);
       if (owner && owner.sessionId !== sessionId) continue;
     }
     const targetInfo = buildTargetInfo(target);
+    const announcedId = targetInfo.targetId ?? target.sessionId;
+    if (client?.announcedTargets.get(target.sessionId) === announcedId) continue;
+    client?.announcedTargets.set(target.sessionId, announcedId);
     sendToCDPClient(clientId, {
       method: 'Target.attachedToTarget',
       params: {
@@ -985,6 +1024,10 @@ function handleExtensionMessage(data: Buffer) {
           for (const [existingSessionId, existing] of attachedTargets) {
             if (existing.tabId === incomingTabId && existingSessionId !== sessionId) {
               log(`Replacing stale target for tabId ${incomingTabId}: ${existingSessionId} → ${sessionId}`);
+              // Enrich with targetId or Playwright cannot resolve which page
+              // died and keeps it registered — the next attach for the same
+              // frame then hits CRBrowser's "Duplicate target" assert.
+              const staleTargetId = buildTargetInfo(existing).targetId;
               attachedTargets.delete(existingSessionId);
               if (incomingTabId != null && tabOwners.has(incomingTabId)) {
                 tabOwners.delete(incomingTabId);
@@ -993,32 +1036,52 @@ function handleExtensionMessage(data: Buffer) {
               }
               broadcastToCDPClients({
                 method: 'Target.detachedFromTarget',
-                params: { sessionId: existingSessionId, reason: 'target-replaced' },
+                params: { sessionId: existingSessionId, targetId: staleTargetId, reason: 'target-replaced' },
               });
+              clearAnnouncedTarget(existingSessionId);
             }
           }
         }
+        // Same-session re-announce (extension resync after reconnect): if the
+        // targetId changed underneath (e.g. cross-process navigation while the
+        // bridge was down), detach the old identity first so no client keeps a
+        // page registered under it.
+        const previous = attachedTargets.get(sessionId);
+        const previousTargetId = previous ? buildTargetInfo(previous).targetId : undefined;
         attachedTargets.set(sessionId, {
           sessionId,
           tabId: incomingTabId,
           targetInfo,
         });
+        const enrichedTargetInfo = buildTargetInfo(attachedTargets.get(sessionId)!);
+        if (previousTargetId !== undefined && previousTargetId !== enrichedTargetInfo.targetId) {
+          broadcastToCDPClients({
+            method: 'Target.detachedFromTarget',
+            params: { sessionId, targetId: previousTargetId, reason: 'target-id-changed' },
+          });
+          clearAnnouncedTarget(sessionId);
+        }
 
         if ((targetInfo?.type ?? 'page') === 'page') {
           applyDownloadBehaviorToTarget(sessionId);
         }
 
-        const enrichedTargetInfo = buildTargetInfo(attachedTargets.get(sessionId)!);
         // Browser-level event: no top-level sessionId, or Playwright routes it
         // to a not-yet-existing CRSession and drops it (live-attached tabs
         // would never become pages). Apply the same per-client ownership
         // filter as the connect-time replay in sendAttachedToTargetEvents.
-        for (const [cdpClientId] of cdpClients) {
+        // Skip clients that already saw this (sessionId, targetId) pair: the
+        // extension re-announces every tab on resync, and a duplicate attach
+        // makes Playwright's CRBrowser assert and unwind the whole process.
+        const announcedId = enrichedTargetInfo.targetId ?? sessionId;
+        for (const [cdpClientId, cdpClient] of cdpClients) {
           const boundSession = pwClientToSession.get(cdpClientId);
           if (incomingTabId != null && boundSession) {
             const owner = tabOwners.get(incomingTabId);
             if (owner && owner.sessionId !== boundSession) continue;
           }
+          if (cdpClient.announcedTargets.get(sessionId) === announcedId) continue;
+          cdpClient.announcedTargets.set(sessionId, announcedId);
           sendToCDPClient(cdpClientId, {
             method,
             params: {
@@ -1070,6 +1133,7 @@ function handleExtensionMessage(data: Buffer) {
             ? { ...(params as Record<string, unknown>), targetId: detachedTargetId }
             : params,
         });
+        if (detachedSessionId) clearAnnouncedTarget(detachedSessionId);
         return;
       }
 
@@ -1746,10 +1810,19 @@ export async function startRelayServer(): Promise<void> {
         for (const target of attachedTargets.values()) {
           broadcastToCDPClients({
             method: 'Target.detachedFromTarget',
-            params: { sessionId: target.sessionId, reason: 'extension-disconnected' },
+            params: {
+              sessionId: target.sessionId,
+              // Without targetId Playwright cannot unregister the page, and the
+              // re-announce after the extension reconnects would be a duplicate.
+              targetId: buildTargetInfo(target).targetId,
+              reason: 'extension-disconnected',
+            },
           });
         }
         attachedTargets.clear();
+        for (const client of cdpClients.values()) {
+          client.announcedTargets.clear();
+        }
         activeDownloadBehavior = null;
         for (const pending of pendingRequests.values()) {
           clearTimeout(pending.timeoutId);
@@ -1791,9 +1864,10 @@ export async function startRelayServer(): Promise<void> {
 
       log(`CDP WebSocket connected: ${clientId}`);
 
-      cdpClients.set(clientId, {
-        ws: ws as WebSocket,
-      });
+    cdpClients.set(clientId, {
+      ws: ws as WebSocket,
+      announcedTargets: new Map(),
+    });
 
       ws.on('message', (data) => {
         handleCDPMessage(rawDataToBuffer(data), clientId);

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { VERSION, getCdpUrl, DEFAULT_PORT } from './utils.js';
 import { OWNERSHIP_ERROR_CODE } from './protocol.js';
-import { resolveCdpSessionForCaller } from './relay.js';
+import { resolveCdpSessionForCaller, isPlaywrightTargetRegistryAssert } from './relay.js';
 
 // ---------------------------------------------------------------------------
 // Simulated relay state (mirrors relay.ts structures)
@@ -1365,6 +1365,199 @@ describe('behavioral: live target lifecycle over WS', () => {
       const detach = await waitForMethod('Target.detachedFromTarget');
       assert.equal(detach.sessionId, undefined, 'detach must not carry a top-level sessionId');
       assert.equal(detach.params.targetId, 'TT42', 'detach must be enriched with targetId');
+
+      ext.close();
+      pw.close();
+    } finally {
+      child.kill();
+      await new Promise(r => setTimeout(r, 200));
+      try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  });
+});
+
+// ===========================================================================
+// Tests: duplicate-attach containment. The extension re-announces every tab on
+// resync (service-worker wake, relay reconnect). Forwarding such a re-announce
+// verbatim makes Playwright's CRBrowser assert ("Duplicate target …"), which
+// surfaces as an unhandled rejection and used to kill the whole relay.
+// ===========================================================================
+
+describe('isPlaywrightTargetRegistryAssert', () => {
+  it('matches the CRBrowser duplicate-target assert', () => {
+    assert.ok(isPlaywrightTargetRegistryAssert(new Error('Duplicate target spawriter-tab-1842658130-1765507333411')));
+  });
+
+  it('matches generic assertion errors from playwright chromium internals', () => {
+    const err = new Error('Assertion error');
+    err.stack = `Error: Assertion error\n    at assert (/x/node_modules/playwright-core/lib/utils/isomorphic/assert.js:5:11)\n    at CRBrowser._onAttachedToTarget (/x/node_modules/playwright-core/lib/server/chromium/crBrowser.js:154:30)`;
+    assert.ok(isPlaywrightTargetRegistryAssert(err));
+  });
+
+  it('does not match unrelated errors', () => {
+    assert.ok(!isPlaywrightTargetRegistryAssert(new Error('ECONNREFUSED 127.0.0.1:9222')));
+    const other = new Error('Assertion error');
+    other.stack = 'Error: Assertion error\n    at somewhere (/x/app/main.js:1:1)';
+    assert.ok(!isPlaywrightTargetRegistryAssert(other));
+  });
+});
+
+describe('regression: duplicate attach announces are contained', () => {
+  const relaySource = readFileSync(new URL('./relay.ts', import.meta.url), 'utf-8');
+  const bridgeSource = readFileSync(new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url), 'utf-8');
+
+  it('relay tracks per-client announced targets and skips re-announces', () => {
+    assert.ok(relaySource.includes('announcedTargets: Map<string, string>'), 'CDPClient must track announced targets');
+    const block = relaySource.slice(
+      relaySource.indexOf("method === 'Target.attachedToTarget' && sessionId"),
+      relaySource.indexOf('Target.tabAvailable'),
+    );
+    assert.ok(block.includes('announcedTargets.get(sessionId) === announcedId) continue'), 'live attach must skip already-announced clients');
+    assert.ok(block.includes("reason: 'target-id-changed'"), 'targetId change must detach the old identity first');
+  });
+
+  it('every detach broadcast carries a targetId so Playwright can unregister the page', () => {
+    assert.ok(
+      relaySource.includes("targetId: staleTargetId, reason: 'target-replaced'"),
+      'target-replaced detach must carry targetId',
+    );
+    assert.ok(
+      relaySource.includes('targetId: buildTargetInfo(target).targetId'),
+      'extension-disconnect detach must carry targetId',
+    );
+  });
+
+  it('announce bookkeeping is cleared on every detach path', () => {
+    const calls = relaySource.match(/clearAnnouncedTarget\(/g) ?? [];
+    assert.ok(calls.length >= 4, `definition + replace/idchange/detach callers, got ${calls.length}`);
+    assert.ok(relaySource.includes('client.announcedTargets.clear()'), 'extension disconnect must reset announce maps');
+  });
+
+  it('relay survives playwright target-registry asserts instead of exiting', () => {
+    assert.ok(relaySource.includes('isPlaywrightTargetRegistryAssert'), 'error handlers must classify registry asserts');
+    assert.ok(relaySource.includes('relayExecutorManager.resetAll()'), 'recovery must reset executors, not exit');
+  });
+
+  it('extension resync is single-flight', () => {
+    assert.ok(bridgeSource.includes('if (resyncInFlight) return resyncInFlight'), 'concurrent resyncs must share one pass');
+    assert.ok(bridgeSource.includes('doResyncAttachedTabs().finally'), 'in-flight marker must always clear');
+  });
+});
+
+describe('behavioral: duplicate attach announces over WS', () => {
+  it('re-announces are deduped per client; detaches re-arm announcing', async () => {
+    const { spawn } = await import('node:child_process');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { default: WebSocket } = await import('ws');
+
+    const srcDir = path.dirname(fileURLToPath(import.meta.url));
+    const pkgRoot = path.join(srcDir, '..');
+    const tsxCli = path.join(pkgRoot, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const port = 23000 + (process.pid % 2000);
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'spawriter-test-'));
+
+    const child = spawn(
+      process.execPath,
+      [tsxCli, path.join(srcDir, 'cli.ts'), 'relay', '--port', String(port)],
+      {
+        stdio: 'ignore',
+        env: { ...process.env, SSPA_MCP_PORT: String(port), TEMP: tmp, TMP: tmp, TMPDIR: tmp },
+      },
+    );
+
+    try {
+      const deadline = Date.now() + 20000;
+      let up = false;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/version`, { signal: AbortSignal.timeout(500) });
+          if (res.ok) { up = true; break; }
+        } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      assert.ok(up, 'relay child did not start in time');
+
+      const openWs = (url: string, opts?: Record<string, unknown>) =>
+        new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+          const ws = new WebSocket(url, opts);
+          ws.once('open', () => resolve(ws));
+          ws.once('error', reject);
+        });
+
+      const received: Array<{ method?: string; params?: any }> = [];
+      const pw = await openWs(`ws://127.0.0.1:${port}/cdp/pw-test-dup`);
+      pw.on('message', (d: Buffer) => received.push(JSON.parse(d.toString())));
+
+      const attaches = () => received.filter(m => m.method === 'Target.attachedToTarget');
+      const detaches = () => received.filter(m => m.method === 'Target.detachedFromTarget');
+      const waitFor = async (pred: () => boolean, what: string) => {
+        const end = Date.now() + 5000;
+        while (Date.now() < end) {
+          if (pred()) return;
+          await new Promise(r => setTimeout(r, 50));
+        }
+        assert.fail(`timeout waiting for ${what}; got: ${received.map(m => m.method).join(', ') || '(nothing)'}`);
+      };
+      const announce = (ext: InstanceType<typeof WebSocket>, sessionId: string, targetId: string) =>
+        ext.send(JSON.stringify({
+          method: 'forwardCDPEvent',
+          params: {
+            method: 'Target.attachedToTarget',
+            sessionId,
+            params: {
+              sessionId,
+              targetInfo: { targetId, type: 'page', tabId: 42, url: 'about:blank', title: '' },
+            },
+          },
+        }));
+
+      let ext = await openWs(`ws://127.0.0.1:${port}/extension`, {
+        headers: { origin: 'chrome-extension://testextension' },
+      });
+
+      // 1. First announce reaches the client.
+      announce(ext, 'spawriter-tab-42-1', 'TT42');
+      await waitFor(() => attaches().length === 1, 'first attach');
+
+      // 2. Identical re-announce (extension resync) must NOT be forwarded again.
+      announce(ext, 'spawriter-tab-42-1', 'TT42');
+      await new Promise(r => setTimeout(r, 400));
+      assert.equal(attaches().length, 1, 'duplicate announce must be swallowed');
+
+      // 3. Same session, new targetId (cross-process nav while bridge was down):
+      //    old identity is detached, new one announced.
+      announce(ext, 'spawriter-tab-42-1', 'TT42b');
+      await waitFor(() => attaches().length === 2, 'attach with new targetId');
+      assert.ok(
+        detaches().some(m => m.params?.targetId === 'TT42' && m.params?.reason === 'target-id-changed'),
+        'old targetId must be detached before the new announce',
+      );
+
+      // 4. New session for the same tab (debugger re-attach): stale session is
+      //    detached with its targetId, then the new session is announced.
+      announce(ext, 'spawriter-tab-42-2', 'TT43');
+      await waitFor(() => attaches().length === 3, 'attach for replacement session');
+      assert.ok(
+        detaches().some(m => m.params?.sessionId === 'spawriter-tab-42-1' && m.params?.targetId === 'TT42b'),
+        'replaced session detach must carry its targetId',
+      );
+
+      // 5. Extension drops: detach is enriched, announce bookkeeping resets,
+      //    so the post-reconnect resync is forwarded again.
+      ext.close();
+      await waitFor(
+        () => detaches().some(m => m.params?.reason === 'extension-disconnected' && m.params?.targetId === 'TT43'),
+        'enriched extension-disconnected detach',
+      );
+
+      ext = await openWs(`ws://127.0.0.1:${port}/extension`, {
+        headers: { origin: 'chrome-extension://testextension' },
+      });
+      announce(ext, 'spawriter-tab-42-2', 'TT43');
+      await waitFor(() => attaches().length === 4, 're-announce after reconnect must be forwarded');
 
       ext.close();
       pw.close();

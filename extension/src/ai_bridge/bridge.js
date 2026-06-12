@@ -781,7 +781,23 @@ import browser from "webextension-polyfill";
     }
   }
 
-  async function resyncAttachedTabs() {
+  let resyncInFlight = null;
+
+  function resyncAttachedTabs() {
+    // The init path and the ws-state-change("open") handler both fire when the
+    // service worker wakes with the relay already connected. Two interleaved
+    // resyncs each pass the !existing check before either writes attachedTabs,
+    // minting two sessionIds for the same tab and double-announcing every
+    // target — Playwright hard-asserts on the duplicate attach. Single-flight:
+    // concurrent callers share one pass.
+    if (resyncInFlight) return resyncInFlight;
+    resyncInFlight = doResyncAttachedTabs().finally(() => {
+      resyncInFlight = null;
+    });
+    return resyncInFlight;
+  }
+
+  async function doResyncAttachedTabs() {
     try {
       const targets = await chrome.debugger.getTargets();
       const liveAttached = targets.filter(
