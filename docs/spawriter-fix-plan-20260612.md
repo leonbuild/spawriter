@@ -14,6 +14,10 @@
 > **MCP/CLI 对齐补全（同日）**：新增 CLI `tabs list` / `tabs connect <url> [--create|--force-create]` / `tabs release [tabId]` 三个命令（`ControlClient` 增加 `listTabs`/`connectTab`/`releaseTab`），与 MCP `tab` 工具的 connect/list/release 动作一一对应；`tab switch` 的 CLI 等价物为既有 `session bind <tabId>`（同一 `/cli/tab/claim` 路径）。`relay.test.ts` 新增行为级测试：以子进程启动真实 relay，用假扩展 + 假 Playwright 客户端走完整 WS 链路，断言 live attach/detach 以浏览器级事件送达（防止协议 bug 1/2 回归）。`cli.test.ts` 新增 MCP/CLI parity 源级断言。测试总数 1569。
 >
 > **tab 获取边界定稿（同日，依据用户反馈）**：自动获取顺序为**自有 tab → 蓝点（已附加空闲）tab → 新建**。产品约定：蓝点 tab 是 agent 领地，用户不浏览蓝点 tab，因此复用无需活跃 tab 检测（曾实现"扩展上报活跃 tab + relay 排除"机制，经用户确认该约定后移除，避免冗余）；无点 tab 对自动路径完全不可见——`pickReusableAttachedTab` 是唯一复用决策点且仅遍历 `attachedTargets`。回归测试：`relay.test.ts` 断言唯一决策点、仅见已附加表、跳过已占用 tab。测试总数 1573。
+>
+> **执行页解析修复（同日，e2e 发现）**：新建 tab 的 page 对象在 Playwright `context.pages()` 中异步出现，`ensureConnection` 原先找不到时静默回退 `pages[0]`，导致 execute 代码跑在无关页面（实测跑在了用户的知乎页上，所有权未被破坏但页面解析错误）。修复：`waitForPageForTab` 轮询等待 owned tab 的 page（3s 超时报错），绝不回退到无关页面。回归测试 2 个（等待异步出现的 page、永不出现时报错）。
+>
+> **Prepared tab 交互（同日，依据用户反馈）**：用户可以主动附加一个 tab 并导航到目标页面，作为"准备好的页面"交给 agent——无 URL hint 的 execute 优先复用最近附加的**内容蓝点**（非空白页），reason=`prepared-tab`；带 hint 的 execute 只做 url-match 或取空白蓝点，**绝不把 prepared tab 导航到别处**。空白蓝点选择从随机改为取最近附加（reason 由 `idle-random` 更名 `idle-blank`）。同时 title 标记对 about:blank 等受限页面增加 debugger `Runtime.evaluate` 兜底（`scripting.executeScript` 被 Chrome 拒绝时经已附加的 debugger 会话写入，空 title 以 URL 为基底），新建空白 tab 也能显示 🟢/🔵。测试总数 1576。
 
 - 配套审计报告：`docs/spawriter-full-audit-20260612.md`（问题编号 S1–S12 与此文一致）
 - 本文目标：针对每个问题给出**确切到文件/函数/行**的修复代码（before → after）、验证方法与回归测试要点，达到可直接照改的程度。

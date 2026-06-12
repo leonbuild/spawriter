@@ -187,21 +187,20 @@ function createRelayState() {
     }
     if (candidates.length === 0) return null;
 
+    const newestFirst = [...candidates].reverse();
+
     if (preferredUrlHint) {
-      const matched = candidates.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
+      const matched = newestFirst.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
       if (matched) return { tabId: matched.tabId, url: matched.url, reason: 'url-match' };
+      const blank = newestFirst.find(c => c.safe);
+      if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'safe-fallback' };
+      return null;
     }
 
-    const safeCandidates = candidates.filter(c => c.safe);
-    if (safeCandidates.length > 0) {
-      const pick = safeCandidates[Math.floor(Math.random() * safeCandidates.length)];
-      return {
-        tabId: pick.tabId,
-        url: pick.url,
-        reason: preferredUrlHint ? 'safe-fallback' : 'idle-random',
-      };
-    }
-
+    const prepared = newestFirst.find(c => !c.safe);
+    if (prepared) return { tabId: prepared.tabId, url: prepared.url, reason: 'prepared-tab' };
+    const blank = newestFirst.find(c => c.safe);
+    if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'idle-blank' };
     return null;
   }
 
@@ -1108,7 +1107,9 @@ describe('pickReusableTab', () => {
     assert.equal(result!.reason, 'safe-fallback');
   });
 
-  it('should return null when no safe tabs and no URL match (never take user tabs)', () => {
+  it('without a hint, reuses the most recently prepared content tab', () => {
+    // The user attaches a tab and navigates it somewhere on purpose: that
+    // page is being handed to the agent, so a hint-less execute gets it.
     relay.attachedTargets.set('target-a', {
       sessionId: 'target-a',
       tabId: 31,
@@ -1121,10 +1122,23 @@ describe('pickReusableTab', () => {
     });
 
     const result = relay.pickReusableTab('state.count = (state.count || 0) + 1');
-    assert.equal(result, null);
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 32, 'most recently attached content tab wins');
+    assert.equal(result!.reason, 'prepared-tab');
   });
 
-  it('should randomly pick among multiple safe tabs', () => {
+  it('with a hint that matches nothing, never diverts a prepared content tab', () => {
+    relay.attachedTargets.set('prepared', {
+      sessionId: 'prepared',
+      tabId: 33,
+      targetInfo: { title: 'Docs', url: 'https://docs.example.com', type: 'page', tabId: 33 },
+    });
+
+    const result = relay.pickReusableTab('await navigate("https://other.example.com")');
+    assert.equal(result, null, 'must create a new tab instead of navigating the prepared one away');
+  });
+
+  it('should pick the most recent among multiple blank tabs', () => {
     relay.attachedTargets.set('target-blank-1', {
       sessionId: 'target-blank-1',
       tabId: 40,
@@ -1138,8 +1152,8 @@ describe('pickReusableTab', () => {
 
     const result = relay.pickReusableTab('state.count = 1');
     assert.notEqual(result, null);
-    assert.ok([40, 41].includes(result!.tabId));
-    assert.equal(result!.reason, 'idle-random');
+    assert.equal(result!.tabId, 41);
+    assert.equal(result!.reason, 'idle-blank');
   });
 
   it('should return null when all tabs are owned', () => {
@@ -1202,7 +1216,7 @@ describe('pickReusableTab', () => {
     assert.equal(result, null);
   });
 
-  it('should handle chrome://newtab/ as safe for random pick', () => {
+  it('should treat chrome://newtab/ as a blank reusable tab', () => {
     relay.attachedTargets.set('newtab', {
       sessionId: 'newtab', tabId: 90,
       targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 90 },
@@ -1211,10 +1225,10 @@ describe('pickReusableTab', () => {
     const result = relay.pickReusableTab('console.log("hi")');
     assert.notEqual(result, null);
     assert.equal(result!.tabId, 90);
-    assert.equal(result!.reason, 'idle-random');
+    assert.equal(result!.reason, 'idle-blank');
   });
 
-  it('should handle edge://newtab/ as safe for random pick', () => {
+  it('should treat edge://newtab/ as a blank reusable tab', () => {
     relay.attachedTargets.set('edge-newtab', {
       sessionId: 'edge-newtab', tabId: 91,
       targetInfo: { title: 'New Tab', url: 'edge://newtab/', type: 'page', tabId: 91 },
@@ -1223,17 +1237,19 @@ describe('pickReusableTab', () => {
     const result = relay.pickReusableTab('console.log("hi")');
     assert.notEqual(result, null);
     assert.equal(result!.tabId, 91);
-    assert.equal(result!.reason, 'idle-random');
+    assert.equal(result!.reason, 'idle-blank');
   });
 
-  it('should return null when only non-safe unowned tabs with no URL hint', () => {
-    relay.attachedTargets.set('user-tab', {
-      sessionId: 'user-tab', tabId: 100,
+  it('hint-less execute picks up a lone prepared content tab', () => {
+    relay.attachedTargets.set('prepared-tab', {
+      sessionId: 'prepared-tab', tabId: 100,
       targetInfo: { title: 'Gmail', url: 'https://mail.google.com', type: 'page', tabId: 100 },
     });
 
     const result = relay.pickReusableTab('state.data = []');
-    assert.equal(result, null);
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 100);
+    assert.equal(result!.reason, 'prepared-tab');
   });
 
   it('should return null when URL hint matches but only non-safe candidates remain after excluding owned', () => {
@@ -1267,13 +1283,13 @@ describe('pickReusableTab', () => {
     assert.equal(result!.reason, 'safe-fallback');
   });
 
-  it('should handle mixed owned/safe/user tabs correctly', () => {
+  it('should prefer a prepared content tab over a blank one and skip owned tabs', () => {
     relay.attachedTargets.set('owned-safe', {
       sessionId: 'owned-safe', tabId: 130,
       targetInfo: { title: 'Blank', url: 'about:blank', type: 'page', tabId: 130 },
     });
-    relay.attachedTargets.set('user-gmail', {
-      sessionId: 'user-gmail', tabId: 131,
+    relay.attachedTargets.set('prepared-gmail', {
+      sessionId: 'prepared-gmail', tabId: 131,
       targetInfo: { title: 'Gmail', url: 'https://mail.google.com', type: 'page', tabId: 131 },
     });
     relay.attachedTargets.set('free-safe', {
@@ -1284,8 +1300,8 @@ describe('pickReusableTab', () => {
 
     const result = relay.pickReusableTab('state.x = 1');
     assert.notEqual(result, null);
-    assert.equal(result!.tabId, 132);
-    assert.equal(result!.reason, 'idle-random');
+    assert.equal(result!.tabId, 131, 'attached content page is a prepared hand-off to the agent');
+    assert.equal(result!.reason, 'prepared-tab');
   });
 });
 

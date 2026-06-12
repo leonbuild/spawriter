@@ -183,6 +183,7 @@ Key features:
 - **Per-tab status markers** — attached tabs show a dot in the tab title: 🟢 claimed by an agent session, 🔵 attached but idle (reusable); markers are applied idempotently by the extension only
 - **Persistent connection** — offscreen document survives MV3 service worker restarts
 - **User tab safety** — auto-acquisition only sees attached (dotted) tabs: 🔵 idle tabs are agent territory and freely reusable, undotted user tabs are never touched; when nothing is reusable a new tab is created
+- **Prepared tabs** — attach a tab and navigate it to a target page to hand it to an agent: a hint-less execute picks the most recent 🔵 content tab first, while an execute targeting a different URL never diverts it (uses a blank tab or creates one)
 
 ## Scripts
 

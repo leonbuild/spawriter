@@ -151,7 +151,21 @@ import browser from "webextension-polyfill";
         args: [prefix, TITLE_PREFIX_STRIP_RE_SRC],
       });
     } catch (_) {
-      // Tab already closed or a restricted page (chrome:// etc.).
+      // scripting.executeScript is blocked on about:blank and other
+      // restricted schemes. Attached tabs have a debugger session, so
+      // evaluate through it; the marker would otherwise be invisible on
+      // freshly created blank tabs.
+      if (!attachedTabs.has(tabId)) return;
+      try {
+        await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+          expression:
+            `(() => { const clean = document.title.replace(new RegExp(${JSON.stringify(TITLE_PREFIX_STRIP_RE_SRC)}, "u"), "");` +
+            ` const next = ${JSON.stringify(prefix || "")} + (clean || document.URL);` +
+            ` if (document.title !== next) document.title = next; })()`,
+        });
+      } catch (_) {
+        // Tab closed or debugger detached meanwhile.
+      }
     }
   }
 

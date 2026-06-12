@@ -233,6 +233,12 @@ function extractTargetUrlHint(code: string): string | undefined {
 // Blue-dot (attached, unowned) tabs are agent territory by convention: the
 // user does not browse them, so reuse needs no active-tab check. Tabs without
 // a dot are never visible to auto-acquisition.
+//
+// A blue-dot tab on a content URL is treated as *prepared*: the user attached
+// it and navigated somewhere on purpose, to hand that page to an agent.
+// - No URL hint (agent wants "a tab"): prepared tab first, then a blank one.
+// - With a URL hint: exact match first, then a blank tab to navigate; a
+//   prepared tab is never diverted to an unrelated destination.
 function pickReusableAttachedTab(preferredUrlHint?: string): { tabId: number; url: string; reason: string } | null {
   const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
   for (const target of attachedTargets.values()) {
@@ -247,21 +253,21 @@ function pickReusableAttachedTab(preferredUrlHint?: string): { tabId: number; ur
   }
   if (candidates.length === 0) return null;
 
+  // Most recently attached last (Map preserves insertion order); prefer it.
+  const newestFirst = [...candidates].reverse();
+
   if (preferredUrlHint) {
-    const urlMatched = candidates.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
+    const urlMatched = newestFirst.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
     if (urlMatched) return { tabId: urlMatched.tabId, url: urlMatched.url, reason: 'url-match' };
+    const blank = newestFirst.find(c => c.safe);
+    if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'safe-fallback' };
+    return null;
   }
 
-  const safeCandidates = candidates.filter(c => c.safe);
-  if (safeCandidates.length > 0) {
-    const pick = safeCandidates[Math.floor(Math.random() * safeCandidates.length)];
-    return {
-      tabId: pick.tabId,
-      url: pick.url,
-      reason: preferredUrlHint ? 'safe-fallback' : 'idle-random',
-    };
-  }
-
+  const prepared = newestFirst.find(c => !c.safe);
+  if (prepared) return { tabId: prepared.tabId, url: prepared.url, reason: 'prepared-tab' };
+  const blank = newestFirst.find(c => c.safe);
+  if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'idle-blank' };
   return null;
 }
 
