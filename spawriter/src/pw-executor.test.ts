@@ -1525,6 +1525,55 @@ describe('PlaywrightExecutor tab management', () => {
     executor.switchToTab(1);
     assert.equal((executor as any).page, pageB);
   });
+
+  it('ensureConnection waits for the owned tab page instead of falling back to pages[0]', async () => {
+    // A freshly created tab attaches asynchronously: its page may not be in
+    // context.pages() yet when execute() starts. Falling back to pages[0]
+    // would run code on an unrelated (possibly user-visible) page.
+    const executor = new PlaywrightExecutor();
+    const strangerPage = {
+      url: () => 'https://user-visible.example/',
+      isClosed: () => false,
+      _delegate: { _targetId: 'STRANGER' },
+    };
+    const ownedPage = {
+      url: () => 'about:blank',
+      isClosed: () => false,
+      _delegate: { _targetId: 'OWNED' },
+    };
+    const pages: any[] = [strangerPage];
+    (executor as any).isConnected = true;
+    (executor as any).browser = {};
+    (executor as any).context = { pages: () => pages };
+    (executor as any).setupPageListeners = () => {};
+
+    executor.claimTab(7, 'about:blank', 'OWNED');
+    executor.switchToTab(7);
+    assert.equal((executor as any).page, null, 'page not attached yet');
+
+    // The owned page appears 300ms later, as in a real tab creation.
+    setTimeout(() => pages.push(ownedPage), 300);
+    const result = await executor.ensureConnection();
+    assert.equal(result.page, ownedPage, 'must wait for the owned page, never use the stranger');
+  });
+
+  it('ensureConnection fails loudly when the owned tab page never appears', async () => {
+    const executor = new PlaywrightExecutor();
+    const strangerPage = { url: () => 'https://user-visible.example/', isClosed: () => false };
+    (executor as any).isConnected = true;
+    (executor as any).browser = {};
+    (executor as any).context = { pages: () => [strangerPage] };
+    (executor as any).setupPageListeners = () => {};
+
+    executor.claimTab(8, 'about:blank', 'NEVER-ATTACHES');
+    executor.switchToTab(8);
+    (executor as any).page = null;
+
+    await assert.rejects(
+      (executor as any).waitForPageForTab((executor as any).context, 8, 400),
+      /No page found for owned tab 8/,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

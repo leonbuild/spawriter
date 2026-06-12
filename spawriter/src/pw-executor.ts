@@ -417,6 +417,28 @@ export class PlaywrightExecutor {
     });
   }
 
+  /**
+   * Pages attach asynchronously after a tab is created/claimed: the CDP
+   * attachedToTarget may arrive after execute() starts. Running on an
+   * arbitrary fallback page would execute code on a tab the session does
+   * not own, so wait for the right page and fail loudly if it never comes.
+   */
+  private async waitForPageForTab(context: BrowserContext, tabId: number, timeoutMs = 3000): Promise<Page> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const pages = context.pages().filter(p => !p.isClosed());
+      const match = this.findPageForTab(pages, tabId);
+      if (match) return match;
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `No page found for owned tab ${tabId} after ${timeoutMs}ms. ` +
+          `The tab may still be attaching; retry, or call reset to reconnect.`,
+        );
+      }
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
   switchToTab(tabId: number): void {
     if (!this.ownedTabIds.has(tabId)) {
       throw new Error(`Tab ${tabId} not owned by this session. Owned: [${[...this.ownedTabIds].join(', ')}]`);
@@ -459,26 +481,17 @@ export class PlaywrightExecutor {
 
     if (this.isConnected && this.browser && this.context && !this.page) {
       const pages = this.context.pages().filter(p => !p.isClosed());
-      if (pages.length > 0) {
-        let page: Page;
-        let matchedActiveTab = false;
-        if (this.activeTabId != null) {
-          const targetPage = this.findPageForTab(pages, this.activeTabId);
-          matchedActiveTab = targetPage != null;
-          page = targetPage ?? pages[0];
-          if (!targetPage) {
-            this.logger?.log(`ensureConnection: no page matching tab ${this.activeTabId}, using first available`);
-          }
-        } else {
-          page = pages[0];
-        }
+      if (this.activeTabId != null) {
+        const page = await this.waitForPageForTab(this.context, this.activeTabId);
         this.page = page;
         this.setupPageListeners(page);
-        // Only refresh the mapping when the page really belongs to the tab;
-        // rebinding a fallback page would corrupt tab→page resolution.
-        if (this.activeTabId != null && matchedActiveTab) {
-          this.tabIdToUrl.set(this.activeTabId, page.url());
-        }
+        this.tabIdToUrl.set(this.activeTabId, page.url());
+        return { page, context: this.context, browser: this.browser };
+      }
+      if (pages.length > 0) {
+        const page = pages[0];
+        this.page = page;
+        this.setupPageListeners(page);
         return { page, context: this.context, browser: this.browser };
       }
     }
@@ -508,23 +521,19 @@ export class PlaywrightExecutor {
     context.setDefaultTimeout(30000);
     context.setDefaultNavigationTimeout(15000);
 
-    const pages = context.pages().filter(p => !p.isClosed());
+    // Mark connected before resolving the page so a waitForPageForTab
+    // failure leaves a reusable connection for the retry.
+    this.browser = browser;
+    this.context = context;
+    this.isConnected = true;
 
     let page: Page;
-    let matchedActiveTab = false;
-    if (this.activeTabId != null && pages.length > 0) {
-      const targetPage = this.findPageForTab(pages, this.activeTabId);
-      matchedActiveTab = targetPage != null;
-      page = targetPage ?? pages[0];
-      if (!targetPage) {
-        this.logger?.log(`Could not find page for tab ${this.activeTabId}, using first available page`);
-      }
-    } else {
-      page = pages.length > 0 ? pages[0] : await context.newPage();
-    }
-
-    if (this.activeTabId != null && matchedActiveTab) {
+    if (this.activeTabId != null) {
+      page = await this.waitForPageForTab(context, this.activeTabId);
       this.tabIdToUrl.set(this.activeTabId, page.url());
+    } else {
+      const pages = context.pages().filter(p => !p.isClosed());
+      page = pages.length > 0 ? pages[0] : await context.newPage();
     }
 
     this.setupPageListeners(page);
@@ -533,10 +542,7 @@ export class PlaywrightExecutor {
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 });
     } catch { /* best-effort stabilization */ }
 
-    this.browser = browser;
-    this.context = context;
     this.page = page;
-    this.isConnected = true;
 
     return { page, context, browser };
   }
