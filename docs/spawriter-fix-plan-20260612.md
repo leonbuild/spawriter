@@ -9,6 +9,8 @@
 > 3. **`handleCloseTarget` 仅按真实 CDP targetId 匹配** —— `/json/list` 暴露的 `id` 是 relay sessionId，按文档用该 id 调 `Target.closeTarget` 返回 target not found。修复：增加 `t.sessionId === targetId` 兜底匹配。
 > 另：MCP `tab switch` 现无条件向 relay 发 claim 以同步 relay 侧 executor 的活动 tab；`/cli/tab/claim` 在 claim 后调用 `executor.switchToTab`；扩展 `clearCacheAndReload` 改为必须显式 `tabId`（拒绝隐式作用于用户活动标签）；relay 进程启用文件日志（`%TMP%/spawriter/relay.log`），解决 `stdio:'ignore'` 下日志全丢的问题。
 >
+> **S6 设计演进（同日，依据用户反馈）**：彻底移除 title 小点后用户失去了 tab 级可视化（badge/icon 是全局的，无法在标签条上区分单个 tab）。最终方案改为**重新引入 title 小点标记，但以单写者幂等设计实现**：仅扩展一处写入（`setTabState`/`emitDetachedFromTarget`/`tabs.onUpdated` 汇聚到 `scheduleTitleMarker`），标记从权威状态（attachedTabs + tabOwnership）即时推导（🟢=被会话占用，🔵=已附加空闲），注入脚本先剥离已有标记且仅在变化时写入。双绿点的根因（扩展 markTabTitle 与 executor 注入的 MutationObserver 两个写者竞争）不复存在——pw-executor 侧无任何 title 写入（回归测试断言此不变量）。
+>
 > **MCP/CLI 对齐补全（同日）**：新增 CLI `tabs list` / `tabs connect <url> [--create|--force-create]` / `tabs release [tabId]` 三个命令（`ControlClient` 增加 `listTabs`/`connectTab`/`releaseTab`），与 MCP `tab` 工具的 connect/list/release 动作一一对应；`tab switch` 的 CLI 等价物为既有 `session bind <tabId>`（同一 `/cli/tab/claim` 路径）。`relay.test.ts` 新增行为级测试：以子进程启动真实 relay，用假扩展 + 假 Playwright 客户端走完整 WS 链路，断言 live attach/detach 以浏览器级事件送达（防止协议 bug 1/2 回归）。`cli.test.ts` 新增 MCP/CLI parity 源级断言。测试总数 1569。
 
 - 配套审计报告：`docs/spawriter-full-audit-20260612.md`（问题编号 S1–S12 与此文一致）

@@ -9895,25 +9895,37 @@ describe('trace – DYNAMIC_CLASS_RE extended patterns', () => {
 });
 
 // ===========================================================================
-// Tests: S6 regression — tab status must use extension icon/badge only,
-// never document.title injection (root cause of the "double green dot" bug)
+// Tests: S6 regression — per-tab title markers must have exactly ONE writer
+// (the extension), derive state from the authoritative maps, and apply
+// idempotently. The "double green dot" bug came from two competing writers
+// (extension markTabTitle + pw-executor injected MutationObserver).
 // ===========================================================================
 
-describe('S6 regression: no page-title status injection', () => {
+describe('S6 regression: single-writer idempotent tab title markers', () => {
   const bridgeSource = fsReadFileSync(new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url), 'utf-8');
 
-  it('bridge.js contains no title prefix emoji constants', () => {
-    assert.ok(!bridgeSource.includes('🟢'), 'green dot emoji must not exist in bridge.js');
-    assert.ok(!bridgeSource.includes('🔵'), 'blue dot emoji must not exist in bridge.js');
-    assert.ok(!bridgeSource.includes('TAB_TITLE_PREFIXES'));
+  it('bridge.js derives the marker from attachment + ownership state', () => {
+    assert.ok(bridgeSource.includes('TAB_TITLE_PREFIXES'));
+    assert.ok(bridgeSource.includes('desiredTitlePrefix'));
+    assert.ok(bridgeSource.includes('attachedTabs.has(tabId)'));
+    assert.ok(bridgeSource.includes('tabOwnership.has(tabId)'));
   });
 
-  it('bridge.js has no markTabTitle implementation or calls', () => {
-    assert.ok(!bridgeSource.includes('markTabTitle'));
+  it('marker injection strips existing markers and writes only on change', () => {
+    assert.ok(bridgeSource.includes('TITLE_PREFIX_STRIP_RE_SRC'));
+    assert.ok(bridgeSource.includes('document.title !== next'), 'must not rewrite identical titles (onUpdated loop guard)');
   });
 
-  it('bridge.js never writes document.title', () => {
-    assert.ok(!bridgeSource.includes('document.title'));
+  it('marker application is debounced per tab', () => {
+    assert.ok(bridgeSource.includes('pendingTitleMarkers'));
+    assert.ok(bridgeSource.includes('scheduleTitleMarker'));
+  });
+
+  it('markers are re-applied on navigation/SPA title changes and cleared on detach', () => {
+    const onUpdatedBlock = bridgeSource.slice(bridgeSource.indexOf('tabs.onUpdated'));
+    assert.ok(onUpdatedBlock.slice(0, 800).includes('scheduleTitleMarker'));
+    const detachBlock = bridgeSource.slice(bridgeSource.indexOf('function emitDetachedFromTarget'));
+    assert.ok(detachBlock.slice(0, 400).includes('scheduleTitleMarker'));
   });
 
   it('bridge.js still updates icon and badge per state', () => {
@@ -9922,10 +9934,11 @@ describe('S6 regression: no page-title status injection', () => {
     assert.ok(bridgeSource.includes('setBadgeBackgroundColor'));
   });
 
-  it('pw-executor has no title prefix code generator', () => {
+  it('pw-executor has no competing title writer (single-writer invariant)', () => {
     const executorSource = fsReadFileSync(new URL('./pw-executor.ts', import.meta.url), 'utf-8');
     assert.ok(!executorSource.includes('buildSetTabTitlePrefixCode'));
     assert.ok(!executorSource.includes('TITLE_PREFIX_RE'));
+    assert.ok(!executorSource.includes('document.title ='));
   });
 });
 

@@ -73,6 +73,7 @@ import browser from "webextension-polyfill";
       tabStates.set(tabId, state);
     }
     persistState();
+    scheduleTitleMarker(tabId);
   }
 
   function getConnectedCount() {
@@ -109,6 +110,49 @@ import browser from "webextension-polyfill";
       }
     }
     syncOwnershipStates();
+  }
+
+  // --- Per-tab title markers (dot in the tab strip) ---
+  // Single writer: every state change funnels through setTabState /
+  // emitDetachedFromTarget, and the marker is derived from the authoritative
+  // maps right before injection. The injected script strips any existing
+  // marker first and writes only on change, so re-application is idempotent
+  // (the old two-writer design stacked duplicate green dots).
+
+  const TAB_TITLE_PREFIXES = { connected: "\u{1F7E2} ", idle: "\u{1F535} " };
+  // Also strips legacy yellow/red markers left by older versions.
+  const TITLE_PREFIX_STRIP_RE_SRC = "^(?:\\s*(?:\u{1F7E2}|\u{1F535}|\u{1F7E1}|\u{1F534})\\s*)+";
+  const pendingTitleMarkers = new Map();
+
+  function desiredTitlePrefix(tabId) {
+    if (!attachedTabs.has(tabId)) return null;
+    return tabOwnership.has(tabId) ? TAB_TITLE_PREFIXES.connected : TAB_TITLE_PREFIXES.idle;
+  }
+
+  function scheduleTitleMarker(tabId) {
+    const existing = pendingTitleMarkers.get(tabId);
+    if (existing) clearTimeout(existing);
+    pendingTitleMarkers.set(tabId, setTimeout(() => {
+      pendingTitleMarkers.delete(tabId);
+      applyTitleMarker(tabId).catch(() => {});
+    }, 50));
+  }
+
+  async function applyTitleMarker(tabId) {
+    const prefix = desiredTitlePrefix(tabId);
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (newPrefix, stripReSrc) => {
+          const clean = document.title.replace(new RegExp(stripReSrc, "u"), "");
+          const next = (newPrefix || "") + clean;
+          if (document.title !== next) document.title = next;
+        },
+        args: [prefix, TITLE_PREFIX_STRIP_RE_SRC],
+      });
+    } catch (_) {
+      // Tab already closed or a restricted page (chrome:// etc.).
+    }
   }
 
   const icons = {
@@ -278,6 +322,11 @@ import browser from "webextension-polyfill";
           },
         });
       }
+      // Navigation or SPA title updates wipe the marker — re-apply it.
+      // Idempotent injection makes the self-triggered update a no-op.
+      if (attachedTabs.has(tabId) && (changeInfo.title || changeInfo.status === "complete")) {
+        scheduleTitleMarker(tabId);
+      }
     });
 
     debuggerEventListenerRegistered = true;
@@ -290,6 +339,7 @@ import browser from "webextension-polyfill";
     tabOwnership.delete(tabId);
     attachedTabs.delete(tabId);
     persistState();
+    scheduleTitleMarker(tabId);
     sendMessage({
       method: "forwardCDPEvent",
       params: {
