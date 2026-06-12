@@ -1487,6 +1487,44 @@ describe('PlaywrightExecutor tab management', () => {
     assert.equal(executor.getActiveTabId(), null);
     assert.equal(executor.getOwnedTabIds().size, 0);
   });
+
+  it('switchToTab resolves the page by CDP targetId, not by ambiguous URL', () => {
+    // Two about:blank tabs: URL matching alone would pick the first page and
+    // execute on a tab the session may not even own.
+    const executor = new PlaywrightExecutor();
+    const fakePage = (targetId: string) => ({
+      url: () => 'about:blank',
+      isClosed: () => false,
+      _delegate: { _targetId: targetId },
+    });
+    const pageA = fakePage('TARGET-A');
+    const pageB = fakePage('TARGET-B');
+    (executor as any).isConnected = true;
+    (executor as any).context = { pages: () => [pageA, pageB] };
+    (executor as any).setupPageListeners = () => {};
+
+    executor.claimTab(1, 'about:blank', 'TARGET-B');
+    executor.claimTab(2, 'about:blank', 'TARGET-A');
+
+    executor.switchToTab(1);
+    assert.equal((executor as any).page, pageB, 'tab 1 must map to TARGET-B page');
+
+    executor.switchToTab(2);
+    assert.equal((executor as any).page, pageA, 'tab 2 must map to TARGET-A page');
+  });
+
+  it('falls back to URL matching when no targetId was recorded', () => {
+    const executor = new PlaywrightExecutor();
+    const pageA = { url: () => 'https://a.example/', isClosed: () => false };
+    const pageB = { url: () => 'https://b.example/', isClosed: () => false };
+    (executor as any).isConnected = true;
+    (executor as any).context = { pages: () => [pageA, pageB] };
+    (executor as any).setupPageListeners = () => {};
+
+    executor.claimTab(1, 'https://b.example/');
+    executor.switchToTab(1);
+    assert.equal((executor as any).page, pageB);
+  });
 });
 
 // ---------------------------------------------------------------------------

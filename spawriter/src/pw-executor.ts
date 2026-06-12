@@ -315,6 +315,7 @@ export class PlaywrightExecutor {
   private ownedTabIds = new Set<number>();
   private activeTabId: number | null = null;
   private tabIdToUrl = new Map<number, string>();
+  private tabIdToTargetId = new Map<number, string>();
   private lastCdpClientId: string | null = null;
 
   private logger: ExecutorLogger;
@@ -380,10 +381,40 @@ export class PlaywrightExecutor {
   getOwnedTabIds(): Set<number> { return this.ownedTabIds; }
   getLastCdpClientId(): string | null { return this.lastCdpClientId; }
 
-  claimTab(tabId: number, url?: string): void {
+  claimTab(tabId: number, url?: string, targetId?: string): void {
     this.ownedTabIds.add(tabId);
     if (url) this.tabIdToUrl.set(tabId, url);
+    if (targetId) this.tabIdToTargetId.set(tabId, targetId);
     if (this.activeTabId == null) this.activeTabId = tabId;
+  }
+
+  /** CDP targetId of a Playwright page (CRPage internal; undefined on API drift). */
+  private static pageTargetId(page: Page): string | undefined {
+    try {
+      return (page as { _delegate?: { _targetId?: string } })._delegate?._targetId;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Deterministic tab → page resolution. URL matching alone is ambiguous
+   * (e.g. several about:blank tabs), so prefer the CDP targetId recorded at
+   * claim time and use the URL only as fallback.
+   */
+  private findPageForTab(pages: Page[], tabId: number): Page | undefined {
+    const targetId = this.tabIdToTargetId.get(tabId);
+    if (targetId) {
+      const byTarget = pages.find(p => PlaywrightExecutor.pageTargetId(p) === targetId);
+      if (byTarget) return byTarget;
+    }
+    const targetUrl = this.tabIdToUrl.get(tabId);
+    if (!targetUrl) return undefined;
+    return pages.find(p => {
+      const pUrl = p.url();
+      if (targetUrl === 'about:blank') return pUrl === '' || pUrl === 'about:blank';
+      return pUrl === targetUrl || pUrl.startsWith(targetUrl);
+    });
   }
 
   switchToTab(tabId: number): void {
@@ -393,10 +424,9 @@ export class PlaywrightExecutor {
     this.activeTabId = tabId;
 
     if (this.isConnected && this.context) {
-      const targetUrl = this.tabIdToUrl.get(tabId);
-      if (targetUrl) {
+      {
         const pages = this.context.pages().filter(p => !p.isClosed());
-        const match = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetUrl));
+        const match = this.findPageForTab(pages, tabId);
         if (match && match !== this.page) {
           this.page = match;
           this.setupPageListeners(match);
@@ -411,6 +441,7 @@ export class PlaywrightExecutor {
   releaseTab(tabId: number): void {
     this.ownedTabIds.delete(tabId);
     this.tabIdToUrl.delete(tabId);
+    this.tabIdToTargetId.delete(tabId);
     if (this.activeTabId === tabId) {
       this.activeTabId = this.ownedTabIds.size > 0 ? [...this.ownedTabIds][0] : null;
       this.page = null;
@@ -430,25 +461,22 @@ export class PlaywrightExecutor {
       const pages = this.context.pages().filter(p => !p.isClosed());
       if (pages.length > 0) {
         let page: Page;
+        let matchedActiveTab = false;
         if (this.activeTabId != null) {
-          const targetUrl = this.tabIdToUrl.get(this.activeTabId);
-          const targetPage = targetUrl
-            ? pages.find(p => {
-                const pUrl = p.url();
-                if (targetUrl === 'about:blank') return pUrl === '' || pUrl === 'about:blank';
-                return pUrl === targetUrl || pUrl.startsWith(targetUrl);
-              })
-            : undefined;
+          const targetPage = this.findPageForTab(pages, this.activeTabId);
+          matchedActiveTab = targetPage != null;
           page = targetPage ?? pages[0];
-          if (!targetPage && targetUrl) {
-            this.logger?.log(`ensureConnection: no page matching tab ${this.activeTabId} (${targetUrl}), using first available`);
+          if (!targetPage) {
+            this.logger?.log(`ensureConnection: no page matching tab ${this.activeTabId}, using first available`);
           }
         } else {
           page = pages[0];
         }
         this.page = page;
         this.setupPageListeners(page);
-        if (this.activeTabId != null) {
+        // Only refresh the mapping when the page really belongs to the tab;
+        // rebinding a fallback page would corrupt tab→page resolution.
+        if (this.activeTabId != null && matchedActiveTab) {
           this.tabIdToUrl.set(this.activeTabId, page.url());
         }
         return { page, context: this.context, browser: this.browser };
@@ -483,25 +511,19 @@ export class PlaywrightExecutor {
     const pages = context.pages().filter(p => !p.isClosed());
 
     let page: Page;
-    if (this.activeTabId != null && pages.length > 1) {
-      const targetUrl = this.tabIdToUrl.get(this.activeTabId);
-      const targetPage = targetUrl
-        ? pages.find(p => {
-            const pUrl = p.url();
-            if (targetUrl === 'about:blank') return pUrl === '' || pUrl === 'about:blank';
-            return pUrl === targetUrl || pUrl.startsWith(targetUrl);
-          })
-        : undefined;
-      page = targetPage ?? pages[0] ?? await context.newPage();
-
-      if (!targetPage && targetUrl) {
-        this.logger?.log(`Could not find page for tab ${this.activeTabId} (url: ${targetUrl}), using first available page`);
+    let matchedActiveTab = false;
+    if (this.activeTabId != null && pages.length > 0) {
+      const targetPage = this.findPageForTab(pages, this.activeTabId);
+      matchedActiveTab = targetPage != null;
+      page = targetPage ?? pages[0];
+      if (!targetPage) {
+        this.logger?.log(`Could not find page for tab ${this.activeTabId}, using first available page`);
       }
     } else {
       page = pages.length > 0 ? pages[0] : await context.newPage();
     }
 
-    if (this.activeTabId != null) {
+    if (this.activeTabId != null && matchedActiveTab) {
       this.tabIdToUrl.set(this.activeTabId, page.url());
     }
 

@@ -311,6 +311,12 @@ async function handleTabAction(
       await sleep(500);
       const targets = await getTargets(port);
       const newTarget = targets.find(t => t.tabId === result.tabId);
+      // Re-claim with full target info so tab→page resolution can use the
+      // CDP targetId instead of ambiguous URL matching.
+      if (newTarget && result.tabId != null && claimStatus.startsWith('claimed')) {
+        const executor = await getOrCreateExecutor();
+        executor.claimTab(result.tabId, newTarget.url, newTarget.targetId);
+      }
       const created = result.created ? ' (newly created)' : '';
       const info = newTarget
         ? `Attached tab${created}:\n  Session: ${newTarget.id}\n  Title: ${newTarget.title}\n  URL: ${newTarget.url}\n  Ownership: ${claimStatus}`
@@ -349,7 +355,7 @@ async function handleTabAction(
         return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${e.message}` }) }], isError: true };
       }
       const executor = await getOrCreateExecutor();
-      executor.claimTab(switchTabId, target.url);
+      executor.claimTab(switchTabId, target.url, target.targetId);
       executor.switchToTab(switchTabId);
       return { content: [{ type: 'text', text: `Switched to tab ${switchTabId}: ${target.title || '(no title)'}\nURL: ${target.url || '(no url)'}` }] };
     }
@@ -398,6 +404,7 @@ async function handleTabAction(
 
 interface TargetListItem {
   id: string;
+  targetId?: string;
   tabId?: number;
   type: string;
   title: string;

@@ -437,6 +437,7 @@ app.get('/json/list', (c) => {
     const targetInfo = target.targetInfo ?? {};
     return {
       id: target.sessionId,
+      targetId: buildTargetInfo(target).targetId,
       tabId: target.tabId,
       type: targetInfo.type ?? 'page',
       title: targetInfo.title ?? '',
@@ -589,6 +590,11 @@ function rawDataToBuffer(data: RawData): Buffer {
 }
 
 const DEFAULT_BROWSER_CONTEXT_ID = 'default-browser-context';
+
+function targetIdForTab(tabId: number): string | undefined {
+  const target = [...attachedTargets.values()].find(t => t.tabId === tabId);
+  return target ? buildTargetInfo(target).targetId : undefined;
+}
 
 function buildTargetInfo(target: AttachedTarget): TargetInfo {
   const targetInfo = target.targetInfo ?? {};
@@ -1478,13 +1484,13 @@ app.post('/cli/execute', async (c) => {
         : ownedTabIds[0];
       if (ownedTabId != null) {
         const url = [...attachedTargets.values()].find(t => t.tabId === ownedTabId)?.targetInfo?.url;
-        executor.claimTab(ownedTabId, url);
+        executor.claimTab(ownedTabId, url, targetIdForTab(ownedTabId));
       } else {
         const reusableTab = pickReusableAttachedTab(targetUrlHint);
         if (reusableTab) {
           const claim = claimTab(reusableTab.tabId, body.sessionId);
           if (claim.ok) {
-            executor.claimTab(reusableTab.tabId, reusableTab.url);
+            executor.claimTab(reusableTab.tabId, reusableTab.url, targetIdForTab(reusableTab.tabId));
             log(`Auto-reused attached tab ${reusableTab.tabId} for session ${body.sessionId} (${reusableTab.reason}${targetUrlHint ? `, hint=${targetUrlHint}` : ''})`);
           }
         }
@@ -1505,7 +1511,7 @@ app.post('/cli/execute', async (c) => {
               if (claim.ok) {
                 const tabUrl = [...attachedTargets.values()]
                   .find(t => t.tabId === result.tabId)?.targetInfo?.url || createUrl;
-                executor.claimTab(result.tabId as number, tabUrl);
+                executor.claimTab(result.tabId as number, tabUrl, targetIdForTab(result.tabId as number));
                 log(`Created new tab ${result.tabId} for session ${body.sessionId}${targetUrlHint ? ` (hint: ${targetUrlHint})` : ''}`);
               }
             }
@@ -1609,7 +1615,7 @@ app.post('/cli/tab/claim', async (c) => {
   if (executor) {
     const url = [...attachedTargets.values()]
       .find(t => t.tabId === tabId)?.targetInfo?.url;
-    executor.claimTab(tabId, url);
+    executor.claimTab(tabId, url, targetIdForTab(tabId));
     // An explicit claim means "use this tab now" — without this, a later
     // claim (bind/switch) would never redirect execute away from the first tab.
     executor.switchToTab(tabId);
