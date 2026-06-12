@@ -182,8 +182,7 @@ Key features:
 - **Multi-agent isolation** — Tab Ownership System ensures exclusive tab ownership per session; idle sessions cleaned up after 30 min
 - **Per-tab status markers** — attached tabs show a dot in the tab title: 🟢 claimed by an agent session, 🔵 attached but idle (reusable); markers are applied idempotently by the extension only
 - **Persistent connection** — offscreen document survives MV3 service worker restarts
-- **User tab safety** — auto-acquisition only sees attached (dotted) tabs: 🔵 idle tabs are agent territory and freely reusable, undotted user tabs are never touched; when nothing is reusable a new tab is created
-- **Prepared tabs** — attach a tab and navigate it to a target page to hand it to an agent: a hint-less execute picks the most recent 🔵 content tab first, while an execute targeting a different URL never diverts it (uses a blank tab or creates one)
+- **User tab safety** — acquisition order is: own 🟢 tab → any 🔵 idle tab (URL match first, then newest) → create new; undotted user tabs are never touched. Attach a tab and navigate it to a page to hand it to an agent — agents see every blue dot with its URL and can pick it up directly
 
 ## Scripts
 

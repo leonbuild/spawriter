@@ -128,8 +128,6 @@ function createRelayState() {
     }
   }
 
-  const SAFE_AUTO_CLAIM_URLS = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
-
   function normalizeUrlHint(rawUrl: string): string | null {
     const trimmed = rawUrl.trim();
     if (!trimmed) return null;
@@ -177,45 +175,21 @@ function createRelayState() {
 
   function pickReusableTab(code: string): { tabId: number; url: string; reason: string } | null {
     const preferredUrlHint = extractTargetUrlHint(code);
-    const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
+    const candidates: Array<{ tabId: number; url: string }> = [];
     for (const target of attachedTargets.values()) {
       if (target.tabId == null) continue;
       if (getTabOwner(target.tabId)) continue;
-      const tabUrl = target.targetInfo?.url || '';
-      const safe = SAFE_AUTO_CLAIM_URLS.some(safeUrl => tabUrl === safeUrl || tabUrl.startsWith(safeUrl));
-      candidates.push({ tabId: target.tabId, url: tabUrl, safe });
+      candidates.push({ tabId: target.tabId, url: target.targetInfo?.url || '' });
     }
     if (candidates.length === 0) return null;
 
-    const newestFirst = [...candidates].reverse();
+    candidates.reverse();
 
     if (preferredUrlHint) {
-      const matched = newestFirst.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
+      const matched = candidates.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
       if (matched) return { tabId: matched.tabId, url: matched.url, reason: 'url-match' };
-      const blank = newestFirst.find(c => c.safe);
-      if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'safe-fallback' };
-      return null;
     }
-
-    const prepared = newestFirst.find(c => !c.safe);
-    if (prepared) return { tabId: prepared.tabId, url: prepared.url, reason: 'prepared-tab' };
-    const blank = newestFirst.find(c => c.safe);
-    if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'idle-blank' };
-    return null;
-  }
-
-  function safeAutoClaimTab(sessionId: string): { tabId: number; url: string } | null {
-    for (const target of attachedTargets.values()) {
-      if (target.tabId == null) continue;
-      const owner = getTabOwner(target.tabId);
-      if (owner) continue;
-      const tabUrl = target.targetInfo?.url || '';
-      const isSafeTab = SAFE_AUTO_CLAIM_URLS.some(safe => tabUrl === safe || tabUrl.startsWith(safe));
-      if (!isSafeTab) continue;
-      const claim = claimTab(target.tabId, sessionId);
-      if (claim.ok) return { tabId: target.tabId, url: tabUrl };
-    }
-    return null;
+    return { tabId: candidates[0].tabId, url: candidates[0].url, reason: 'idle' };
   }
 
   return {
@@ -231,7 +205,6 @@ function createRelayState() {
     listTargets,
     routeCdpEvent,
     handleTabInfoChanged,
-    safeAutoClaimTab,
     extractTargetUrlHint,
     pickReusableTab,
   };
@@ -925,103 +898,6 @@ describe('handleTabInfoChanged — title/URL sync from extension', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Safe auto-claim tab restriction
-// ---------------------------------------------------------------------------
-describe('safeAutoClaimTab', () => {
-  let relay: ReturnType<typeof createRelayState>;
-
-  beforeEach(() => {
-    relay = createRelayState();
-  });
-
-  it('should auto-claim about:blank tabs', () => {
-    relay.attachedTargets.set('target-blank', {
-      sessionId: 'target-blank',
-      tabId: 1,
-      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 1 },
-    });
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 1);
-    assert.equal(result!.url, 'about:blank');
-  });
-
-  it('should auto-claim chrome://newtab/ tabs', () => {
-    relay.attachedTargets.set('target-newtab', {
-      sessionId: 'target-newtab',
-      tabId: 2,
-      targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 2 },
-    });
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 2);
-  });
-
-  it('should NOT auto-claim tabs with real website URLs', () => {
-    relay.attachedTargets.set('target-real', {
-      sessionId: 'target-real',
-      tabId: 3,
-      targetInfo: { title: 'Google', url: 'https://www.google.com', type: 'page', tabId: 3 },
-    });
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.equal(result, null);
-  });
-
-  it('should NOT auto-claim tabs with http:// URLs', () => {
-    relay.attachedTargets.set('target-local', {
-      sessionId: 'target-local',
-      tabId: 4,
-      targetInfo: { title: 'Local Dev', url: 'http://localhost:3000', type: 'page', tabId: 4 },
-    });
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.equal(result, null);
-  });
-
-  it('should NOT auto-claim tabs already owned by another session', () => {
-    relay.attachedTargets.set('target-owned', {
-      sessionId: 'target-owned',
-      tabId: 5,
-      targetInfo: { title: 'Blank', url: 'about:blank', type: 'page', tabId: 5 },
-    });
-    relay.claimTab(5, 'sw-other');
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.equal(result, null);
-  });
-
-  it('should skip non-safe tabs and claim the first safe one', () => {
-    relay.attachedTargets.set('target-web', {
-      sessionId: 'target-web',
-      tabId: 10,
-      targetInfo: { title: 'Reddit', url: 'https://reddit.com', type: 'page', tabId: 10 },
-    });
-    relay.attachedTargets.set('target-safe', {
-      sessionId: 'target-safe',
-      tabId: 11,
-      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 11 },
-    });
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 11);
-  });
-
-  it('should auto-claim edge://newtab/ tabs', () => {
-    relay.attachedTargets.set('target-edge', {
-      sessionId: 'target-edge',
-      tabId: 20,
-      targetInfo: { title: 'New Tab', url: 'edge://newtab/', type: 'page', tabId: 20 },
-    });
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 20);
-  });
-
-  it('should return null when no tabs exist', () => {
-    const result = relay.safeAutoClaimTab('sw-test');
-    assert.equal(result, null);
-  });
-});
-
 describe('extractTargetUrlHint', () => {
   let relay: ReturnType<typeof createRelayState>;
 
@@ -1046,6 +922,8 @@ describe('extractTargetUrlHint', () => {
 });
 
 describe('pickReusableTab', () => {
+  // Every blue-dot (attached, unowned) tab is reusable, whatever its URL:
+  // own green tab -> any blue dot (URL match first, then newest) -> create.
   let relay: ReturnType<typeof createRelayState>;
 
   beforeEach(() => {
@@ -1053,8 +931,8 @@ describe('pickReusableTab', () => {
   });
 
   it('should prioritize URL-matched unowned attached tab', () => {
-    relay.attachedTargets.set('target-safe', {
-      sessionId: 'target-safe',
+    relay.attachedTargets.set('target-blank', {
+      sessionId: 'target-blank',
       tabId: 1,
       targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 1 },
     });
@@ -1070,25 +948,25 @@ describe('pickReusableTab', () => {
     assert.equal(result!.reason, 'url-match');
   });
 
-  it('should fall back to safe blank tab when URL hint misses', () => {
+  it('should fall back to the newest blue dot when the URL hint misses', () => {
     relay.attachedTargets.set('target-web', {
       sessionId: 'target-web',
       tabId: 10,
       targetInfo: { title: 'Docs', url: 'https://docs.example.com', type: 'page', tabId: 10 },
     });
-    relay.attachedTargets.set('target-safe', {
-      sessionId: 'target-safe',
+    relay.attachedTargets.set('target-blank', {
+      sessionId: 'target-blank',
       tabId: 11,
       targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 11 },
     });
 
     const result = relay.pickReusableTab('await navigate("https://not-found.example.com")');
     assert.notEqual(result, null);
-    assert.equal(result!.tabId, 11);
-    assert.equal(result!.reason, 'safe-fallback');
+    assert.equal(result!.tabId, 11, 'newest attached blue dot');
+    assert.equal(result!.reason, 'idle');
   });
 
-  it('should ignore owned URL matches and reuse available tab', () => {
+  it('should ignore owned URL matches and reuse an available blue dot', () => {
     relay.attachedTargets.set('target-owned', {
       sessionId: 'target-owned',
       tabId: 21,
@@ -1104,12 +982,11 @@ describe('pickReusableTab', () => {
     const result = relay.pickReusableTab('await navigate("https://target.example.com")');
     assert.notEqual(result, null);
     assert.equal(result!.tabId, 22);
-    assert.equal(result!.reason, 'safe-fallback');
+    assert.equal(result!.reason, 'idle');
   });
 
-  it('without a hint, reuses the most recently prepared content tab', () => {
-    // The user attaches a tab and navigates it somewhere on purpose: that
-    // page is being handed to the agent, so a hint-less execute gets it.
+  it('without a hint, reuses the most recently attached blue dot whatever its URL', () => {
+    // A user-attached content tab is a hand-off to the agent.
     relay.attachedTargets.set('target-a', {
       sessionId: 'target-a',
       tabId: 31,
@@ -1123,19 +1000,21 @@ describe('pickReusableTab', () => {
 
     const result = relay.pickReusableTab('state.count = (state.count || 0) + 1');
     assert.notEqual(result, null);
-    assert.equal(result!.tabId, 32, 'most recently attached content tab wins');
-    assert.equal(result!.reason, 'prepared-tab');
+    assert.equal(result!.tabId, 32, 'most recently attached wins');
+    assert.equal(result!.reason, 'idle');
   });
 
-  it('with a hint that matches nothing, never diverts a prepared content tab', () => {
-    relay.attachedTargets.set('prepared', {
-      sessionId: 'prepared',
+  it('with a hint that matches nothing, still reuses a blue dot (the agent navigates it)', () => {
+    relay.attachedTargets.set('blue-dot', {
+      sessionId: 'blue-dot',
       tabId: 33,
       targetInfo: { title: 'Docs', url: 'https://docs.example.com', type: 'page', tabId: 33 },
     });
 
     const result = relay.pickReusableTab('await navigate("https://other.example.com")');
-    assert.equal(result, null, 'must create a new tab instead of navigating the prepared one away');
+    assert.notEqual(result, null);
+    assert.equal(result!.tabId, 33);
+    assert.equal(result!.reason, 'idle');
   });
 
   it('should pick the most recent among multiple blank tabs', () => {
@@ -1153,7 +1032,7 @@ describe('pickReusableTab', () => {
     const result = relay.pickReusableTab('state.count = 1');
     assert.notEqual(result, null);
     assert.equal(result!.tabId, 41);
-    assert.equal(result!.reason, 'idle-blank');
+    assert.equal(result!.reason, 'idle');
   });
 
   it('should return null when all tabs are owned', () => {
@@ -1189,14 +1068,14 @@ describe('pickReusableTab', () => {
     assert.equal(result!.tabId, 60);
   });
 
-  it('should prefer URL match over safe tab even when both exist', () => {
-    relay.attachedTargets.set('safe', {
-      sessionId: 'safe', tabId: 70,
-      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 70 },
-    });
+  it('should prefer URL match over a newer blue dot', () => {
     relay.attachedTargets.set('match', {
       sessionId: 'match', tabId: 71,
       targetInfo: { title: 'App', url: 'https://myapp.com/dashboard', type: 'page', tabId: 71 },
+    });
+    relay.attachedTargets.set('newer-blank', {
+      sessionId: 'newer-blank', tabId: 70,
+      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 70 },
     });
 
     const result = relay.pickReusableTab('await navigate("https://myapp.com")');
@@ -1205,7 +1084,7 @@ describe('pickReusableTab', () => {
     assert.equal(result!.reason, 'url-match');
   });
 
-  it('should not match URL on an owned tab even if URL matches', () => {
+  it('should not reuse an owned tab even if its URL matches', () => {
     relay.attachedTargets.set('owned-match', {
       sessionId: 'owned-match', tabId: 80,
       targetInfo: { title: 'App', url: 'https://myapp.com', type: 'page', tabId: 80 },
@@ -1216,7 +1095,7 @@ describe('pickReusableTab', () => {
     assert.equal(result, null);
   });
 
-  it('should treat chrome://newtab/ as a blank reusable tab', () => {
+  it('should treat chrome://newtab/ as a reusable blue dot', () => {
     relay.attachedTargets.set('newtab', {
       sessionId: 'newtab', tabId: 90,
       targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 90 },
@@ -1225,83 +1104,28 @@ describe('pickReusableTab', () => {
     const result = relay.pickReusableTab('console.log("hi")');
     assert.notEqual(result, null);
     assert.equal(result!.tabId, 90);
-    assert.equal(result!.reason, 'idle-blank');
+    assert.equal(result!.reason, 'idle');
   });
 
-  it('should treat edge://newtab/ as a blank reusable tab', () => {
-    relay.attachedTargets.set('edge-newtab', {
-      sessionId: 'edge-newtab', tabId: 91,
-      targetInfo: { title: 'New Tab', url: 'edge://newtab/', type: 'page', tabId: 91 },
-    });
-
-    const result = relay.pickReusableTab('console.log("hi")');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 91);
-    assert.equal(result!.reason, 'idle-blank');
-  });
-
-  it('hint-less execute picks up a lone prepared content tab', () => {
-    relay.attachedTargets.set('prepared-tab', {
-      sessionId: 'prepared-tab', tabId: 100,
-      targetInfo: { title: 'Gmail', url: 'https://mail.google.com', type: 'page', tabId: 100 },
-    });
-
-    const result = relay.pickReusableTab('state.data = []');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 100);
-    assert.equal(result!.reason, 'prepared-tab');
-  });
-
-  it('should return null when URL hint matches but only non-safe candidates remain after excluding owned', () => {
-    relay.attachedTargets.set('match-owned', {
-      sessionId: 'match-owned', tabId: 110,
-      targetInfo: { title: 'API', url: 'https://api.example.com', type: 'page', tabId: 110 },
-    });
-    relay.attachedTargets.set('user-tab', {
-      sessionId: 'user-tab', tabId: 111,
-      targetInfo: { title: 'Twitter', url: 'https://twitter.com', type: 'page', tabId: 111 },
-    });
-    relay.claimTab(110, 'sw-other');
-
-    const result = relay.pickReusableTab('await navigate("https://api.example.com")');
-    assert.equal(result, null);
-  });
-
-  it('should use safe-fallback reason when URL hint is present but no URL match found', () => {
-    relay.attachedTargets.set('safe-tab', {
-      sessionId: 'safe-tab', tabId: 120,
-      targetInfo: { title: 'New Tab', url: 'about:blank', type: 'page', tabId: 120 },
-    });
-    relay.attachedTargets.set('unrelated', {
-      sessionId: 'unrelated', tabId: 121,
-      targetInfo: { title: 'Docs', url: 'https://docs.example.com', type: 'page', tabId: 121 },
-    });
-
-    const result = relay.pickReusableTab('await navigate("https://totally-different.com")');
-    assert.notEqual(result, null);
-    assert.equal(result!.tabId, 120);
-    assert.equal(result!.reason, 'safe-fallback');
-  });
-
-  it('should prefer a prepared content tab over a blank one and skip owned tabs', () => {
-    relay.attachedTargets.set('owned-safe', {
-      sessionId: 'owned-safe', tabId: 130,
+  it('should skip owned tabs and pick the newest available blue dot', () => {
+    relay.attachedTargets.set('owned-blank', {
+      sessionId: 'owned-blank', tabId: 130,
       targetInfo: { title: 'Blank', url: 'about:blank', type: 'page', tabId: 130 },
     });
-    relay.attachedTargets.set('prepared-gmail', {
-      sessionId: 'prepared-gmail', tabId: 131,
+    relay.attachedTargets.set('gmail', {
+      sessionId: 'gmail', tabId: 131,
       targetInfo: { title: 'Gmail', url: 'https://mail.google.com', type: 'page', tabId: 131 },
     });
-    relay.attachedTargets.set('free-safe', {
-      sessionId: 'free-safe', tabId: 132,
+    relay.attachedTargets.set('free-newtab', {
+      sessionId: 'free-newtab', tabId: 132,
       targetInfo: { title: 'New Tab', url: 'chrome://newtab/', type: 'page', tabId: 132 },
     });
     relay.claimTab(130, 'sw-busy');
 
     const result = relay.pickReusableTab('state.x = 1');
     assert.notEqual(result, null);
-    assert.equal(result!.tabId, 131, 'attached content page is a prepared hand-off to the agent');
-    assert.equal(result!.reason, 'prepared-tab');
+    assert.equal(result!.tabId, 132, 'newest unowned blue dot wins');
+    assert.equal(result!.reason, 'idle');
   });
 });
 

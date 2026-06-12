@@ -17,7 +17,9 @@
 >
 > **执行页解析修复（同日，e2e 发现）**：新建 tab 的 page 对象在 Playwright `context.pages()` 中异步出现，`ensureConnection` 原先找不到时静默回退 `pages[0]`，导致 execute 代码跑在无关页面（实测跑在了用户的知乎页上，所有权未被破坏但页面解析错误）。修复：`waitForPageForTab` 轮询等待 owned tab 的 page（3s 超时报错），绝不回退到无关页面。回归测试 2 个（等待异步出现的 page、永不出现时报错）。
 >
-> **Prepared tab 交互（同日，依据用户反馈）**：用户可以主动附加一个 tab 并导航到目标页面，作为"准备好的页面"交给 agent——无 URL hint 的 execute 优先复用最近附加的**内容蓝点**（非空白页），reason=`prepared-tab`；带 hint 的 execute 只做 url-match 或取空白蓝点，**绝不把 prepared tab 导航到别处**。空白蓝点选择从随机改为取最近附加（reason 由 `idle-random` 更名 `idle-blank`）。同时 title 标记对 about:blank 等受限页面增加 debugger `Runtime.evaluate` 兜底（`scripting.executeScript` 被 Chrome 拒绝时经已附加的 debugger 会话写入，空 title 以 URL 为基底），新建空白 tab 也能显示 🟢/🔵。测试总数 1576。
+> **Prepared tab 交互（同日，依据用户反馈）**：用户可以主动附加一个 tab 并导航到目标页面，作为"准备好的页面"交给 agent。同时 title 标记对 about:blank 等受限页面增加 debugger `Runtime.evaluate` 兜底（`scripting.executeScript` 被 Chrome 拒绝时经已附加的 debugger 会话写入，空 title 以 URL 为基底），新建空白 tab 也能显示 🟢/🔵。
+>
+> **复用规则最终定稿（同日，依据用户反馈）**：放弃 prepared/blank 启发式区分与 safe-URL 白名单——**所有蓝点（已附加、无 owner）一律可复用，不论 URL**。获取顺序：自己的 🟢 → 任意 🔵（URL 命中 hint 的优先，其次最近附加）→ 新建；无点 tab 对自动路径不可见。智能选择交给 agent 层：`tabs list` / MCP `tab list` 暴露全部蓝点及其 URL，agent 可显式 connect 指定 tabId。`SAFE_AUTO_REUSE_URLS`/`isSafeAutoReuseUrl` 删除，reason 收敛为 `url-match`/`idle`；顺带删除测试中早已死亡的 `safeAutoClaimTab` 镜像及其套件。测试总数 1564。
 
 - 配套审计报告：`docs/spawriter-full-audit-20260612.md`（问题编号 S1–S12 与此文一致）
 - 本文目标：针对每个问题给出**确切到文件/函数/行**的修复代码（before → after）、验证方法与回归测试要点，达到可直接照改的程度。

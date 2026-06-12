@@ -176,13 +176,6 @@ function getTabOwner(tabId: number): string | undefined {
   return tabOwners.get(tabId)?.sessionId;
 }
 
-const SAFE_AUTO_REUSE_URLS = ['about:blank', 'chrome://newtab/', 'chrome://new-tab-page/', 'edge://newtab/'];
-
-function isSafeAutoReuseUrl(url: string): boolean {
-  const normalized = url.trim().toLowerCase();
-  return SAFE_AUTO_REUSE_URLS.some((safe) => normalized === safe || normalized.startsWith(safe));
-}
-
 function normalizeUrlHint(rawUrl: string): string | null {
   const trimmed = rawUrl.trim();
   if (!trimmed) return null;
@@ -230,45 +223,29 @@ function extractTargetUrlHint(code: string): string | undefined {
   return undefined;
 }
 
-// Blue-dot (attached, unowned) tabs are agent territory by convention: the
-// user does not browse them, so reuse needs no active-tab check. Tabs without
-// a dot are never visible to auto-acquisition.
-//
-// A blue-dot tab on a content URL is treated as *prepared*: the user attached
-// it and navigated somewhere on purpose, to hand that page to an agent.
-// - No URL hint (agent wants "a tab"): prepared tab first, then a blank one.
-// - With a URL hint: exact match first, then a blank tab to navigate; a
-//   prepared tab is never diverted to an unrelated destination.
+// Blue-dot (attached, unowned) tabs are agent territory: every one of them
+// is reusable, including tabs the user attached and navigated on purpose to
+// hand a page to an agent. Undotted tabs are never visible here. Acquisition
+// order: own green tab -> any blue-dot tab -> create new. Within blue dots,
+// an exact URL match for the agent's destination wins, then the most
+// recently attached.
 function pickReusableAttachedTab(preferredUrlHint?: string): { tabId: number; url: string; reason: string } | null {
-  const candidates: Array<{ tabId: number; url: string; safe: boolean }> = [];
+  const candidates: Array<{ tabId: number; url: string }> = [];
   for (const target of attachedTargets.values()) {
     if (target.tabId == null) continue;
     if (getTabOwner(target.tabId)) continue;
-    const tabUrl = target.targetInfo?.url || '';
-    candidates.push({
-      tabId: target.tabId,
-      url: tabUrl,
-      safe: isSafeAutoReuseUrl(tabUrl),
-    });
+    candidates.push({ tabId: target.tabId, url: target.targetInfo?.url || '' });
   }
   if (candidates.length === 0) return null;
 
-  // Most recently attached last (Map preserves insertion order); prefer it.
-  const newestFirst = [...candidates].reverse();
+  // Map preserves insertion order; newest attached first.
+  candidates.reverse();
 
   if (preferredUrlHint) {
-    const urlMatched = newestFirst.find(candidate => urlMatchesHint(candidate.url, preferredUrlHint));
-    if (urlMatched) return { tabId: urlMatched.tabId, url: urlMatched.url, reason: 'url-match' };
-    const blank = newestFirst.find(c => c.safe);
-    if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'safe-fallback' };
-    return null;
+    const matched = candidates.find(c => urlMatchesHint(c.url, preferredUrlHint));
+    if (matched) return { tabId: matched.tabId, url: matched.url, reason: 'url-match' };
   }
-
-  const prepared = newestFirst.find(c => !c.safe);
-  if (prepared) return { tabId: prepared.tabId, url: prepared.url, reason: 'prepared-tab' };
-  const blank = newestFirst.find(c => c.safe);
-  if (blank) return { tabId: blank.tabId, url: blank.url, reason: 'idle-blank' };
-  return null;
+  return { tabId: candidates[0].tabId, url: candidates[0].url, reason: 'idle' };
 }
 
 function resolveTabIdFromSession(cdpSessionId: string): number | undefined {
