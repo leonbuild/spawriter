@@ -87,7 +87,7 @@ Run `spawriter skill` for the full CLI reference.
   "mcpServers": {
     "spawriter": {
       "command": "node",
-      "args": ["D:\\dev\\side\\spawriter\\spawriter\\dist\\cli.js", "serve"]
+      "args": ["D:\\dev\\side\\spawriter\\mcp\\dist\\cli.js", "serve"]
     }
   }
 }
