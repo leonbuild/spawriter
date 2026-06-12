@@ -10,6 +10,7 @@ import {
   isLocalhost,
   log,
   error,
+  enableFileLog,
   VERSION,
 } from './utils.js';
 import type {
@@ -294,6 +295,8 @@ const SWEEP_INTERVAL = STALE_SESSION_TTL > 0
 
 function startStaleSweep(): void {
   if (SWEEP_INTERVAL <= 0) return;
+  // unref: the sweep must never keep the process alive on its own
+  // (e.g. when this module is imported without starting the server).
   setInterval(() => {
     const now = Date.now();
     for (const [sessionId, lastActive] of sessionActivity) {
@@ -314,7 +317,7 @@ function startStaleSweep(): void {
         sessionToClientId.delete(sessionId);
       }
     }
-  }, SWEEP_INTERVAL);
+  }, SWEEP_INTERVAL).unref();
 }
 
 const ALLOWED_EXTENSION_IDS = getAllowedExtensionIds();
@@ -325,46 +328,23 @@ app.get('/', (c) => {
   return c.text('OK');
 });
 
-app.post('/connect-active-tab', async (c) => {
-  if (!isExtensionConnected()) {
-    return c.json({ success: false, error: 'Extension not connected' }, 503);
-  }
-
-  return new Promise<Response>((resolve) => {
-    const relayId = nextExtensionRequestId++;
-    const timeoutId = setTimeout(() => {
-      pendingExtensionCmdRequests.delete(relayId);
-      resolve(c.json({ success: false, error: 'Timeout waiting for extension' }, 504));
-    }, 15000);
-
-    const mockWs = {
-      send(data: string) {
-        clearTimeout(timeoutId);
-        pendingExtensionCmdRequests.delete(relayId);
-        try {
-          resolve(c.json(JSON.parse(data)));
-        } catch {
-          resolve(c.json({ success: false, error: 'Invalid response' }, 500));
-        }
-      },
-      readyState: 1,
-    } as unknown as WebSocket;
-
-    pendingExtensionCmdRequests.set(relayId, { ws: mockWs, timeoutId });
-
-    sendToExtension({
-      id: relayId,
-      method: 'connectActiveTab',
-    });
-  });
-});
-
 app.post('/connect-tab', async (c) => {
   if (!isExtensionConnected()) {
     return c.json({ success: false, error: 'Extension not connected' }, 503);
   }
 
-  const body = await c.req.json<{ url?: string; tabId?: number; create?: boolean }>().catch(() => ({}));
+  const body: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean } =
+    await c.req.json<{ url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }>().catch(() => ({}));
+
+  // Idle reuse is decided here, against the authoritative attachedTargets /
+  // tabOwners state. The extension never scans the user's open tabs (S9).
+  if (body.url && body.tabId === undefined && !body.forceCreate) {
+    const reusable = pickReusableAttachedTab(body.url);
+    if (reusable) {
+      log(`/connect-tab: reusing idle tab ${reusable.tabId} (${reusable.reason}) for "${body.url}"`);
+      return c.json({ success: true, tabId: reusable.tabId, reused: true });
+    }
+  }
 
   return new Promise<Response>((resolve) => {
     const relayId = nextExtensionRequestId++;
@@ -1037,15 +1017,25 @@ function handleExtensionMessage(data: Buffer) {
         }
 
         const enrichedTargetInfo = buildTargetInfo(attachedTargets.get(sessionId)!);
-        broadcastToCDPClients({
-          method,
-          params: {
-            ...params as Record<string, unknown>,
-            sessionId,
-            targetInfo: { ...enrichedTargetInfo, attached: true },
-          },
-          sessionId,
-        });
+        // Browser-level event: no top-level sessionId, or Playwright routes it
+        // to a not-yet-existing CRSession and drops it (live-attached tabs
+        // would never become pages). Apply the same per-client ownership
+        // filter as the connect-time replay in sendAttachedToTargetEvents.
+        for (const [cdpClientId] of cdpClients) {
+          const boundSession = pwClientToSession.get(cdpClientId);
+          if (incomingTabId != null && boundSession) {
+            const owner = tabOwners.get(incomingTabId);
+            if (owner && owner.sessionId !== boundSession) continue;
+          }
+          sendToCDPClient(cdpClientId, {
+            method,
+            params: {
+              ...params as Record<string, unknown>,
+              sessionId,
+              targetInfo: { ...enrichedTargetInfo, attached: true },
+            },
+          });
+        }
 
         broadcastToCDPClients({
           method: 'Target.tabAvailable',
@@ -1062,8 +1052,10 @@ function handleExtensionMessage(data: Buffer) {
 
       if (method === 'Target.detachedFromTarget') {
         const detachedSessionId = (params as { sessionId?: string }).sessionId;
+        let detachedTargetId: string | undefined;
         if (detachedSessionId) {
           const detachedTarget = attachedTargets.get(detachedSessionId);
+          if (detachedTarget) detachedTargetId = buildTargetInfo(detachedTarget).targetId;
           if (detachedTarget?.tabId != null) {
             const hadOwner = tabOwners.has(detachedTarget.tabId);
             tabOwners.delete(detachedTarget.tabId);
@@ -1075,6 +1067,18 @@ function handleExtensionMessage(data: Buffer) {
           }
           attachedTargets.delete(detachedSessionId);
         }
+        // Browser-level event: no top-level sessionId, or Playwright routes it
+        // into the dying child session instead of the browser-level handler
+        // that marks the page closed — page.close() would then hang forever.
+        // Playwright resolves the page by params.targetId, which the extension
+        // does not include, so enrich it from the attached-target registry.
+        broadcastToCDPClients({
+          method,
+          params: detachedTargetId
+            ? { ...(params as Record<string, unknown>), targetId: detachedTargetId }
+            : params,
+        });
+        return;
       }
 
       maybeSynthesizeBrowserDownloadEvent(method, params);
@@ -1187,6 +1191,68 @@ function routeCdpEvent(method: string, params: unknown, sessionId?: string): voi
   }
 }
 
+// ---------------------------------------------------------------------------
+// Target.createTarget / Target.closeTarget — browser-level commands that the
+// extension cannot forward via chrome.debugger.sendCommand({tabId}). They are
+// implemented with chrome.tabs.create/remove, enabling context.newPage() and
+// page.close() through the relay (S8).
+// ---------------------------------------------------------------------------
+
+async function handleCreateTarget(clientId: string, id: number, url?: string): Promise<void> {
+  const createUrl = url || 'about:blank';
+  try {
+    const result = await sendExtensionCommand('connectTabByMatch', { url: createUrl, forceCreate: true }, 15000);
+    const newTabId = result.tabId as number | undefined;
+    if (!result.success || typeof newTabId !== 'number') {
+      sendCdpError(clientId, { id, error: `createTarget failed: ${(result as { error?: string }).error || 'unknown'}` });
+      return;
+    }
+    let target: AttachedTarget | undefined;
+    for (let i = 0; i < 25; i++) {
+      target = [...attachedTargets.values()].find(t => t.tabId === newTabId);
+      if (target) break;
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if (!target) {
+      sendCdpError(clientId, { id, error: 'createTarget: tab did not attach in time' });
+      return;
+    }
+    const callerSession = pwClientToSession.get(clientId);
+    if (callerSession) claimTab(newTabId, callerSession);
+    sendCdpResponse(clientId, { id, result: { targetId: buildTargetInfo(target).targetId } });
+  } catch (e: any) {
+    sendCdpError(clientId, { id, error: `createTarget error: ${e.message}` });
+  }
+}
+
+async function handleCloseTarget(clientId: string, id: number, sessionId: string | undefined, targetId?: string): Promise<void> {
+  // Match real CDP targetId first; fall back to relay sessionId, which is
+  // what /json/list exposes as `id`.
+  const target = targetId
+    ? [...attachedTargets.values()].find(t => buildTargetInfo(t).targetId === targetId || t.sessionId === targetId)
+    : (sessionId ? attachedTargets.get(sessionId) : undefined);
+  if (target?.tabId == null) {
+    sendCdpError(clientId, { id, sessionId, error: 'closeTarget: target not found' });
+    return;
+  }
+  const owner = getTabOwner(target.tabId);
+  const callerSession = pwClientToSession.get(clientId);
+  if (owner && callerSession && owner !== callerSession) {
+    sendCdpError(clientId, { id, sessionId, error: `Tab ${target.tabId} is owned by session "${owner}". Cannot close.` });
+    return;
+  }
+  try {
+    const result = await sendExtensionCommand('closeTab', { tabId: target.tabId }, 10000);
+    if (!result.success) {
+      sendCdpError(clientId, { id, sessionId, error: `closeTarget failed: ${(result as { error?: string }).error || 'unknown'}` });
+      return;
+    }
+    sendCdpResponse(clientId, { id, sessionId, result: { success: true } });
+  } catch (e: any) {
+    sendCdpError(clientId, { id, sessionId, error: `closeTarget error: ${e.message}` });
+  }
+}
+
 function handleCDPMessage(data: Buffer, clientId: string) {
   try {
     const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
@@ -1236,6 +1302,17 @@ function handleCDPMessage(data: Buffer, clientId: string) {
 
     const params = asRecord(parsed.params);
     const sessionId = asString(parsed.sessionId);
+
+    // Browser-level tab lifecycle requires awaiting the extension, so it is
+    // handled outside the synchronous server-command switch.
+    if (method === 'Target.createTarget') {
+      void handleCreateTarget(clientId, id, (params as { url?: string } | undefined)?.url);
+      return;
+    }
+    if (method === 'Target.closeTarget') {
+      void handleCloseTarget(clientId, id, sessionId, (params as { targetId?: string } | undefined)?.targetId);
+      return;
+    }
 
     const serverHandled = handleServerCdpCommand(clientId, {
       id,
@@ -1288,18 +1365,33 @@ function handleCDPMessage(data: Buffer, clientId: string) {
 // Direct CDP command sender for the executor (bypasses Playwright CDPSession)
 // ---------------------------------------------------------------------------
 
-function getActiveSessionId(): string | undefined {
-  for (const target of attachedTargets.values()) {
-    return target.sessionId;
+// Resolves the target CDP session strictly within tabs owned by the caller.
+// Without a caller session (internal use) the legacy first-target behavior
+// applies; with one, never fall through to another session's tab (S4).
+export function resolveCdpSessionForCaller(
+  targets: ReadonlyMap<string, { tabId?: number; sessionId: string }>,
+  ownerOf: (tabId: number) => string | undefined,
+  callerSessionId?: string,
+): string | undefined {
+  if (!callerSessionId) {
+    for (const target of targets.values()) return target.sessionId;
+    return undefined;
+  }
+  for (const target of targets.values()) {
+    if (target.tabId != null && ownerOf(target.tabId) === callerSessionId) {
+      return target.sessionId;
+    }
   }
   return undefined;
 }
 
-function relaySendCdp(method: string, params?: Record<string, unknown>, timeout = 30000): Promise<unknown> {
+function relaySendCdp(method: string, params?: Record<string, unknown>, timeout = 30000, callerSessionId?: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const sessionId = getActiveSessionId();
+    const sessionId = resolveCdpSessionForCaller(attachedTargets, getTabOwner, callerSessionId);
     if (!sessionId) {
-      reject(new Error('No attached target'));
+      reject(new Error(callerSessionId
+        ? `No tab owned by session "${callerSessionId}". Connect a tab first.`
+        : 'No attached target'));
       return;
     }
     if (!isExtensionConnected()) {
@@ -1518,6 +1610,9 @@ app.post('/cli/tab/claim', async (c) => {
     const url = [...attachedTargets.values()]
       .find(t => t.tabId === tabId)?.targetInfo?.url;
     executor.claimTab(tabId, url);
+    // An explicit claim means "use this tab now" — without this, a later
+    // claim (bind/switch) would never redirect execute away from the first tab.
+    executor.switchToTab(tabId);
   }
   return c.json({ success: true });
 });
@@ -1563,7 +1658,7 @@ app.post('/cli/cdp', async (c) => {
       }
     }
 
-    const result = await relaySendCdp(method, params, timeout);
+    const result = await relaySendCdp(method, params, timeout, sessionId);
     return c.json({ result });
   } catch (err: any) {
     return c.json({ error: err.message }, 500);
@@ -1572,6 +1667,11 @@ app.post('/cli/cdp', async (c) => {
 
 export async function startRelayServer(): Promise<void> {
   installRelayProcessErrorHandlers();
+  // The relay is usually spawned with stdio:'ignore' — mirror logs to the
+  // file that `spawriter logfile` points at, or they are lost entirely.
+  const os = await import('node:os');
+  const path = await import('node:path');
+  enableFileLog(path.join(os.tmpdir(), 'spawriter', 'relay.log'));
   const port = getRelayPort();
   if (ALLOW_ANY_EXTENSION) {
     error('No SSPA_EXTENSION_IDS configured. Allowing any chrome-extension origin.');

@@ -1,5 +1,7 @@
 # spawriter 错误输出深度审计文档（XCAI 上传场景）
 
+> **Status: Implemented**（2026-06-12 验证）。本文建议的导航超时预算治理已落地于 `pw-executor.ts`（`NAVIGATE_TIMEOUT_SAFETY_BUFFER_MS`、`NAVIGATE_MIN/MAX_POST_ACTION_RESERVE_MS`、`NAVIGATE_POST_ACTION_RESERVE_RATIO`）。本文档仅作历史记录。
+
 ## 1. 问题概览
 
 本次观测到两类错误同时出现：

@@ -7,7 +7,12 @@ export async function ensureRelayServer(options?: {
   force?: boolean;
 }): Promise<boolean> {
   const port = getRelayPort();
-  const logger = options?.logger || console;
+  // stderr by default: stdout of CLI commands (e.g. `session new`) is a
+  // machine-readable contract and must not be polluted by status messages.
+  const logger = options?.logger || {
+    log: (...args: unknown[]) => console.error(...args),
+    error: (...args: unknown[]) => console.error(...args),
+  };
 
   if (!options?.force) {
     const isRunning = await checkRelayRunning(port);

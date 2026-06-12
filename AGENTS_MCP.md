@@ -9,8 +9,8 @@ spawriter also extends Playwright with single-spa microfrontend tooling. You can
 ## Tool Catalog (4 tools)
 
 - **`execute`** — Playwright JS code with spawriter extensions. Globals: `page`, `context`, `browser`, `state`, `navigate`, `ensureFreshRender`, `screenshot`, `screenshotWithLabels`, `snapshot`/`accessibilitySnapshot`, `interact`, `refToLocator`, `consoleLogs`, `getLatestLogs`, `clearAllLogs`, `networkLog`, `networkDetail`, `clearNetworkLog`, `networkIntercept`, `dbg`, `editor`, `browserFetch`, `storage`, `emulation`, `performance`, `cssInspect`, `pageContent`, `singleSpa`, `clearCacheAndReload`, `getCDPSession`, `resetPlaywright`, `require`, `import`
-- **`reset`** — Full reconnect + clear all state
-- **`single_spa`** — Override management, app lifecycle (status/set/remove/enable/disable/reset_all/mount/unmount/unload)
+- **`reset`** — Reconnect + clear all state, releasing every tab owned by this MCP server
+- **`single_spa`** — Override management, app lifecycle (status/override_set/override_remove/override_enable/override_disable/override_reset_all/mount/unmount/unload)
 - **`tab`** — Tab management (connect/list/switch/release) with ownership isolation
 
 ## Tab Isolation Policy
@@ -25,7 +25,7 @@ Never use the user's active/current tab, `/connect-active-tab`, unmanaged existi
 
 ## Connection Protocol
 
-1. Determine a `session_id` (use agent transcript UUID if available). Pass on `tab { action: "connect" }`, `tab { action: "list" }`, etc.
+1. Determine a `session_id` (use agent transcript UUID if available). Pass the **same value** on every call that accepts it — `tab`, `execute`, and `single_spa` — so all operations land on the same relay session and the same owned tab.
 2. If your session already owns a tab, keep using it; do not reconnect just to navigate.
 3. Proactively call `tab { action: "connect", url: "target-url", create: true, session_id: "..." }` when you anticipate needing browser access. This may claim a blue-dot idle tab or create a new tab; it must not claim an unmanaged user tab.
 4. On `execute` error "No tab connected": call `tab { action: "connect", url: "about:blank", create: true, session_id: "..." }` first, then retry `execute`.
@@ -93,7 +93,7 @@ After any UI code change, automatically:
 3. Verify state via `single_spa { action: "status" }` / `execute`, not static assumptions
 4. Screenshot between major actions
 5. Don't assume code changes are live — confirm visually
-6. **CRITICAL: All cache/cookie/storage clearing is automatically origin-scoped — never affects other sites**
+6. **CRITICAL: cache/cookie/storage clearing defaults to the current origin — never pass another site's origin explicitly**
 7. Mock rules persist until disabled — always clean up
 
 ## Troubleshooting

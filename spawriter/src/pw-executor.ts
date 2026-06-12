@@ -257,21 +257,6 @@ export function isNoDialogShowingRace(err: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Tab title prefix (used by MCP for ownership state indicator)
-// ---------------------------------------------------------------------------
-
-const TITLE_PREFIX_RE = /^(?:🟢 |🟡 |🔴 |🔵 )+/;
-
-export function buildSetTabTitlePrefixCode(prefix: string | null): string {
-  const reSrc = '^(?:🟢 |🟡 |🔴 |🔵 )+';
-  return prefix
-    ? `(() => { document.title = ${JSON.stringify(prefix)} + document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`
-    : `(() => { document.title = document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`;
-}
-
-export { TITLE_PREFIX_RE };
-
-// ---------------------------------------------------------------------------
 // Dynamic class regex for filtering CSS classes
 // ---------------------------------------------------------------------------
 

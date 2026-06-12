@@ -6,11 +6,13 @@
  */
 import { describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync as fsReadFileSync } from 'node:fs';
 import {
   PlaywrightExecutor,
   ExecutorManager,
   isPlaywrightChannelOwner,
 } from './pw-executor.js';
+import { buildRelaySessionId, ownerBelongsToThisMcp } from './mcp.js';
 
 // ---------------------------------------------------------------------------
 // Test: Console log capture
@@ -9893,147 +9895,77 @@ describe('trace – DYNAMIC_CLASS_RE extended patterns', () => {
 });
 
 // ===========================================================================
-// Tests: Tab title prefix — ALL_PREFIXES_RE_SRC
+// Tests: S6 regression — tab status must use extension icon/badge only,
+// never document.title injection (root cause of the "double green dot" bug)
 // ===========================================================================
 
-describe('Tab title prefix regex', () => {
-  const ALL_PREFIXES_RE_SRC = "^(?:🟢 |🟡 |🔴 |🔵 )+";
-  const re = new RegExp(ALL_PREFIXES_RE_SRC);
+describe('S6 regression: no page-title status injection', () => {
+  const bridgeSource = fsReadFileSync(new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url), 'utf-8');
 
-  it('should match single green prefix', () => {
-    assert.ok(re.test('🟢 Example Domain'));
+  it('bridge.js contains no title prefix emoji constants', () => {
+    assert.ok(!bridgeSource.includes('🟢'), 'green dot emoji must not exist in bridge.js');
+    assert.ok(!bridgeSource.includes('🔵'), 'blue dot emoji must not exist in bridge.js');
+    assert.ok(!bridgeSource.includes('TAB_TITLE_PREFIXES'));
   });
 
-  it('should match single yellow prefix', () => {
-    assert.ok(re.test('🟡 Connecting...'));
+  it('bridge.js has no markTabTitle implementation or calls', () => {
+    assert.ok(!bridgeSource.includes('markTabTitle'));
   });
 
-  it('should match single red prefix', () => {
-    assert.ok(re.test('🔴 Error'));
+  it('bridge.js never writes document.title', () => {
+    assert.ok(!bridgeSource.includes('document.title'));
   });
 
-  it('should match multiple repeated prefixes', () => {
-    assert.ok(re.test('🟢 🟡 🟢 Title'));
-    const cleaned = '🟢 🟡 🟢 Title'.replace(re, '');
-    assert.equal(cleaned, 'Title');
+  it('bridge.js still updates icon and badge per state', () => {
+    assert.ok(bridgeSource.includes('updateIcons'));
+    assert.ok(bridgeSource.includes('setBadgeText'));
+    assert.ok(bridgeSource.includes('setBadgeBackgroundColor'));
   });
 
-  it('should not match title without prefix', () => {
-    assert.ok(!re.test('Example Domain'));
-  });
-
-  it('should match blue prefix', () => {
-    assert.ok(re.test('🔵 Idle Tab'));
-  });
-
-  it('should strip all prefixes at once', () => {
-    const title = '🟢 🟢 🟡 🔴 🔵 Example Domain';
-    const cleaned = title.replace(re, '');
-    assert.equal(cleaned, 'Example Domain');
-  });
-
-  it('should not strip emoji in middle of title', () => {
-    const title = '🟢 My 🟡 Page';
-    const cleaned = title.replace(re, '');
-    assert.equal(cleaned, 'My 🟡 Page');
-  });
-});
-
-describe('Tab title prefix mapping', () => {
-  const TAB_TITLE_PREFIXES: Record<string, string> = {
-    connected: "🟢 ",
-    idle: "🔵 ",
-    connecting: "🟡 ",
-    error: "🔴 ",
-  };
-
-  it('should have 4 states', () => {
-    assert.equal(Object.keys(TAB_TITLE_PREFIXES).length, 4);
-  });
-
-  it('markTabTitle state resolution: true → connected', () => {
-    const stateOrBool: boolean | string | null = true;
-    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
-    assert.equal(state, "connected");
-  });
-
-  it('markTabTitle state resolution: false → null (remove)', () => {
-    const stateOrBool: boolean | string | null = false;
-    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
-    assert.equal(state, null);
-  });
-
-  it('markTabTitle state resolution: "connecting" → connecting', () => {
-    const stateOrBool: boolean | string | null = "connecting";
-    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
-    assert.equal(state, "connecting");
-  });
-
-  it('markTabTitle state resolution: "error" → error', () => {
-    const stateOrBool: boolean | string | null = "error";
-    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
-    assert.equal(state, "error");
-  });
-
-  it('unknown state maps to null prefix', () => {
-    const state = "unknown";
-    const prefix = TAB_TITLE_PREFIXES[state] || null;
-    assert.equal(prefix, null);
+  it('pw-executor has no title prefix code generator', () => {
+    const executorSource = fsReadFileSync(new URL('./pw-executor.ts', import.meta.url), 'utf-8');
+    assert.ok(!executorSource.includes('buildSetTabTitlePrefixCode'));
+    assert.ok(!executorSource.includes('TITLE_PREFIX_RE'));
   });
 });
 
 // ===========================================================================
-// Tests: setTabTitlePrefix — code generation
+// Tests: S5 regression — no path may take over the user's active tab
 // ===========================================================================
 
-describe('setTabTitlePrefix code generation', () => {
-  const TITLE_PREFIX_RE_SRC = '^(?:🟢 |🟡 |🔴 |🔵 )+';
+describe('S5 regression: no active-tab takeover paths', () => {
+  const bridgeSource = fsReadFileSync(new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url), 'utf-8');
+  const relaySource = fsReadFileSync(new URL('./relay.ts', import.meta.url), 'utf-8');
 
-  function generateTitleCode(prefix: string | null): string {
-    const reSrc = TITLE_PREFIX_RE_SRC;
-    return prefix
-      ? `(() => { document.title = ${JSON.stringify(prefix)} + document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`
-      : `(() => { document.title = document.title.replace(new RegExp(${JSON.stringify(reSrc)}), ''); })()`;
-  }
-
-  it('should generate code with green prefix', () => {
-    const code = generateTitleCode('🟢 ');
-    assert.ok(code.includes('🟢 '));
-    assert.ok(code.includes('document.title'));
-    assert.ok(code.includes('replace'));
+  it('relay exposes no /connect-active-tab endpoint', () => {
+    assert.ok(!relaySource.includes('/connect-active-tab'));
+    assert.ok(!relaySource.includes("'connectActiveTab'"));
   });
 
-  it('should generate code with blue prefix', () => {
-    const code = generateTitleCode('🔵 ');
-    assert.ok(code.includes('🔵 '));
+  it('bridge has no connectActiveTab handler and no ensureActiveTabAttached', () => {
+    assert.ok(!bridgeSource.includes('connectActiveTab'));
+    assert.ok(!bridgeSource.includes('ensureActiveTabAttached'));
   });
 
-  it('should generate removal code when prefix is null', () => {
-    const code = generateTitleCode(null);
-    assert.ok(!code.includes('document.title = "🟢'));
-    assert.ok(!code.includes('document.title = "🔵'));
-    assert.ok(code.includes('replace'));
-    assert.ok(code.includes('document.title = document.title.replace'));
+  it('bridge CDP handler errors out instead of attaching the active tab', () => {
+    assert.ok(bridgeSource.includes('No target tab attached'));
   });
 
-  it('regex in generated code should strip all prefix types', () => {
-    const re = new RegExp(TITLE_PREFIX_RE_SRC);
-    assert.equal('🟢 🔵 🟡 Title'.replace(re, ''), 'Title');
-    assert.equal('🟢 Title'.replace(re, ''), 'Title');
-    assert.equal('🔵 Title'.replace(re, ''), 'Title');
-    assert.equal('Title'.replace(re, ''), 'Title');
+  it('bridge never scans all browser tabs for url matching (S9)', () => {
+    assert.ok(!bridgeSource.includes('pickBestMatchingTab'));
+    assert.ok(!bridgeSource.includes('tabMatchesHint'));
+  });
+
+  it('relay decides idle reuse for /connect-tab (S9 single source of truth)', () => {
+    assert.ok(relaySource.includes('pickReusableAttachedTab(body.url)'));
   });
 });
 
 // ===========================================================================
-// Tests: Tab state lifecycle — ownership claim/release title changes
+// Tests: bridge visual state resolution (icon/badge based)
 // ===========================================================================
 
-describe('Tab state lifecycle – title prefix expectations', () => {
-  const TAB_TITLE_PREFIXES: Record<string, string> = {
-    connected: "🟢 ", idle: "🔵 ", connecting: "🟡 ", error: "🔴 ",
-  };
-
+describe('Bridge visual state resolution', () => {
   function resolveBridgeVisualState(args: {
     attached: boolean;
     isOwned: boolean;
@@ -10045,66 +9977,54 @@ describe('Tab state lifecycle – title prefix expectations', () => {
     return isOwned ? 'connected' : 'idle';
   }
 
-  it('claimTab should result in green prefix', () => {
-    const expectedPrefix = '🟢 ';
-    assert.ok(expectedPrefix.startsWith('🟢'));
+  it('attached but unowned tab shows idle', () => {
+    assert.equal(resolveBridgeVisualState({ attached: true, isOwned: false }), 'idle');
   });
 
-  it('releaseTab should result in blue prefix', () => {
-    const expectedPrefix = '🔵 ';
-    assert.ok(expectedPrefix.startsWith('🔵'));
+  it('attached and owned tab shows connected', () => {
+    assert.equal(resolveBridgeVisualState({ attached: true, isOwned: true }), 'connected');
   });
 
-  it('WS close should set idle state in bridge', () => {
-    // When ws-state-change: closed, bridge calls markTabTitle("idle") → 🔵
-    const idlePrefix = '🔵 ';
-    assert.equal(idlePrefix, '🔵 ');
+  it('release reverts to idle', () => {
+    assert.equal(resolveBridgeVisualState({ attached: true, isOwned: false }), 'idle');
   });
 
-  it('detach should remove prefix entirely', () => {
-    // emitDetachedFromTarget calls markTabTitle(false) → null prefix
-    const stateOrBool = false;
-    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
-    assert.equal(state, null);
+  it('connecting/error states pass through', () => {
+    assert.equal(resolveBridgeVisualState({ attached: true, isOwned: true, baseState: 'connecting' }), 'connecting');
+    assert.equal(resolveBridgeVisualState({ attached: true, isOwned: false, baseState: 'error' }), 'error');
+  });
+});
+
+// ===========================================================================
+// Tests: buildBadgeInfo (mirror of bridge.js badge logic)
+// ===========================================================================
+
+describe('buildBadgeInfo', () => {
+  function buildBadgeInfo(ownedCount: number, idleCount: number): { text: string; color: string } {
+    if (ownedCount > 0 && idleCount > 0) {
+      return { text: `${ownedCount}·${idleCount}`, color: '#4CAF50' };
+    } else if (ownedCount > 0) {
+      return { text: String(ownedCount), color: '#4CAF50' };
+    } else if (idleCount > 0) {
+      return { text: String(idleCount), color: '#3F51B5' };
+    }
+    return { text: '', color: '#9E9E9E' };
+  }
+
+  it('owned + idle shows combined badge', () => {
+    assert.deepEqual(buildBadgeInfo(2, 1), { text: '2·1', color: '#4CAF50' });
   });
 
-  it('bridge attachTab should remain blue until ownership is claimed', () => {
-    const bridgeAttachState = resolveBridgeVisualState({
-      attached: true,
-      isOwned: false,
-      baseState: 'idle',
-    });
-    assert.equal(TAB_TITLE_PREFIXES[bridgeAttachState], '🔵 ');
+  it('owned only shows green count', () => {
+    assert.deepEqual(buildBadgeInfo(3, 0), { text: '3', color: '#4CAF50' });
   });
 
-  it('bridge should become green only after ownership claim', () => {
-    const ownedState = resolveBridgeVisualState({
-      attached: true,
-      isOwned: true,
-      baseState: 'idle',
-    });
-    assert.equal(TAB_TITLE_PREFIXES[ownedState], '🟢 ');
+  it('idle only shows blue count', () => {
+    assert.deepEqual(buildBadgeInfo(0, 2), { text: '2', color: '#3F51B5' });
   });
 
-  it('bridge should revert to blue after ownership release', () => {
-    const releasedState = resolveBridgeVisualState({
-      attached: true,
-      isOwned: false,
-      baseState: 'idle',
-    });
-    assert.equal(TAB_TITLE_PREFIXES[releasedState], '🔵 ');
-  });
-
-  it('rapid switch_tab should not cause prefix corruption', () => {
-    // Each switch_tab: close old session → new connectCdp → enableDomains → setTabTitlePrefix(🟢)
-    // Old tab: no prefix change from MCP (bridge handles WS close → 🔵)
-    // New tab: 🟢
-    const re = new RegExp('^(?:🟢 |🟡 |🔴 |🔵 )+');
-    const title1 = '🟢 Old Tab';
-    const title2 = '🔵 Old Tab';
-    assert.equal(title1.replace(re, ''), 'Old Tab');
-    assert.equal(title2.replace(re, ''), 'Old Tab');
-    assert.equal(('🟢 ' + 'Old Tab'.replace(re, '')), '🟢 Old Tab');
+  it('none shows empty gray', () => {
+    assert.deepEqual(buildBadgeInfo(0, 0), { text: '', color: '#9E9E9E' });
   });
 });
 
@@ -10182,5 +10102,107 @@ describe('formatMcpResult', () => {
     assert.equal(result.content.length, 2);
     assert.equal(result.content[0].type, 'image');
     assert.equal(result.content[1].type, 'image');
+  });
+});
+
+// ===========================================================================
+// Tests: S1 regression — unified relay session ID across all MCP tools
+// ===========================================================================
+
+describe('S1 regression: unified relay session ID', () => {
+  const mcpSource = fsReadFileSync(new URL('./mcp.ts', import.meta.url), 'utf-8');
+
+  it('buildRelaySessionId prefixes the client id with mcp-', () => {
+    assert.equal(buildRelaySessionId('client-1'), 'mcp-client-1');
+    assert.equal(buildRelaySessionId('client-1::agent-a'), 'mcp-client-1::agent-a');
+  });
+
+  it('all relay-facing calls resolve through getRelaySessionId', () => {
+    assert.ok(mcpSource.includes('async function remoteRelaySendCdp'));
+    assert.ok(mcpSource.includes('async function executeViaRelay'));
+    // Both fetch helpers and handleTabAction must use the unified resolver.
+    const usages = mcpSource.match(/getRelaySessionId\(/g) || [];
+    assert.ok(usages.length >= 4, `expected >=4 getRelaySessionId usages, got ${usages.length}`);
+    // The old bug pattern: inline `mcp-${getEffectiveClientId()}` derivations.
+    assert.ok(!mcpSource.includes('`mcp-${getEffectiveClientId'));
+  });
+
+  it('execute and single_spa sync activeAgentId from session_id', () => {
+    const syncs = mcpSource.match(/if \(args\.session_id\) activeAgentId = args\.session_id as string;/g) || [];
+    assert.ok(syncs.length >= 2, `expected execute and single_spa to sync activeAgentId, got ${syncs.length}`);
+  });
+
+  it('execute, single_spa, and tab schemas expose session_id (S12)', () => {
+    const schemaFields = mcpSource.match(/session_id: \{/g) || [];
+    assert.ok(schemaFields.length >= 3, `expected session_id in 3 tool schemas, got ${schemaFields.length}`);
+  });
+});
+
+// ===========================================================================
+// Tests: S3 regression — reset/shutdown release owned tabs
+// ===========================================================================
+
+describe('S3 regression: ownership never outlives the MCP process', () => {
+  const mcpSource = fsReadFileSync(new URL('./mcp.ts', import.meta.url), 'utf-8');
+
+  it('ownerBelongsToThisMcp matches base id and ::agent variants only', () => {
+    assert.ok(ownerBelongsToThisMcp('mcp-client-1', 'client-1'));
+    assert.ok(ownerBelongsToThisMcp('mcp-client-1::agent-a', 'client-1'));
+    assert.ok(!ownerBelongsToThisMcp('mcp-client-2', 'client-1'));
+    assert.ok(!ownerBelongsToThisMcp('mcp-client-1x', 'client-1'), 'prefix collision must not match');
+    assert.ok(!ownerBelongsToThisMcp('sw-abc123', 'client-1'), 'CLI sessions are never released by MCP');
+    assert.ok(!ownerBelongsToThisMcp(null, 'client-1'));
+    assert.ok(!ownerBelongsToThisMcp(undefined, 'client-1'));
+  });
+
+  it('reset releases owned tabs and clears executor state', () => {
+    const resetBlock = mcpSource.slice(mcpSource.indexOf("if (name === 'reset')"));
+    assert.ok(resetBlock.includes('releaseAllOwnedTabs()'));
+    assert.ok(resetBlock.includes('executorManager.resetAll()'));
+    assert.ok(resetBlock.includes('activeAgentId = null'));
+  });
+
+  it('graceful shutdown releases tabs on SIGINT, SIGTERM, and stdin end', () => {
+    assert.ok(mcpSource.includes("process.on('SIGINT', () => void gracefulShutdown('SIGINT'))"));
+    assert.ok(mcpSource.includes("process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'))"));
+    assert.ok(mcpSource.includes("process.stdin.on('end', () => void gracefulShutdown('stdin-end'))"));
+    const shutdownBlock = mcpSource.slice(mcpSource.indexOf('const gracefulShutdown'));
+    assert.ok(shutdownBlock.includes('releaseAllOwnedTabs()'));
+  });
+
+  it('releaseAllOwnedTabs releases tabs and deletes their relay sessions', () => {
+    const fnBlock = mcpSource.slice(mcpSource.indexOf('async function releaseAllOwnedTabs'));
+    assert.ok(fnBlock.includes('/cli/tab/release'));
+    assert.ok(fnBlock.includes('/cli/session/delete'));
+    assert.ok(fnBlock.includes('ownerBelongsToThisMcp(t.owner)'));
+  });
+});
+
+// ===========================================================================
+// Tests: S10/S11 regression — CLI exit behavior and quoting-safe input
+// ===========================================================================
+
+describe('S10/S11 regression: CLI input modes and graceful exit', () => {
+  const cliSource = fsReadFileSync(new URL('./cli.ts', import.meta.url), 'utf-8');
+
+  it('cli.ts never calls process.exit (libuv crash on Windows)', () => {
+    assert.ok(!cliSource.includes('process.exit('), 'use process.exitCode instead of process.exit');
+  });
+
+  it('supports -f file input and -e - stdin input', () => {
+    assert.ok(cliSource.includes("'-f, --file <path>'"));
+    assert.ok(cliSource.includes('function readStdin'));
+    assert.ok(cliSource.includes("options.eval === '-'"));
+  });
+
+  it('session bind goes through ControlClient (honors --host, D14)', () => {
+    const bindBlock = cliSource.slice(cliSource.indexOf("cli.command('session bind"));
+    assert.ok(bindBlock.includes('getControlClient'));
+    assert.ok(bindBlock.includes('claimTab'));
+    assert.ok(!bindBlock.includes('http://localhost'));
+  });
+
+  it('skill command prints AGENTS_Unified.md', () => {
+    assert.ok(cliSource.includes("'AGENTS_Unified.md'"));
   });
 });

@@ -60,4 +60,29 @@ export class ControlClient {
       body: JSON.stringify({ sessionId }),
     });
   }
+
+  async claimTab(sessionId: string, tabId: number) {
+    return this.request<{ success: boolean }>('/cli/tab/claim', {
+      method: 'POST',
+      body: JSON.stringify({ tabId, sessionId }),
+    });
+  }
+
+  async listTabs() {
+    return this.request<Array<{ id: string; tabId: number | null; type: string; title: string; url: string; owner: string | null }>>('/json/list');
+  }
+
+  async connectTab(opts: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }) {
+    return this.request<{ success: boolean; tabId?: number; created?: boolean; reused?: boolean; error?: string }>('/connect-tab', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    });
+  }
+
+  async releaseTab(sessionId: string, tabId: number) {
+    return this.request<{ success: boolean }>('/cli/tab/release', {
+      method: 'POST',
+      body: JSON.stringify({ tabId, sessionId }),
+    });
+  }
 }

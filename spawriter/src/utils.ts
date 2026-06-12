@@ -1,3 +1,6 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
 export const VERSION = "1.0.0";
 
 export const DEFAULT_PORT = 19989;
@@ -43,12 +46,38 @@ export function isLocalhost(address: string): boolean {
   );
 }
 
+// Optional file sink: the relay is spawned with stdio:'ignore', so without
+// this its stderr logs are lost and `spawriter logfile` points at nothing.
+let logFilePath: string | null = null;
+const LOG_FILE_MAX_BYTES = 5 * 1024 * 1024;
+
+export function enableFileLog(filePath: string): void {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    try {
+      if (fs.statSync(filePath).size > LOG_FILE_MAX_BYTES) fs.truncateSync(filePath, 0);
+    } catch { /* file does not exist yet */ }
+    logFilePath = filePath;
+  } catch {
+    logFilePath = null;
+  }
+}
+
+function writeLine(line: string): void {
+  process.stderr.write(line);
+  if (logFilePath) {
+    try {
+      fs.appendFileSync(logFilePath, line);
+    } catch { /* never let logging break the server */ }
+  }
+}
+
 export function log(...args: unknown[]): void {
-  process.stderr.write(`[SPAWRITER] ${new Date().toISOString()} ${args.map(String).join(' ')}\n`);
+  writeLine(`[SPAWRITER] ${new Date().toISOString()} ${args.map(String).join(' ')}\n`);
 }
 
 export function error(...args: unknown[]): void {
-  process.stderr.write(`[SPAWRITER ERROR] ${new Date().toISOString()} ${args.map(String).join(' ')}\n`);
+  writeLine(`[SPAWRITER ERROR] ${new Date().toISOString()} ${args.map(String).join(' ')}\n`);
 }
 
 export function getAgentLabel(): string | undefined {

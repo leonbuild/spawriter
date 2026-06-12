@@ -45,7 +45,7 @@ spawriter session new
 spawriter -s sw-abc123 -e 'page.url()'
 ```
 
-Always wrap `-e` code in single quotes (`'...'`) so the shell does not interpret `$`, backticks, or other JavaScript syntax. Use double quotes or template literals for strings inside the JavaScript code.
+In bash, always wrap `-e` code in single quotes (`'...'`) so the shell does not interpret `$`, backticks, or other JavaScript syntax. Use double quotes or template literals for strings inside the JavaScript code. On Windows (PowerShell/CMD), prefer stdin (`-e -`) or a file (`-f <path>`) instead of inline `-e` to avoid shell quoting issues.
 
 ### CLI Session Commands
 
@@ -55,7 +55,12 @@ spawriter session list
 spawriter session reset <id>
 spawriter session delete <id>
 spawriter session bind <tabId> -s <id>
+spawriter tabs list -s <id>                       # tabs with MINE/AVAILABLE/OWNED status
+spawriter tabs connect <url> --create -s <id>     # connect + claim (like MCP tab connect)
+spawriter tabs release [tabId] -s <id>            # release one or all owned tabs
 spawriter -s <id> -e '<code>'
+spawriter -s <id> -e -                  # code from stdin
+spawriter -s <id> -f <path>             # code from a file
 spawriter relay
 spawriter relay --replace
 spawriter logfile
@@ -68,11 +73,10 @@ On the first `-e` call, spawriter safely auto-acquires an owned session tab, a b
 If `No tab connected to this session` occurs:
 
 1. Run `spawriter session reset <id>`.
-2. If it still fails, create and bind a new tab:
+2. If it still fails, connect and claim a new tab:
 
    ```bash
-   curl -s -X POST http://localhost:19989/connect-tab -H 'Content-Type: application/json' -d '{"url":"about:blank","create":true,"forceCreate":true}'
-   spawriter session bind <tabId> -s <id>
+   spawriter tabs connect about:blank --force-create -s <id>
    ```
 
 3. Use the target URL instead of `about:blank` when it is already known.
@@ -297,7 +301,7 @@ Recover autonomously before asking the user for help:
 
 | Symptom | MCP recovery | CLI recovery |
 |---------|--------------|--------------|
-| No tab connected | `tab connect` with `create: true`, then retry | `spawriter session reset <id>`, then create and bind a new safe tab |
+| No tab connected | `tab connect` with `create: true`, then retry | `spawriter session reset <id>`, then `spawriter tabs connect <url> --create -s <id>` |
 | Tool timeout or connection error | Retry, call `reset`, then retry; fall back to CLI if still broken | Reset the session and retry |
 | Relay unavailable | Fall back to CLI and run relay recovery | `spawriter relay --replace`, then retry |
 | Override not reflected | `ensureFreshRender()` or `clearCacheAndReload({ clear: "cache" })` | Same execute code through CLI |

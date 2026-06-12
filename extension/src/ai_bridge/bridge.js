@@ -91,60 +91,10 @@ import browser from "webextension-polyfill";
     return tabOwnership.has(tabId);
   }
 
-  function normalizeUrlHint(url) {
-    if (!url || typeof url !== "string") return "";
-    const trimmed = url.trim().toLowerCase();
-    if (!trimmed) return "";
-    if (/^[a-z][\w+.-]*:/i.test(trimmed)) return trimmed;
-    if (trimmed.startsWith("//")) return `https:${trimmed}`;
-    if (trimmed.startsWith("/")) return trimmed;
-    return `https://${trimmed}`;
-  }
-
-  function tabMatchesHint(tab, urlHint) {
-    const rawHint = (urlHint || "").trim().toLowerCase();
-    if (!rawHint) return false;
-    const normalizedHint = normalizeUrlHint(urlHint);
-    const tabUrl = (tab?.url || "").toLowerCase();
-    const tabTitle = (tab?.title || "").toLowerCase();
-
-    if (tabUrl && !isRestrictedUrl(tab.url)) {
-      if (
-        tabUrl.includes(rawHint) ||
-        (normalizedHint && tabUrl.includes(normalizedHint))
-      ) {
-        return true;
-      }
-    }
-
-    return !!tabTitle && tabTitle.includes(rawHint);
-  }
-
-  function tabReuseScore(tab) {
-    const tabId = tab?.id;
-    if (tabId == null) return Number.MAX_SAFE_INTEGER;
-    const attached = attachedTabs.has(tabId);
-    const owned = isTabOwned(tabId);
-    if (attached && !owned) return 0;
-    if (!attached && !owned) return 1;
-    if (attached && owned) return 2;
-    return 3;
-  }
-
-  function pickBestMatchingTab(allTabs, urlHint) {
-    const matches = allTabs
-      .filter((tab) => tab?.id != null && tabMatchesHint(tab, urlHint))
-      .filter((tab) => attachedTabs.has(tab.id) && !isTabOwned(tab.id))
-      .sort((a, b) => tabReuseScore(a) - tabReuseScore(b));
-    return matches[0];
-  }
-
   function syncOwnershipStates() {
     for (const [tabId] of attachedTabs.entries()) {
       const owned = tabOwnership.has(tabId);
-      const nextState = owned ? "connected" : "idle";
-      setTabState(tabId, nextState);
-      markTabTitle(tabId, nextState);
+      setTabState(tabId, owned ? "connected" : "idle");
     }
     updateIcons();
   }
@@ -318,9 +268,6 @@ import browser from "webextension-polyfill";
 
     browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
       updateIcons();
-      if (changeInfo.status === "complete" && attachedTabs.has(tabId)) {
-        markTabTitle(tabId, getTabState(tabId));
-      }
       if (attachedTabs.has(tabId) && (changeInfo.title || changeInfo.url)) {
         sendMessage({
           method: "tabInfoChanged",
@@ -336,53 +283,6 @@ import browser from "webextension-polyfill";
     debuggerEventListenerRegistered = true;
   }
 
-  const TAB_TITLE_PREFIXES = {
-    connected: "🟢 ",
-    idle: "🔵 ",
-    connecting: "🟡 ",
-    error: "🔴 ",
-  };
-  const ALL_PREFIXES_RE_SRC = "^(?:🟢 |🟡 |🔴 |🔵 )+";
-
-  const pendingTitleUpdates = new Map();
-
-  function markTabTitle(tabId, stateOrBool) {
-    const state = stateOrBool === true ? "connected" : stateOrBool === false ? null : stateOrBool;
-    const prefix = state ? TAB_TITLE_PREFIXES[state] || null : null;
-
-    const existing = pendingTitleUpdates.get(tabId);
-    if (existing) clearTimeout(existing.timer);
-
-    const timer = setTimeout(() => {
-      pendingTitleUpdates.delete(tabId);
-      _applyTabTitle(tabId, prefix).catch(() => {});
-    }, 50);
-    pendingTitleUpdates.set(tabId, { timer, prefix });
-  }
-
-  async function _applyTabTitle(tabId, prefix) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (newPrefix, reSrc) => {
-          const re = new RegExp(reSrc);
-          if (window.__spawriterTitleObserver) {
-            window.__spawriterTitleObserver.disconnect();
-            window.__spawriterTitleObserver = null;
-          }
-          if (window.__spawriterOrigTitleDesc) {
-            Object.defineProperty(document, "title", window.__spawriterOrigTitleDesc);
-            window.__spawriterOrigTitleDesc = null;
-          }
-          document.title = (newPrefix || '') + document.title.replace(re, '');
-        },
-        args: [prefix, ALL_PREFIXES_RE_SRC],
-      });
-    } catch (e) {
-      warn(`markTabTitle failed for tab ${tabId}:`, e?.message || e);
-    }
-  }
-
   function emitDetachedFromTarget(tabId, reason) {
     const tabInfo = attachedTabs.get(tabId);
     if (!tabInfo) return;
@@ -390,7 +290,6 @@ import browser from "webextension-polyfill";
     tabOwnership.delete(tabId);
     attachedTabs.delete(tabId);
     persistState();
-    markTabTitle(tabId, false);
     sendMessage({
       method: "forwardCDPEvent",
       params: {
@@ -526,7 +425,7 @@ import browser from "webextension-polyfill";
       return;
     }
 
-    if (message.method === "connectActiveTab" || message.method === "connectTabByMatch") {
+    if (message.method === "connectTabByMatch" || message.method === "closeTab") {
       handleRelayMessage(message)
         .then((result) => sendMessage({ id: message.id, ...result }))
         .catch((e) => sendMessage({ id: message.id, success: false, error: e.message }));
@@ -618,19 +517,10 @@ import browser from "webextension-polyfill";
       }
     }
 
+    // Never fall back to the user's active tab: CDP commands may only run
+    // against tabs that are already spawriter-attached.
     if (!targetTabId) {
-      try {
-        targetTabId = await ensureActiveTabAttached();
-      } catch (attachErr) {
-        error(
-          "No target tab available for CDP command:",
-          attachErr?.message || attachErr
-        );
-      }
-    }
-
-    if (!targetTabId) {
-      sendMessage({ id, error: "No target tab attached" });
+      sendMessage({ id, error: "No target tab attached. Connect a tab first." });
       return;
     }
 
@@ -680,7 +570,6 @@ import browser from "webextension-polyfill";
     try {
       log(`Starting connection to tab ${tabId}`);
       setTabState(tabId, "connecting");
-      markTabTitle(tabId, "connecting");
       updateIcons();
 
       await ensureRelayConnected();
@@ -690,7 +579,6 @@ import browser from "webextension-polyfill";
     } catch (err) {
       error(`Failed to connect tab ${tabId}:`, err);
       setTabState(tabId, "error");
-      markTabTitle(tabId, "error");
       updateIcons();
     }
   }
@@ -801,14 +689,13 @@ import browser from "webextension-polyfill";
     }
 
     log(`Attached to tab ${tabId}, sessionId: ${sessionId}`);
-    markTabTitle(tabId, initialState);
     updateIcons();
     syncTabGroup();
     return { tabId, sessionId };
   }
 
   async function syncTabGroup() {
-    // Tab grouping disabled — status shown via title prefix emoji instead
+    // Tab grouping disabled — status shown via extension icon + badge
   }
 
   async function detachAllTabs() {
@@ -816,29 +703,6 @@ import browser from "webextension-polyfill";
     for (const tabId of tabIds) {
       await disconnectTab(tabId);
     }
-  }
-
-  async function getActiveTab() {
-    const tabs = await browser.tabs.query({
-      active: true,
-      currentWindow: true,
-    });
-    return tabs[0] || null;
-  }
-
-  async function ensureActiveTabAttached() {
-    const activeTab = await getActiveTab();
-    if (!activeTab?.id) throw new Error("No active tab found");
-
-    const needsAttach = !attachedTabs.has(activeTab.id) || !(await isDebuggerAttached(activeTab.id));
-    if (needsAttach) {
-      if (attachedTabs.has(activeTab.id)) {
-        emitDetachedFromTarget(activeTab.id, "stale-entry");
-      }
-      await connectTab(activeTab.id);
-    }
-
-    return activeTab.id;
   }
 
   async function isDebuggerAttached(tabId) {
@@ -921,9 +785,7 @@ import browser from "webextension-polyfill";
           },
         });
 
-        const nextState = isTabOwned(tabId) ? "connected" : "idle";
-        setTabState(tabId, nextState);
-        markTabTitle(tabId, nextState);
+        setTabState(tabId, isTabOwned(tabId) ? "connected" : "idle");
       }
 
       persistState();
@@ -950,11 +812,6 @@ import browser from "webextension-polyfill";
   // --- Relay message handlers (commands from relay via offscreen) ---
 
   async function handleRelayMessage(message) {
-    if (message.method === "connectActiveTab") {
-      const tabId = await ensureActiveTabAttached();
-      return { success: true, tabId };
-    }
-
     if (message.method === "connectTabByMatch") {
       const { url, tabId, create } = message.params || {};
 
@@ -978,24 +835,10 @@ import browser from "webextension-polyfill";
       }
 
       if (url) {
-        const forceCreate = message.params?.forceCreate;
-        if (!forceCreate) {
-          const allTabs = await browser.tabs.query({});
-          const match = pickBestMatchingTab(allTabs, url);
-
-          if (match) {
-            const needsAttach = !attachedTabs.has(match.id) || !(await isDebuggerAttached(match.id));
-            if (needsAttach) {
-              if (attachedTabs.has(match.id)) {
-                emitDetachedFromTarget(match.id, "stale-entry");
-              }
-              await connectTab(match.id);
-            }
-            return { success: true, tabId: match.id };
-          }
-        }
-
-        if (create || forceCreate) {
+        // Idle-tab reuse is decided by the relay (the single source of truth
+        // for ownership). The extension never searches the user's open tabs;
+        // it only creates fresh tabs on request.
+        if (create || message.params?.forceCreate) {
           const fullUrl = /^[a-z][\w+.-]*:/i.test(url) ? url : `https://${url}`;
           const newTab = await browser.tabs.create({ url: fullUrl, active: false });
           await sleep(1000);
@@ -1005,16 +848,28 @@ import browser from "webextension-polyfill";
 
         return {
           success: false,
-          error: `No tab matching "${url}" found. Set create: true to create one.`,
+          error: `No reusable idle tab for "${url}". Set create: true to create one.`,
         };
       }
 
       return { success: false, error: 'No url or tabId provided for connectTabByMatch' };
     }
 
+    if (message.method === "closeTab") {
+      const tabId = message.params?.tabId ?? message.tabId;
+      if (tabId == null) return { success: false, error: "No tabId" };
+      try {
+        await browser.tabs.remove(tabId);
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    }
+
     if (message.method === "clearCacheAndReload") {
-      const tabId = message.tabId || (await getActiveTab())?.id;
-      if (!tabId) return { success: false, error: "No tab specified" };
+      // Explicit tabId only — never implicitly target the user's active tab.
+      const tabId = message.tabId ?? message.params?.tabId;
+      if (tabId == null) return { success: false, error: "No tabId specified" };
       await clearCacheAndReload(tabId);
       return { success: true };
     }
@@ -1065,7 +920,6 @@ import browser from "webextension-polyfill";
             tabOwnership.clear();
             for (const [tabId] of attachedTabs.entries()) {
               setTabState(tabId, "idle");
-              markTabTitle(tabId, "idle");
             }
             resyncAttachedTabs().then(async () => {
               await sleep(500);
@@ -1106,7 +960,6 @@ import browser from "webextension-polyfill";
         tabOwnership.clear();
         for (const tabId of attachedTabs.keys()) {
           setTabState(tabId, "idle");
-          markTabTitle(tabId, "idle");
         }
         updateIcons();
         syncTabGroup();
@@ -1115,7 +968,6 @@ import browser from "webextension-polyfill";
         tabOwnership.clear();
         for (const [tabId] of attachedTabs.entries()) {
           setTabState(tabId, "idle");
-          markTabTitle(tabId, "idle");
         }
         updateIcons();
         resyncAttachedTabs().then(async () => {
@@ -1175,8 +1027,6 @@ import browser from "webextension-polyfill";
         getTabState,
         getConnectedCount,
         attachTab,
-        getActiveTab,
-        ensureActiveTabAttached,
         clearCacheAndReload,
         detachAllTabs,
       };

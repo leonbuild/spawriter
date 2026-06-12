@@ -14,7 +14,17 @@ spawriter session new
 spawriter -s sw-abc123 -e 'page.url()'
 ```
 
-**Why single quotes?** Always wrap `-e` code in single quotes (`'...'`) to prevent bash from interpreting `$`, backticks, and other special characters. Use double quotes or backtick template literals for strings inside the JS code.
+**Why single quotes?** In bash, always wrap `-e` code in single quotes (`'...'`) to prevent the shell from interpreting `$`, backticks, and other special characters. Use double quotes or backtick template literals for strings inside the JS code.
+
+**Windows (PowerShell/CMD):** quoting rules differ and inner double quotes are often mangled. Prefer stdin or a file instead of inline `-e`:
+
+```powershell
+# stdin: no shell quoting issues at all
+'await navigate("https://example.com")' | spawriter -s sw-abc123 -e -
+
+# or write the code to a file and run it
+spawriter -s sw-abc123 -f script.js
+```
 
 ## Session Management
 
@@ -29,7 +39,12 @@ spawriter session list                  # list all active sessions
 spawriter session reset <id>            # reset browser connection for a session
 spawriter session delete <id>           # delete a session
 spawriter session bind <tabId> -s <id>  # bind only to a safe tabId you created or own
+spawriter tabs list -s <id>             # list tabs with MINE/AVAILABLE/OWNED status
+spawriter tabs connect <url> --create -s <id>   # connect + claim a tab (use --force-create to always create)
+spawriter tabs release [tabId] -s <id>  # release one owned tab, or all if omitted
 spawriter -s <id> -e '<code>'           # execute code in a session
+spawriter -s <id> -e -                  # execute code read from stdin
+spawriter -s <id> -f <path>             # execute code from a file
 spawriter relay                         # start the relay server
 spawriter relay --replace               # replace existing relay server
 spawriter logfile                       # prints the log file path
@@ -52,10 +67,9 @@ Never use `/connect-active-tab`, never bind the current Chrome tab, and never bi
 On first `-e` execute, spawriter auto-acquires safely: owned session tab -> blue-dot idle attached tab -> newly created inactive tab. It must not attach the user's active tab or any unmanaged existing tab. If you get `No tab connected to this session`, recover in this order:
 
 1. `spawriter session reset <id>` — retries safe auto-acquisition
-2. If still fails, manually create and bind a new tab:
+2. If still fails, connect and claim a new tab:
    ```bash
-   curl -s -X POST http://localhost:19989/connect-tab -H 'Content-Type: application/json' -d '{"url":"about:blank","create":true,"forceCreate":true}'   # -> { "tabId": 12345, "created": true }
-   spawriter session bind 12345 -s <id>
+   spawriter tabs connect about:blank --force-create -s <id>
    ```
    Use the target URL instead of `about:blank` when you already know where the agent should work.
 3. If relay is down: `spawriter relay --replace`
@@ -94,7 +108,7 @@ All globals are injected into the Playwright VM sandbox. Playwright native opera
 | `pageContent(action, opts?)` | Page content: `get_text`, `get_html`, `get_metadata`, `search_dom` |
 | `singleSpa` | Single-spa management (`.status()`, `.override()`, `.mount()`, `.unmount()`, `.unload()`) |
 | `clearCacheAndReload(opts?)` | Origin-scoped cache/storage clear + reload |
-| `getCDPSession()` | Raw CDP session accessor (returns null through relay) |
+| `getCDPSession()` | Raw CDP session accessor (normally returns a live session, including through the relay; null only if creation failed) |
 | `resetPlaywright()` | Reset Playwright connection |
 | `require(module)` | Sandboxed module import (allowlisted: `path`, `url`, `crypto`, `fs` → ScopedFS, etc.) |
 | `import` | ES module dynamic import |
@@ -255,7 +269,7 @@ spawriter -s sw-1 -e 'page.url()'
 
 1. Only operate on normal web pages — never `chrome://` or extension pages
 2. Never use `/connect-active-tab` or bind arbitrary active/existing Chrome tabs. Only use your owned tab, a blue-dot idle spawriter tab, or a newly created tab.
-3. **CRITICAL: All cache/cookie/storage clearing is automatically scoped to the current tab's origin. Never attempt to clear storage for other origins — this will destroy the user's login sessions on all sites.**
+3. **CRITICAL: cache/cookie/storage clearing defaults to the current tab's origin. Never pass another site's origin explicitly — this would destroy the user's login sessions on other sites.**
 4. Screenshot between major actions for verification
 5. Don't assume code changes are live — verify with `screenshot()` or `snapshot()`
 6. Mock rules persist until disabled — always clean up with `networkIntercept.disable()`
@@ -273,7 +287,7 @@ Do not ask the user for help — recover autonomously using this table:
 
 | Symptom | Recovery |
 |---------|----------|
-| `No tab connected to this session` | `spawriter session reset <id>` → if still fails: create a new tab with `/connect-tab` + `forceCreate:true`, then `spawriter session bind <tabId> -s <id>` |
+| `No tab connected to this session` | `spawriter session reset <id>` → if still fails: `spawriter tabs connect <url> --force-create -s <id>` |
 | Tool timeout / connection error | `spawriter session reset <id>` then retry |
 | Relay not running | `spawriter relay --replace` then retry |
 | Override not reflected | `await ensureFreshRender()` |

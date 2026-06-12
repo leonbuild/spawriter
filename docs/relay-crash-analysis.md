@@ -1,5 +1,7 @@
 # Spawriter Relay Crash Analysis
 
+> **Status: Implemented**（2026-06-12 验证）。本文建议的进程级保护已落地：`relay.ts` 与 `mcp.ts` 均注册了 `unhandledRejection`/`uncaughtException` 处理器，`pw-executor.ts` 含 dialog（`beforeunload`）处理。本文档仅作历史记录。
+
 ## 1. 审计结论
 
 本次崩溃最可信的直接原因是 Playwright 在处理 `beforeunload` / JavaScript dialog 时触发了未处理的异步 rejection：

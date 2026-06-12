@@ -6,8 +6,10 @@
  */
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { VERSION, getCdpUrl, DEFAULT_PORT } from './utils.js';
 import { OWNERSHIP_ERROR_CODE } from './protocol.js';
+import { resolveCdpSessionForCaller } from './relay.js';
 
 // ---------------------------------------------------------------------------
 // Simulated relay state (mirrors relay.ts structures)
@@ -1284,5 +1286,229 @@ describe('pickReusableTab', () => {
     assert.notEqual(result, null);
     assert.equal(result!.tabId, 132);
     assert.equal(result!.reason, 'idle-random');
+  });
+});
+
+// ===========================================================================
+// Tests: S4 — resolveCdpSessionForCaller (HTTP /cli/cdp ownership enforcement)
+// ===========================================================================
+
+describe('resolveCdpSessionForCaller (S4)', () => {
+  function makeTargets(entries: Array<{ sessionId: string; tabId?: number }>) {
+    const map = new Map<string, { tabId?: number; sessionId: string }>();
+    for (const e of entries) map.set(e.sessionId, e);
+    return map;
+  }
+
+  it('without caller session, returns the first target (legacy internal use)', () => {
+    const targets = makeTargets([{ sessionId: 'cdp-1', tabId: 1 }, { sessionId: 'cdp-2', tabId: 2 }]);
+    assert.equal(resolveCdpSessionForCaller(targets, () => undefined, undefined), 'cdp-1');
+  });
+
+  it('without caller session and no targets, returns undefined', () => {
+    assert.equal(resolveCdpSessionForCaller(makeTargets([]), () => undefined, undefined), undefined);
+  });
+
+  it('caller gets its own tab even when other targets come first', () => {
+    const targets = makeTargets([{ sessionId: 'cdp-1', tabId: 1 }, { sessionId: 'cdp-2', tabId: 2 }]);
+    const ownerOf = (tabId: number) => (tabId === 2 ? 'sw-me' : 'sw-other');
+    assert.equal(resolveCdpSessionForCaller(targets, ownerOf, 'sw-me'), 'cdp-2');
+  });
+
+  it('caller owning nothing gets undefined — never another session tab', () => {
+    const targets = makeTargets([{ sessionId: 'cdp-1', tabId: 1 }, { sessionId: 'cdp-2', tabId: 2 }]);
+    const ownerOf = () => 'sw-other';
+    assert.equal(resolveCdpSessionForCaller(targets, ownerOf, 'sw-me'), undefined);
+  });
+
+  it('caller never falls through to an unowned tab', () => {
+    const targets = makeTargets([{ sessionId: 'cdp-1', tabId: 1 }]);
+    assert.equal(resolveCdpSessionForCaller(targets, () => undefined, 'sw-me'), undefined);
+  });
+
+  it('targets without tabId never match a caller', () => {
+    const targets = makeTargets([{ sessionId: 'cdp-1' }]);
+    const ownerOf = () => 'sw-me';
+    assert.equal(resolveCdpSessionForCaller(targets, ownerOf, 'sw-me'), undefined);
+  });
+});
+
+// ===========================================================================
+// Tests: S8 — Target.createTarget / Target.closeTarget through the relay
+// ===========================================================================
+
+describe('S8 regression: Target.createTarget/closeTarget implemented', () => {
+  const relaySource = readFileSync(new URL('./relay.ts', import.meta.url), 'utf-8');
+  const bridgeSource = readFileSync(new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url), 'utf-8');
+
+  it('relay routes Target.createTarget and Target.closeTarget to async handlers', () => {
+    assert.ok(relaySource.includes("method === 'Target.createTarget'"));
+    assert.ok(relaySource.includes("method === 'Target.closeTarget'"));
+    assert.ok(relaySource.includes('handleCreateTarget('));
+    assert.ok(relaySource.includes('handleCloseTarget('));
+  });
+
+  it('createTarget forces a new tab and claims it for the caller session', () => {
+    assert.ok(relaySource.includes("sendExtensionCommand('connectTabByMatch', { url: createUrl, forceCreate: true }"));
+    assert.ok(relaySource.includes('claimTab(newTabId, callerSession)'));
+  });
+
+  it('closeTarget refuses to close a tab owned by another session', () => {
+    assert.ok(relaySource.includes('owner !== callerSession'));
+    assert.ok(relaySource.includes('Cannot close.'));
+  });
+
+  it('extension handles closeTab via browser.tabs.remove', () => {
+    assert.ok(bridgeSource.includes('"closeTab"') || bridgeSource.includes("'closeTab'"));
+    assert.ok(bridgeSource.includes('tabs.remove'));
+  });
+
+  it('closeTarget resolves targetId by real CDP id or relay sessionId (the /json/list id)', () => {
+    assert.ok(relaySource.includes('buildTargetInfo(t).targetId === targetId || t.sessionId === targetId'));
+  });
+});
+
+// ===========================================================================
+// Tests: target lifecycle events must reach Playwright as browser-level
+// events (no top-level sessionId), or pages are never created/closed.
+// ===========================================================================
+
+describe('regression: live target lifecycle events are browser-level', () => {
+  const relaySource = readFileSync(new URL('./relay.ts', import.meta.url), 'utf-8');
+
+  it('live Target.attachedToTarget is sent per-client without top-level sessionId', () => {
+    // A top-level sessionId makes Playwright route the event to a
+    // not-yet-existing CRSession and drop it: live-attached tabs would
+    // never become pages (newPage/bind/switch all hang on this).
+    const block = relaySource.slice(
+      relaySource.indexOf("method === 'Target.attachedToTarget' && sessionId"),
+      relaySource.indexOf('Target.tabAvailable'),
+    );
+    assert.ok(block.includes('sendToCDPClient(cdpClientId'), 'expected per-client send loop');
+    assert.ok(block.includes('boundSession'), 'expected per-client ownership filter');
+    const sendCall = block.slice(block.indexOf('sendToCDPClient(cdpClientId'), block.indexOf('});') + 3);
+    // sessionId may only appear inside params, never as a sibling of method/params.
+    const outsideParams = sendCall.replace(/params:\s*\{[\s\S]*\}\s*,/, 'params: {},');
+    assert.ok(!/\bsessionId\b/.test(outsideParams), 'live attachedToTarget must not have top-level sessionId');
+  });
+
+  it('Target.detachedFromTarget is broadcast browser-level and enriched with targetId', () => {
+    // Playwright resolves the dying page by params.targetId; the extension
+    // only sends params.sessionId. Without enrichment page.close() hangs.
+    const idx = relaySource.indexOf("method === 'Target.detachedFromTarget'");
+    assert.ok(idx > -1);
+    const block = relaySource.slice(idx, idx + 1600);
+    assert.ok(block.includes('detachedTargetId'), 'expected targetId enrichment');
+    assert.ok(block.includes('broadcastToCDPClients({'), 'expected browser-level broadcast');
+    assert.ok(block.includes('return;'), 'must return instead of falling through to routeCdpEvent');
+    assert.ok(!block.includes('routeCdpEvent(method'), 'must not route with top-level sessionId');
+  });
+});
+
+// ===========================================================================
+// Tests: behavioral — live attach/detach over a real relay process. This is
+// the end-to-end guarantee behind newPage()/page.close()/bind/switch: a tab
+// attached after a CDP client connects must surface as a browser-level
+// attachedToTarget, and its detach must carry the targetId.
+// ===========================================================================
+
+describe('behavioral: live target lifecycle over WS', () => {
+  it('pw client gets browser-level attach and targetId-enriched detach', async () => {
+    const { spawn } = await import('node:child_process');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { default: WebSocket } = await import('ws');
+
+    const srcDir = path.dirname(fileURLToPath(import.meta.url));
+    const pkgRoot = path.join(srcDir, '..');
+    const tsxCli = path.join(pkgRoot, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const port = 21000 + (process.pid % 2000);
+    // Isolate the child's relay.log from the real one.
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'spawriter-test-'));
+
+    const child = spawn(
+      process.execPath,
+      [tsxCli, path.join(srcDir, 'cli.ts'), 'relay', '--port', String(port)],
+      {
+        stdio: 'ignore',
+        env: { ...process.env, SSPA_MCP_PORT: String(port), TEMP: tmp, TMP: tmp, TMPDIR: tmp },
+      },
+    );
+
+    try {
+      const deadline = Date.now() + 20000;
+      let up = false;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/version`, { signal: AbortSignal.timeout(500) });
+          if (res.ok) { up = true; break; }
+        } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      assert.ok(up, 'relay child did not start in time');
+
+      const openWs = (url: string, opts?: Record<string, unknown>) =>
+        new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+          const ws = new WebSocket(url, opts);
+          ws.once('open', () => resolve(ws));
+          ws.once('error', reject);
+        });
+
+      const ext = await openWs(`ws://127.0.0.1:${port}/extension`, {
+        headers: { origin: 'chrome-extension://testextension' },
+      });
+      const received: Array<{ method?: string; sessionId?: string; params?: any }> = [];
+      const pw = await openWs(`ws://127.0.0.1:${port}/cdp/pw-test-1`);
+      pw.on('message', (d: Buffer) => received.push(JSON.parse(d.toString())));
+
+      const waitForMethod = async (method: string) => {
+        const end = Date.now() + 5000;
+        while (Date.now() < end) {
+          const msg = received.find(m => m.method === method);
+          if (msg) return msg;
+          await new Promise(r => setTimeout(r, 50));
+        }
+        return assert.fail(`did not receive ${method}; got: ${received.map(m => m.method).join(', ') || '(nothing)'}`);
+      };
+
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.attachedToTarget',
+          sessionId: 'spawriter-tab-42-1',
+          params: {
+            sessionId: 'spawriter-tab-42-1',
+            targetInfo: { targetId: 'TT42', type: 'page', tabId: 42, url: 'about:blank', title: '' },
+          },
+        },
+      }));
+
+      const attach = await waitForMethod('Target.attachedToTarget');
+      assert.equal(attach.sessionId, undefined, 'live attach must not carry a top-level sessionId');
+      assert.equal(attach.params.sessionId, 'spawriter-tab-42-1');
+      assert.equal(attach.params.targetInfo.targetId, 'TT42');
+
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.detachedFromTarget',
+          sessionId: 'spawriter-tab-42-1',
+          params: { sessionId: 'spawriter-tab-42-1', reason: 'tab-removed' },
+        },
+      }));
+
+      const detach = await waitForMethod('Target.detachedFromTarget');
+      assert.equal(detach.sessionId, undefined, 'detach must not carry a top-level sessionId');
+      assert.equal(detach.params.targetId, 'TT42', 'detach must be enriched with targetId');
+
+      ext.close();
+      pw.close();
+    } finally {
+      child.kill();
+      await new Promise(r => setTimeout(r, 200));
+      try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
   });
 });

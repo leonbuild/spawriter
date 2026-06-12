@@ -1,5 +1,7 @@
 # Tab 获取机制 — 完备审计、实施方案与优化文档
 
+> **Status: Implemented**（2026-06-12 验证）。第六章方案 6.1–6.4 均已落地于 `relay.ts`/`bridge.js`。本文遗漏的 CDP 无目标时抢活跃 tab 的兜底路径（原 `bridge.js` `ensureActiveTabAttached`）已随 fix-plan S5/S8 一并移除；扩展侧 url 匹配搜索已整体移除，idle 复用统一由 relay 端 `pickReusableAttachedTab` 决策（S9）。本文档仅作历史记录。
+
 ## 一、系统架构
 
 ```

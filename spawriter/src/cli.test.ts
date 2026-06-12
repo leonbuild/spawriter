@@ -6,6 +6,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { DEFAULT_PORT } from './utils.js';
 
 // ---------------------------------------------------------------------------
@@ -331,6 +332,37 @@ describe('Phase 3: CLI command coverage', () => {
     assert.equal(globalOpts.length, 6);
     assert.ok(globalOpts.includes('eval'));
     assert.ok(globalOpts.includes('session'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP/CLI tab-management parity: the MCP `tab` tool actions (connect, list,
+// switch, release) must all have CLI equivalents.
+// ---------------------------------------------------------------------------
+
+describe('MCP/CLI parity: tabs commands', () => {
+  const cliSource = readFileSync(new URL('./cli.ts', import.meta.url), 'utf-8');
+  const clientSource = readFileSync(new URL('./runtime/control-client.ts', import.meta.url), 'utf-8');
+
+  it('cli exposes tabs list/connect/release and session bind (= MCP tab switch)', () => {
+    assert.ok(cliSource.includes("cli.command('tabs list'"));
+    assert.ok(cliSource.includes("cli.command('tabs connect <url>'"));
+    assert.ok(cliSource.includes("cli.command('tabs release [tabId]'"));
+    assert.ok(cliSource.includes("cli.command('session bind <tabId>'"));
+  });
+
+  it('tabs connect claims the tab after connecting, like MCP tab connect', () => {
+    const block = cliSource.slice(cliSource.indexOf("cli.command('tabs connect <url>'"));
+    const action = block.slice(0, block.indexOf("cli.command('tabs release"));
+    assert.ok(action.includes('connectTab('));
+    assert.ok(action.includes('claimTab('));
+  });
+
+  it('ControlClient wraps the relay tab endpoints', () => {
+    assert.ok(clientSource.includes("'/json/list'"));
+    assert.ok(clientSource.includes("'/connect-tab'"));
+    assert.ok(clientSource.includes("'/cli/tab/claim'"));
+    assert.ok(clientSource.includes("'/cli/tab/release'"));
   });
 });
 

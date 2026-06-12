@@ -37,12 +37,12 @@ const __mcpDirname = path.dirname(fileURLToPath(import.meta.url));
 
 function loadPromptContent(): string {
   const repoRoot = path.join(__mcpDirname, '..', '..');
-  const agentsPath = path.join(repoRoot, 'AGENTS.md');
-  try {
-    return fs.readFileSync(agentsPath, 'utf-8');
-  } catch {
-    return 'spawriter: AI-assisted browser automation for single-spa micro-frontends. Execute Playwright JS code with spawriter extensions.';
+  for (const name of ['AGENTS_MCP.md', 'AGENTS_Unified.md']) {
+    try {
+      return fs.readFileSync(path.join(repoRoot, name), 'utf-8');
+    } catch { /* try next */ }
   }
+  return 'spawriter: AI-assisted browser automation for single-spa micro-frontends. Execute Playwright JS code with spawriter extensions.';
 }
 
 const promptContent = loadPromptContent();
@@ -104,13 +104,6 @@ const MCP_CLIENT_ID = generateMcpClientId();
 const agentLabel = getAgentLabel();
 const projectUrl = getProjectUrl();
 
-interface AgentSession {
-  agentId: string;
-  clientId: string;
-  executorSessionId: string;
-}
-
-const agentSessions = new Map<string, AgentSession>();
 let activeAgentId: string | null = null;
 
 function getEffectiveClientId(agentId?: string): string {
@@ -118,17 +111,21 @@ function getEffectiveClientId(agentId?: string): string {
   return `${MCP_CLIENT_ID}::${agentId}`;
 }
 
-function getAgentSession(agentId: string): AgentSession {
-  let session = agentSessions.get(agentId);
-  if (!session) {
-    session = {
-      agentId,
-      clientId: getEffectiveClientId(agentId),
-      executorSessionId: `mcp-${agentId}`,
-    };
-    agentSessions.set(agentId, session);
-  }
-  return session;
+// Single source of truth for the relay-facing session ID.
+// execute / single_spa / tab / cdp must all resolve through this function,
+// otherwise tab ownership and execution land on different sessions (S1).
+export function buildRelaySessionId(clientId: string): string {
+  return `mcp-${clientId}`;
+}
+
+function getRelaySessionId(agentId?: string): string {
+  return buildRelaySessionId(getEffectiveClientId(agentId ?? activeAgentId ?? undefined));
+}
+
+export function ownerBelongsToThisMcp(owner: string | null | undefined, mcpClientId: string = MCP_CLIENT_ID): boolean {
+  if (!owner) return false;
+  const prefix = buildRelaySessionId(mcpClientId);
+  return owner === prefix || owner.startsWith(`${prefix}::`);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,7 +134,7 @@ function getAgentSession(agentId: string): AgentSession {
 
 async function remoteRelaySendCdp(method: string, params?: Record<string, unknown>, timeout?: number): Promise<unknown> {
   const port = getRelayPort();
-  const mcpSessionId = `mcp-${getEffectiveClientId() || 'default'}`;
+  const mcpSessionId = getRelaySessionId();
   const resp = await fetch(`http://localhost:${port}/cli/cdp`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -159,7 +156,7 @@ async function getOrCreateExecutor(agentId?: string): Promise<PlaywrightExecutor
 
 async function executeViaRelay(code: string, timeout: number): Promise<ExecuteResult> {
   const port = getRelayPort();
-  const mcpSessionId = `mcp-${getEffectiveClientId() || 'default'}`;
+  const mcpSessionId = getRelaySessionId();
   const resp = await fetch(`http://localhost:${port}/cli/execute`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -221,9 +218,7 @@ async function handleTabAction(
   const port = getRelayPort();
   const sessionId = args.session_id as string | undefined;
   if (sessionId) activeAgentId = sessionId;
-  const effectiveClientId = getEffectiveClientId(sessionId || activeAgentId || undefined);
-
-  const mySessionId = `mcp-${effectiveClientId || 'default'}`;
+  const mySessionId = getRelaySessionId(sessionId);
 
   switch (action) {
     case 'list': {
@@ -338,20 +333,20 @@ async function handleTabAction(
       if (target.owner && target.owner !== mySessionId) {
         return { content: [{ type: 'text', text: formatError({ error: `Tab ${switchTabId} owned by ${target.owner}`, hint: 'You can only switch to tabs you own or unclaimed tabs' }) }], isError: true };
       }
-      if (!target.owner) {
-        try {
-          const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tabId: switchTabId, sessionId: mySessionId }),
-          });
-          if (!claimResp.ok) {
-            const claimErr = await claimResp.json().catch(() => ({}));
-            return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${(claimErr as any).error || claimResp.status}` }) }], isError: true };
-          }
-        } catch (e: any) {
-          return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${e.message}` }) }], isError: true };
+      // Always claim, even when already owned: the relay-side claim also
+      // switches the relay executor's active tab, so execute follows the switch.
+      try {
+        const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tabId: switchTabId, sessionId: mySessionId }),
+        });
+        if (!claimResp.ok) {
+          const claimErr = await claimResp.json().catch(() => ({}));
+          return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${(claimErr as any).error || claimResp.status}` }) }], isError: true };
         }
+      } catch (e: any) {
+        return { content: [{ type: 'text', text: formatError({ error: `Failed to claim tab ${switchTabId}: ${e.message}` }) }], isError: true };
       }
       const executor = await getOrCreateExecutor();
       executor.claimTab(switchTabId, target.url);
@@ -419,6 +414,36 @@ async function getTargets(port: number): Promise<TargetListItem[]> {
   }
 }
 
+// Releases every tab owned by any session of this MCP process (base ID and
+// ::agentId variants) and deletes those relay sessions. Used by reset and
+// graceful shutdown so ownership never outlives the process (S3).
+async function releaseAllOwnedTabs(): Promise<number> {
+  const port = getRelayPort();
+  let released = 0;
+  try {
+    const targets = await getTargets(port);
+    const ownedSessions = new Set<string>();
+    await Promise.all(targets
+      .filter(t => t.tabId != null && ownerBelongsToThisMcp(t.owner))
+      .map(t => {
+        ownedSessions.add(t.owner as string);
+        released++;
+        return fetch(`http://localhost:${port}/cli/tab/release`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tabId: t.tabId, sessionId: t.owner }),
+        }).catch(() => {});
+      }));
+    await Promise.all([...ownedSessions].map(sid =>
+      fetch(`http://localhost:${port}/cli/session/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: sid }),
+      }).catch(() => {})));
+  } catch { /* relay may not be running */ }
+  return released;
+}
+
 async function requestConnectTab(port: number, params: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
   try {
     const response = await fetch(`http://localhost:${port}/connect-tab`, {
@@ -463,6 +488,10 @@ const tools = [
           type: 'number',
           description: 'Execution timeout in ms (default: 30000)',
         },
+        session_id: {
+          type: 'string',
+          description: 'Session ID for per-agent isolation (use the same value as tab connect)',
+        },
       },
       required: ['code'],
     },
@@ -493,6 +522,10 @@ Actions:
         },
         appName: { type: 'string', description: 'App name (e.g. @org/navbar)' },
         url: { type: 'string', description: 'Override URL (e.g. http://localhost:8080/main.js)' },
+        session_id: {
+          type: 'string',
+          description: 'Session ID for per-agent isolation (use the same value as tab connect)',
+        },
       },
       required: ['action'],
     },
@@ -529,6 +562,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'execute') {
       const code = args.code as string;
       const timeout = (args.timeout as number) || 30000;
+      if (args.session_id) activeAgentId = args.session_id as string;
       if (!code) {
         return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter: code' }) }], isError: true };
       }
@@ -538,31 +572,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === 'reset') {
-      const port = getRelayPort();
-      const sessionsToRelease = new Set<string>();
-      for (const [, sid] of agentSessions) sessionsToRelease.add(`mcp-${sid}`);
-      sessionsToRelease.add(`mcp-${getEffectiveClientId() || 'default'}`);
-
-      for (const sid of sessionsToRelease) {
-        try {
-          await fetch(`http://localhost:${port}/cli/session/delete`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: sid }),
-          });
-        } catch { /* relay may not be running */ }
-      }
-
+      const released = await releaseAllOwnedTabs();
       await executorManager.resetAll();
-      agentSessions.clear();
       activeAgentId = null;
-      return { content: [{ type: 'text', text: 'Connection reset. All state and tab ownership cleared.' }] };
+      return { content: [{ type: 'text', text: `Connection reset. All state cleared; ${released} owned tab(s) released.` }] };
     }
 
     if (name === 'single_spa') {
       const action = args.action as string;
       const appName = args.appName as string | undefined;
       const url = args.url as string | undefined;
+      if (args.session_id) activeAgentId = args.session_id as string;
 
       await ensureRelayServer();
 
@@ -641,11 +661,19 @@ async function main() {
   await server.connect(transport);
   mcpLog('info', 'MCP server ready');
 
-  process.on('SIGINT', async () => {
-    log('Shutting down...');
+  let shuttingDown = false;
+  const gracefulShutdown = async (signal: string): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`Shutting down (${signal})...`);
+    await releaseAllOwnedTabs().catch(() => {});
     await executorManager.resetAll().catch(() => {});
     process.exit(0);
-  });
+  };
+  process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+  // MCP clients close stdio to terminate the server
+  process.stdin.on('end', () => void gracefulShutdown('stdin-end'));
 }
 
 export async function startMcpServer(): Promise<void> {

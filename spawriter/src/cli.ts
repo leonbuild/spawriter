@@ -36,13 +36,28 @@ cli
   .option('--host <host>', 'Remote relay server host (or set SSPA_RELAY_HOST)')
   .option('--token <token>', 'Authentication token (or set SSPA_RELAY_TOKEN)')
   .option('-s, --session <name>', 'Session ID (required for -e)')
-  .option('-e, --eval <code>', 'Execute code and exit (Playwright API + spawriter extensions)')
+  .option('-e, --eval [code]', "Execute code and exit. Omit the value or pass '-' to read code from stdin (avoids shell quoting issues)")
+  .option('-f, --file <path>', 'Execute code from a file and exit')
   .option('--timeout <ms>', 'Execution timeout in ms (default: 30000)')
-  .option('--port <port>', 'Port for MCP server (default: 19989)')
+  .option('--port <port>', 'Relay HTTP port (default: 19989)')
   .action(async (options: Record<string, unknown>) => {
-    if (options.eval) {
+    if (options.eval !== undefined || options.file !== undefined) {
+      let code: string;
+      if (options.file !== undefined) {
+        try {
+          code = fs.readFileSync(String(options.file), 'utf-8');
+        } catch (e: any) {
+          console.error(`Error: cannot read file "${options.file}": ${e.message}`);
+          process.exitCode = 1;
+          return;
+        }
+      } else if (options.eval === '-' || options.eval === '' || options.eval === true) {
+        code = await readStdin();
+      } else {
+        code = String(options.eval);
+      }
       await executeCode({
-        code: options.eval as string,
+        code,
         timeout: Number(options.timeout) || 30000,
         sessionId: options.session as string | undefined,
         host: options.host as string | undefined,
@@ -58,6 +73,15 @@ cli
     await startMcpServer();
   });
 
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => { data += chunk; });
+    process.stdin.on('end', () => resolve(data));
+  });
+}
+
 // === executeCode: core code execution function ===
 async function executeCode(options: {
   code: string;
@@ -72,7 +96,8 @@ async function executeCode(options: {
   if (!sessionId) {
     console.error('Error: -s/--session is required for -e.');
     console.error('Run `spawriter session new` first to get a session ID.');
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   const rawHost = host || process.env.SSPA_RELAY_HOST || '';
@@ -100,8 +125,7 @@ async function executeCode(options: {
 
     if (!response.ok) {
       const text = await response.text();
-      console.error(`Error: ${response.status} ${text}`);
-      process.exit(1);
+      throw new Error(`${response.status} ${text}`);
     }
 
     return (await response.json()) as {
@@ -140,7 +164,9 @@ async function executeCode(options: {
       }
     }
 
-    if (result.isError) process.exit(1);
+    // process.exitCode instead of process.exit: lets libuv drain undici
+    // keep-alive handles naturally (process.exit mid-close crashes on Windows).
+    if (result.isError) process.exitCode = 1;
   } catch (error: any) {
     if (error.cause?.code === 'ECONNREFUSED') {
       console.error('Error: Cannot connect to relay server after retry.');
@@ -148,20 +174,23 @@ async function executeCode(options: {
     } else {
       console.error(`Error: ${error.message}`);
     }
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 
 // === skill ===
 cli.command('skill', 'Print the full spawriter usage instructions').action(() => {
-  const repoRoot = path.join(__dirname, '..', '..');
-  const resolvedPath = path.join(repoRoot, 'skill.md');
-  const fallback = path.join(__dirname, 'skill.md');
-  const skillPath = fs.existsSync(resolvedPath) ? resolvedPath : fallback;
+  // __dirname is spawriter/dist (built) or spawriter/src (tsx), so ../.. is the repo root.
+  const candidates = [
+    path.join(__dirname, '..', '..', 'AGENTS_Unified.md'),
+    path.join(__dirname, '..', 'AGENTS_Unified.md'),
+  ];
+  const skillPath = candidates.find(p => fs.existsSync(p));
 
-  if (!fs.existsSync(skillPath)) {
-    console.error('skill.md not found.');
-    process.exit(1);
+  if (!skillPath) {
+    console.error('AGENTS_Unified.md not found.');
+    process.exitCode = 1;
+    return;
   }
   console.log(fs.readFileSync(skillPath, 'utf-8'));
 });
@@ -270,23 +299,110 @@ cli.command('session bind <tabId>', 'Bind session to a specific tab')
   .option('-s, --session <name>', 'Session ID (required)')
   .action(async (tabId: string, options: Record<string, unknown>) => {
     const sessionId = options.session as string;
-    if (!sessionId) { console.error('Error: -s/--session is required.'); process.exit(1); }
-    const port = getRelayPort();
-    const token = (options.token as string) || getRelayToken();
-    const response = await fetch(`http://localhost:${port}/cli/tab/claim`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
-      body: JSON.stringify({ tabId: Number(tabId), sessionId }),
-    });
-    const result = await response.json() as Record<string, unknown>;
-    if (response.ok) {
+    if (!sessionId) {
+      console.error('Error: -s/--session is required.');
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const client = getControlClient(options as any);
+      await client.claimTab(sessionId, Number(tabId));
       console.log(`Session ${sessionId} bound to tab ${tabId}.`);
-    } else {
-      console.error(`Failed: ${result.error || 'Unknown error'}`);
-      process.exit(1);
+    } catch (error: any) {
+      console.error(`Failed: ${error.message}`);
+      process.exitCode = 1;
+    }
+  });
+
+// === tabs list ===
+cli.command('tabs list', 'List attached tabs with ownership status')
+  .option('--host <host>', 'Remote relay host')
+  .option('--token <token>', 'Auth token')
+  .option('-s, --session <name>', 'Mark tabs owned by this session as MINE')
+  .action(async (options: Record<string, unknown>) => {
+    if (!options.host && !process.env.SSPA_RELAY_HOST) {
+      await ensureRelayServer();
+    }
+    const client = getControlClient(options as any);
+    const tabs = await client.listTabs();
+    if (tabs.length === 0) {
+      console.log('No attached tabs.');
+      return;
+    }
+    const sid = options.session as string | undefined;
+    console.log('TABID'.padEnd(12) + 'STATUS'.padEnd(28) + 'URL');
+    for (const t of tabs) {
+      const status = !t.owner ? 'AVAILABLE' : t.owner === sid ? 'MINE' : `OWNED(${t.owner})`;
+      console.log(String(t.tabId ?? '?').padEnd(12) + status.padEnd(28) + t.url);
+    }
+  });
+
+// === tabs connect ===
+cli.command('tabs connect <url>', 'Connect to a tab by URL and claim it (like MCP tab connect)')
+  .option('--host <host>', 'Remote relay host')
+  .option('--token <token>', 'Auth token')
+  .option('-s, --session <name>', 'Session ID (required)')
+  .option('--create', 'Create a new tab if no idle match')
+  .option('--force-create', 'Always create a new tab')
+  .action(async (url: string, options: Record<string, unknown>) => {
+    const sessionId = options.session as string;
+    if (!sessionId) {
+      console.error('Error: -s/--session is required.');
+      process.exitCode = 1;
+      return;
+    }
+    if (!options.host && !process.env.SSPA_RELAY_HOST) {
+      await ensureRelayServer();
+    }
+    try {
+      const client = getControlClient(options as any);
+      const result = await client.connectTab({
+        url,
+        create: !!options.create || !!options.forceCreate,
+        forceCreate: !!options.forceCreate,
+      });
+      if (!result.success || result.tabId == null) {
+        console.error(`Failed: ${result.error || 'no tab available'}`);
+        process.exitCode = 1;
+        return;
+      }
+      await client.claimTab(sessionId, result.tabId);
+      const how = result.created ? 'created' : result.reused ? 'reused idle' : 'connected';
+      console.log(`Session ${sessionId} bound to tab ${result.tabId} (${how}).`);
+    } catch (error: any) {
+      console.error(`Failed: ${error.message}`);
+      process.exitCode = 1;
+    }
+  });
+
+// === tabs release ===
+cli.command('tabs release [tabId]', 'Release owned tab(s); all owned tabs if tabId omitted')
+  .option('--host <host>', 'Remote relay host')
+  .option('--token <token>', 'Auth token')
+  .option('-s, --session <name>', 'Session ID (required)')
+  .action(async (tabId: string | undefined, options: Record<string, unknown>) => {
+    const sessionId = options.session as string;
+    if (!sessionId) {
+      console.error('Error: -s/--session is required.');
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const client = getControlClient(options as any);
+      const ids = tabId != null
+        ? [Number(tabId)]
+        : (await client.listTabs()).filter(t => t.owner === sessionId && t.tabId != null).map(t => t.tabId as number);
+      if (ids.length === 0) {
+        console.log('No owned tabs to release.');
+        return;
+      }
+      for (const id of ids) {
+        await client.releaseTab(sessionId, id);
+      }
+      console.log(`Released tab(s): ${ids.join(', ')}.`);
+    } catch (error: any) {
+      console.error(`Failed: ${error.message}`);
+      process.exitCode = 1;
     }
   });
 
