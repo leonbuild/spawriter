@@ -9940,6 +9940,34 @@ describe('S6 regression: single-writer idempotent tab title markers', () => {
     assert.ok(!executorSource.includes('TITLE_PREFIX_RE'));
     assert.ok(!executorSource.includes('document.title ='));
   });
+
+  it('blank pages use the URL as title base so the dot stays visible', () => {
+    // about:blank has an empty title; "🔵 " alone is invisible in the tab
+    // strip. Both injection paths must fall back to document.URL.
+    const fn = bridgeSource.slice(
+      bridgeSource.indexOf('async function applyTitleMarker'),
+      bridgeSource.indexOf('const icons'),
+    );
+    const urlFallbacks = fn.match(/document\.URL/g) ?? [];
+    assert.equal(urlFallbacks.length, 2, 'scripting and debugger paths must both fall back to the URL');
+    assert.ok(fn.includes('clean ||'), 'URL base only when the stripped title is empty');
+  });
+
+  it('falls back to debugger Runtime.evaluate when script injection is blocked', () => {
+    // chrome.scripting.executeScript is rejected on about:blank and other
+    // restricted schemes; attached tabs always have a debugger session.
+    const fn = bridgeSource.slice(
+      bridgeSource.indexOf('async function applyTitleMarker'),
+      bridgeSource.indexOf('const icons'),
+    );
+    const catchIdx = fn.indexOf('catch');
+    assert.ok(catchIdx > -1);
+    const fallback = fn.slice(catchIdx);
+    assert.ok(fallback.includes('attachedTabs.has(tabId)'), 'fallback only for attached (dotted) tabs');
+    assert.ok(fallback.includes('chrome.debugger.sendCommand'), 'must evaluate through the debugger session');
+    assert.ok(fallback.includes('"Runtime.evaluate"'));
+    assert.ok(fallback.includes('TITLE_PREFIX_STRIP_RE_SRC'), 'debugger path must stay idempotent (strip before write)');
+  });
 });
 
 // ===========================================================================
