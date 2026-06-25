@@ -72,8 +72,8 @@ export class ControlClient {
     return this.request<Array<{ id: string; tabId: number | null; type: string; title: string; url: string; owner: string | null }>>('/json/list');
   }
 
-  async connectTab(opts: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }) {
-    return this.request<{ success: boolean; tabId?: number; created?: boolean; reused?: boolean; error?: string }>('/connect-tab', {
+  async connectTab(opts: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean; sessionId?: string }) {
+    return this.request<{ success: boolean; tabId?: number; created?: boolean; reused?: boolean; claimed?: boolean; targetId?: string; url?: string; error?: string }>('/connect-tab', {
       method: 'POST',
       body: JSON.stringify(opts),
     });

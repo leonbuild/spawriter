@@ -364,6 +364,24 @@ describe('MCP/CLI parity: tabs commands', () => {
     assert.ok(clientSource.includes("'/cli/tab/claim'"));
     assert.ok(clientSource.includes("'/cli/tab/release'"));
   });
+
+  // Doc regression test 4: connect+claim is atomic — every caller passes its
+  // session to /connect-tab and only falls back to a separate claim if the
+  // atomic claim was lost to a concurrent caller.
+  it('CLI connect forwards sessionId and only claims as a fallback (FP1)', () => {
+    assert.ok(clientSource.includes('sessionId?: string'), 'connectTab opts must include sessionId');
+    const block = cliSource.slice(cliSource.indexOf("cli.command('tabs connect <url>'"));
+    const action = block.slice(0, block.indexOf("cli.command('tabs release"));
+    assert.ok(/connectTab\(\{[\s\S]*sessionId[\s\S]*\}\)/.test(action), 'tabs connect must forward sessionId');
+    assert.ok(action.includes('if (!result.claimed)'), 'separate claim must be a fallback only');
+  });
+
+  it('MCP connect forwards its session for an atomic claim (FP1)', () => {
+    const mcpSource = readFileSync(new URL('./mcp.ts', import.meta.url), 'utf-8');
+    assert.ok(mcpSource.includes('sessionId: mySessionId'), 'requestConnectTab must send mySessionId');
+    const block = mcpSource.slice(mcpSource.indexOf("case 'connect'"), mcpSource.indexOf("case 'switch'"));
+    assert.ok(block.includes('result.claimed'), 'connect must trust the atomic claim result');
+  });
 });
 
 // ---------------------------------------------------------------------------

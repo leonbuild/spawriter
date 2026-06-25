@@ -360,13 +360,16 @@ cli.command('tabs connect <url>', 'Connect to a tab by URL and claim it (like MC
         url,
         create: !!options.create || !!options.forceCreate,
         forceCreate: !!options.forceCreate,
+        sessionId,
       });
       if (!result.success || result.tabId == null) {
         console.error(`Failed: ${result.error || 'no tab available'}`);
         process.exitCode = 1;
         return;
       }
-      await client.claimTab(sessionId, result.tabId);
+      // connect-tab claims atomically when sessionId is passed; fall back to an
+      // explicit claim only if a concurrent caller won the race.
+      if (!result.claimed) await client.claimTab(sessionId, result.tabId);
       const how = result.created ? 'created' : result.reused ? 'reused idle' : 'connected';
       console.log(`Session ${sessionId} bound to tab ${result.tabId} (${how}).`);
     } catch (error: any) {

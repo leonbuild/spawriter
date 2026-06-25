@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { VERSION, getCdpUrl, DEFAULT_PORT } from './utils.js';
 import { OWNERSHIP_ERROR_CODE } from './protocol.js';
-import { resolveCdpSessionForCaller, isPlaywrightTargetRegistryAssert } from './relay.js';
+import { resolveCdpSessionForCaller, isPlaywrightTargetRegistryAssert, isTargetVisibleToClient } from './relay.js';
 
 // ---------------------------------------------------------------------------
 // Simulated relay state (mirrors relay.ts structures)
@@ -1323,8 +1323,16 @@ describe('behavioral: live target lifecycle over WS', () => {
         headers: { origin: 'chrome-extension://testextension' },
       });
       const received: Array<{ method?: string; sessionId?: string; params?: any }> = [];
-      const pw = await openWs(`ws://127.0.0.1:${port}/cdp/pw-test-1`);
+      // FP2: a page target is replayed only to the client that owns its tab, so
+      // declare the session at connect time and claim tab 42 for it.
+      const pwSession = 'sess-e2e-attach';
+      const pw = await openWs(`ws://127.0.0.1:${port}/cdp/pw-test-1?session=${pwSession}`);
       pw.on('message', (d: Buffer) => received.push(JSON.parse(d.toString())));
+      await fetch(`http://127.0.0.1:${port}/cli/tab/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tabId: 42, sessionId: pwSession }),
+      });
 
       const waitForMethod = async (method: string) => {
         const end = Date.now() + 5000;
@@ -1488,7 +1496,15 @@ describe('behavioral: duplicate attach announces over WS', () => {
         });
 
       const received: Array<{ method?: string; params?: any }> = [];
-      const pw = await openWs(`ws://127.0.0.1:${port}/cdp/pw-test-dup`);
+      // FP2: page targets reach only the owning client; bind a session and
+      // (re-)claim tab 42 for it before each announce phase.
+      const dupSession = 'sess-e2e-dup';
+      const claimTab42 = () => fetch(`http://127.0.0.1:${port}/cli/tab/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tabId: 42, sessionId: dupSession }),
+      });
+      const pw = await openWs(`ws://127.0.0.1:${port}/cdp/pw-test-dup?session=${dupSession}`);
       pw.on('message', (d: Buffer) => received.push(JSON.parse(d.toString())));
 
       const attaches = () => received.filter(m => m.method === 'Target.attachedToTarget');
@@ -1517,6 +1533,7 @@ describe('behavioral: duplicate attach announces over WS', () => {
       let ext = await openWs(`ws://127.0.0.1:${port}/extension`, {
         headers: { origin: 'chrome-extension://testextension' },
       });
+      await claimTab42();
 
       // 1. First announce reaches the client.
       announce(ext, 'spawriter-tab-42-1', 'TT42');
@@ -1556,6 +1573,9 @@ describe('behavioral: duplicate attach announces over WS', () => {
       ext = await openWs(`ws://127.0.0.1:${port}/extension`, {
         headers: { origin: 'chrome-extension://testextension' },
       });
+      // The extension drop reset the browser-side mirror, clearing tab
+      // ownership; re-claim so the post-reconnect announce reaches the owner.
+      await claimTab42();
       announce(ext, 'spawriter-tab-42-2', 'TT43');
       await waitFor(() => attaches().length === 4, 're-announce after reconnect must be forwarded');
 
@@ -1566,5 +1586,663 @@ describe('behavioral: duplicate attach announces over WS', () => {
       await new Promise(r => setTimeout(r, 200));
       try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
     }
+  });
+});
+
+// ===========================================================================
+// Tests: spawriter-tab-page-mapping-fix.md regression suite (FP1–FP5). Numbers
+// in comments map to the document's "Regression Tests" list.
+// ===========================================================================
+
+describe('FP2: strict Playwright target visibility (isTargetVisibleToClient)', () => {
+  // 5: unbound client (early setAutoAttach/setDiscoverTargets replay window).
+  it('hides every page target from an unbound client but shows browser-level', () => {
+    assert.equal(isTargetVisibleToClient(42, undefined, 'sess-a'), false);
+    assert.equal(isTargetVisibleToClient(42, undefined, undefined), false);
+    // Browser-level targets (no tabId) bootstrap Playwright and stay visible.
+    assert.equal(isTargetVisibleToClient(null, undefined, undefined), true);
+    assert.equal(isTargetVisibleToClient(undefined, undefined, undefined), true);
+  });
+
+  // 6: a bound client only ever sees targets its own session owns.
+  it('shows a bound client only its own owned targets', () => {
+    assert.equal(isTargetVisibleToClient(42, 'sess-a', 'sess-a'), true);
+    assert.equal(isTargetVisibleToClient(42, 'sess-a', 'sess-b'), false);
+    assert.equal(isTargetVisibleToClient(42, 'sess-a', undefined), false);
+  });
+
+  // 2: a created+claimed tab is visible only to its owner client.
+  it('a tab claimed for a session is invisible to other clients', () => {
+    const relay = createRelayState();
+    relay.claimTab(99, 'owner-sess');
+    const owner = relay.getTabOwner(99);
+    assert.equal(isTargetVisibleToClient(99, 'owner-sess', owner), true);
+    assert.equal(isTargetVisibleToClient(99, 'other-sess', owner), false);
+    assert.equal(isTargetVisibleToClient(99, undefined, owner), false);
+  });
+});
+
+describe('FP1–FP5: relay source invariants', () => {
+  const relaySource = readFileSync(new URL('./relay.ts', import.meta.url), 'utf-8');
+
+  // 7: every Playwright target replay path filters through isTargetVisibleToClient.
+  it('all five replay paths go through isTargetVisibleToClient', () => {
+    const calls = relaySource.match(/isTargetVisibleToClient\(/g) ?? [];
+    assert.ok(calls.length >= 6, `expected definition + 5 call sites, got ${calls.length}`);
+    for (const fn of ['function sendAttachedToTargetEvents', 'function sendTargetCreatedEvents']) {
+      const idx = relaySource.indexOf(fn);
+      const body = relaySource.slice(idx, relaySource.indexOf('\nfunction ', idx + 1));
+      assert.ok(body.includes('isTargetVisibleToClient('), `${fn} must filter`);
+    }
+    for (const handler of ["case 'Target.getTargets'", "case 'Target.getTargetInfo'"]) {
+      const idx = relaySource.indexOf(handler);
+      const body = relaySource.slice(idx, idx + 800);
+      assert.ok(body.includes('isTargetVisibleToClient('), `${handler} must filter`);
+    }
+  });
+
+  // 1: /connect-tab claims atomically for the caller session.
+  it('connect-tab accepts sessionId and claims the tab before returning', () => {
+    const idx = relaySource.indexOf("app.post('/connect-tab'");
+    const body = relaySource.slice(idx, relaySource.indexOf('\napp.post(', idx + 1));
+    assert.ok(body.includes('sessionId'), 'must accept sessionId');
+    assert.ok(body.includes('claimForSession('), 'reuse and create paths must claim');
+    assert.ok(body.includes('replayClaimedTargetToOwner('), 'claimed target must replay to owner');
+  });
+
+  // 3: the atomic claim is all-or-nothing (no provisional ownership, so no
+  // explicit pending-connect hold is needed — strict visibility already hides
+  // an unclaimed target from every client).
+  it('a lost connect claim leaves no provisional ownership', () => {
+    const idx = relaySource.indexOf("app.post('/connect-tab'");
+    const body = relaySource.slice(idx, relaySource.indexOf('\napp.post(', idx + 1));
+    const cf = body.slice(body.indexOf('claimForSession ='), body.indexOf('respondFor ='));
+    assert.ok(cf.includes('if (!r.ok) return false'), 'a lost claim must not set ownership');
+  });
+
+  // 9: claim replays only to the owner's CDP client.
+  it('replayClaimedTargetToOwner sends only to the owner client', () => {
+    const idx = relaySource.indexOf('function replayClaimedTargetToOwner');
+    const body = relaySource.slice(idx, relaySource.indexOf('\nfunction ', idx + 1));
+    assert.ok(body.includes('sessionToClientId.get(sessionId)'), 'resolves owner client by session');
+    assert.ok(body.includes('sendToCDPClient(clientId'), 'sends to that single client');
+  });
+
+  // 10: resetRelaySession clears all per-session relay state.
+  it('resetRelaySession clears ownership, activity, bindings, executor, virtual sessions', () => {
+    const idx = relaySource.indexOf('async function resetRelaySession');
+    const body = relaySource.slice(idx, relaySource.indexOf('\nfunction ', idx + 1));
+    assert.ok(body.includes('releaseAllTabs(sessionId)'), 'releases owned tabs');
+    assert.ok(body.includes('sessionActivity.delete(sessionId)'), 'clears activity');
+    assert.ok(body.includes('sessionToClientId.delete(sessionId)'), 'clears session→client');
+    assert.ok(body.includes('pwClientToSession.delete'), 'clears client→session');
+    assert.ok(body.includes('relayExecutorManager.remove(sessionId)'), 'removes executor');
+    assert.ok(body.includes('clearVirtualSessionsForRealSession'), 'clears virtual sessions');
+  });
+
+  // 11: reset, delete, and stale sweep all delegate to resetRelaySession.
+  it('reset, delete, and stale sweep all delegate to resetRelaySession', () => {
+    const calls = relaySource.match(/resetRelaySession\(/g) ?? [];
+    assert.ok(calls.length >= 4, `expected definition + three callers, got ${calls.length}`);
+    assert.ok(relaySource.includes("app.post('/cli/session/reset'"));
+    assert.ok(relaySource.includes("app.post('/cli/session/delete'"));
+  });
+
+  // 13: assert recovery resets the bridge target graph and virtual maps.
+  it('resetBridgeState clears the target graph, announces, and virtual maps', () => {
+    const idx = relaySource.indexOf('function resetBridgeState');
+    const body = relaySource.slice(idx, relaySource.indexOf('\nfunction ', idx + 1));
+    assert.ok(body.includes('tabOwners.clear()'), 'releases ownership');
+    assert.ok(body.includes('attachedTargets.clear()'), 'empties attached targets for resync rebuild');
+    assert.ok(body.includes('announcedTargets.clear()'), 'clears announce bookkeeping');
+    assert.ok(body.includes('virtualBrowserSessions.clear()'));
+    assert.ok(body.includes('virtualToRealSession.clear()'));
+    assert.ok(body.includes('realToVirtualSessions.clear()'));
+  });
+
+  // 14: the CDP socket close handler drops client bindings and releases tabs
+  // (the indirect convergence relied on after resetAll()).
+  it('CDP websocket close clears client bindings and releases its tabs', () => {
+    const idx = relaySource.indexOf('log(`CDP WebSocket disconnected');
+    const body = relaySource.slice(idx, idx + 700);
+    assert.ok(body.includes('pwClientToSession.delete(clientId)'), 'clears client→session');
+    assert.ok(body.includes('sessionToClientId.delete(sid)'), 'clears session→client');
+    assert.ok(body.includes('releaseAllTabs(sid)'), 'releases the client tabs');
+  });
+
+  // 15: only the registry-assert branch is process-wide; it uses resetAll.
+  it('registry-assert recovery is process-wide and resets all executors', () => {
+    const idx = relaySource.indexOf('function handleRecoverableProcessError');
+    const body = relaySource.slice(idx, relaySource.indexOf('\nfunction ', idx + 1));
+    assert.ok(body.includes('isPlaywrightTargetRegistryAssert(reason)'), 'classifies registry asserts');
+    assert.ok(body.includes('resetBridgeState('), 'resets bridge state');
+    assert.ok(body.includes('relayExecutorManager.resetAll()'), 'resets all executors');
+  });
+});
+
+describe('FP4: session cleanup behavioral parity', () => {
+  // 12: releasing a session leaves no tab owned by it; others keep theirs.
+  it('releasing a session leaves no owned tabs', () => {
+    const relay = createRelayState();
+    relay.claimTab(1, 'sess-a');
+    relay.claimTab(2, 'sess-a');
+    relay.claimTab(3, 'sess-b');
+    assert.equal(relay.releaseAllTabs('sess-a'), 2);
+    assert.equal(relay.getTabOwner(1), undefined);
+    assert.equal(relay.getTabOwner(2), undefined);
+    assert.equal(relay.getTabOwner(3), 'sess-b', 'other sessions keep their tabs');
+  });
+});
+
+describe('FP2 behavioral: ownership isolation over WS', () => {
+  // 8: two CDP clients, one owns the tab; only the owner receives the page.
+  it('only the owner client receives a claimed tab page target', async () => {
+    const { spawn } = await import('node:child_process');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { default: WebSocket } = await import('ws');
+
+    const srcDir = path.dirname(fileURLToPath(import.meta.url));
+    const tsxCli = path.join(srcDir, '..', '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const port = 25000 + (process.pid % 2000);
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'spawriter-test-'));
+
+    const child = spawn(
+      process.execPath,
+      [tsxCli, path.join(srcDir, 'cli.ts'), 'relay', '--port', String(port)],
+      { stdio: 'ignore', env: { ...process.env, SSPA_MCP_PORT: String(port), TEMP: tmp, TMP: tmp, TMPDIR: tmp } },
+    );
+
+    try {
+      const deadline = Date.now() + 20000;
+      let up = false;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/version`, { signal: AbortSignal.timeout(500) });
+          if (res.ok) { up = true; break; }
+        } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      assert.ok(up, 'relay child did not start in time');
+
+      const openWs = (url: string, opts?: Record<string, unknown>) =>
+        new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+          const ws = new WebSocket(url, opts);
+          ws.once('open', () => resolve(ws));
+          ws.once('error', reject);
+        });
+
+      const ext = await openWs(`ws://127.0.0.1:${port}/extension`, {
+        headers: { origin: 'chrome-extension://testextension' },
+      });
+
+      const ownerMsgs: Array<{ method?: string; params?: any }> = [];
+      const otherMsgs: Array<{ method?: string; params?: any }> = [];
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-owner?session=sess-owner`);
+      const other = await openWs(`ws://127.0.0.1:${port}/cdp/pw-other?session=sess-other`);
+      owner.on('message', (d: Buffer) => ownerMsgs.push(JSON.parse(d.toString())));
+      other.on('message', (d: Buffer) => otherMsgs.push(JSON.parse(d.toString())));
+
+      // Owner claims tab 77; the other session never does.
+      await fetch(`http://127.0.0.1:${port}/cli/tab/claim`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tabId: 77, sessionId: 'sess-owner' }),
+      });
+
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.attachedToTarget',
+          sessionId: 'spawriter-tab-77-1',
+          params: { sessionId: 'spawriter-tab-77-1', targetInfo: { targetId: 'T77', type: 'page', tabId: 77, url: 'about:blank', title: '' } },
+        },
+      }));
+
+      const end = Date.now() + 5000;
+      let ownerGotIt = false;
+      while (Date.now() < end) {
+        ownerGotIt = ownerMsgs.some(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.targetId === 'T77');
+        if (ownerGotIt) break;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      assert.ok(ownerGotIt, 'owner must receive the page target attach');
+      // Same window for the other client; it must never see the page target.
+      await new Promise(r => setTimeout(r, 400));
+      assert.ok(
+        !otherMsgs.some(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.tabId === 77),
+        'a non-owner client must never receive the page target',
+      );
+
+      ext.close(); owner.close(); other.close();
+    } finally {
+      child.kill();
+      await new Promise(r => setTimeout(r, 200));
+      try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  });
+});
+
+describe('FP1/FP5 behavioral E2E (real relay over WS)', () => {
+  // Shared spawn harness: boots a real relay child, hands the test an openWs that
+  // tracks its sockets, and tears everything down. Keeps the two E2E cases below
+  // free of duplicated boot/cleanup boilerplate.
+  async function withRelay(
+    port: number,
+    run: (ctx: { port: number; openWs: (url: string, opts?: Record<string, unknown>) => Promise<InstanceType<typeof import('ws').default>> }) => Promise<void>,
+  ): Promise<void> {
+    const { spawn } = await import('node:child_process');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { default: WebSocket } = await import('ws');
+
+    const srcDir = path.dirname(fileURLToPath(import.meta.url));
+    const tsxCli = path.join(srcDir, '..', '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const tmp = mkdtempSync(path.join(os.tmpdir(), 'spawriter-test-'));
+    const child = spawn(
+      process.execPath,
+      [tsxCli, path.join(srcDir, 'cli.ts'), 'relay', '--port', String(port)],
+      { stdio: 'ignore', env: { ...process.env, SSPA_MCP_PORT: String(port), TEMP: tmp, TMP: tmp, TMPDIR: tmp } },
+    );
+    const openSockets: Array<InstanceType<typeof WebSocket>> = [];
+    const openWs = (url: string, opts?: Record<string, unknown>) =>
+      new Promise<InstanceType<typeof WebSocket>>((resolve, reject) => {
+        const ws = new WebSocket(url, opts);
+        openSockets.push(ws);
+        ws.once('open', () => resolve(ws));
+        ws.once('error', reject);
+      });
+
+    try {
+      const deadline = Date.now() + 20000;
+      let up = false;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/version`, { signal: AbortSignal.timeout(500) });
+          if (res.ok) { up = true; break; }
+        } catch { /* not up yet */ }
+        await new Promise(r => setTimeout(r, 200));
+      }
+      assert.ok(up, 'relay child did not start in time');
+      await run({ port, openWs });
+    } finally {
+      for (const ws of openSockets) { try { ws.close(); } catch { /* already closed */ } }
+      child.kill();
+      await new Promise(r => setTimeout(r, 200));
+      try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  }
+
+  const PORT_BASE = 27000 + (process.pid % 1500);
+
+  // FP1 + FP3 end-to-end: a single /connect-tab call claims the created tab for
+  // the caller, and only that owner's CDP client receives the page target.
+  it('connect-tab atomically claims a created tab and replays only to the owner', async () => {
+    await withRelay(PORT_BASE, async ({ port, openWs }) => {
+      const ext = await openWs(`ws://127.0.0.1:${port}/extension`, { headers: { origin: 'chrome-extension://testextension' } });
+      // Simulated extension: answer connectTabByMatch with a freshly created tab.
+      ext.on('message', (d: Buffer) => {
+        const msg = JSON.parse(d.toString());
+        if (msg.method === 'connectTabByMatch') {
+          ext.send(JSON.stringify({ id: msg.id, success: true, tabId: 777, created: true }));
+        }
+      });
+      const ownerMsgs: Array<{ method?: string; params?: any }> = [];
+      const otherMsgs: Array<{ method?: string; params?: any }> = [];
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-owner?session=sess-fp1`);
+      const other = await openWs(`ws://127.0.0.1:${port}/cdp/pw-other?session=sess-other`);
+      owner.on('message', (d: Buffer) => ownerMsgs.push(JSON.parse(d.toString())));
+      other.on('message', (d: Buffer) => otherMsgs.push(JSON.parse(d.toString())));
+
+      const res = await fetch(`http://127.0.0.1:${port}/connect-tab`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: 'https://example.com/', create: true, sessionId: 'sess-fp1' }),
+      });
+      const body = await res.json() as { success: boolean; tabId?: number; claimed?: boolean; created?: boolean };
+      assert.equal(body.success, true, 'connect-tab succeeds');
+      assert.equal(body.tabId, 777);
+      assert.equal(body.created, true);
+      assert.equal(body.claimed, true, 'connect-tab claims for the caller session in one round-trip');
+
+      // The extension then attaches the created tab; strict visibility + claim
+      // replay mean the owner sees it and the other session never does.
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.attachedToTarget',
+          sessionId: 'spawriter-tab-777-1',
+          params: { sessionId: 'spawriter-tab-777-1', targetInfo: { targetId: 'T777', type: 'page', tabId: 777, url: 'https://example.com/', title: '' } },
+        },
+      }));
+
+      const end = Date.now() + 5000;
+      let ownerGot = false;
+      while (Date.now() < end) {
+        ownerGot = ownerMsgs.some(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.targetId === 'T777');
+        if (ownerGot) break;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      assert.ok(ownerGot, 'owner receives the claimed page target');
+      await new Promise(r => setTimeout(r, 300));
+      assert.ok(
+        !otherMsgs.some(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.tabId === 777),
+        'a non-owner client never sees the claimed page target',
+      );
+    });
+  });
+
+  // FP5 end-to-end: an extension drop runs resetBridgeState, which must release
+  // ownership and detach the page (with its targetId) for the owning client.
+  it('extension disconnect releases the tab and detaches the owner page', async () => {
+    await withRelay(PORT_BASE + 1, async ({ port, openWs }) => {
+      const ext = await openWs(`ws://127.0.0.1:${port}/extension`, { headers: { origin: 'chrome-extension://testextension' } });
+      const msgs: Array<{ method?: string; params?: any }> = [];
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-rel?session=sess-rel`);
+      owner.on('message', (d: Buffer) => msgs.push(JSON.parse(d.toString())));
+      await fetch(`http://127.0.0.1:${port}/cli/tab/claim`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tabId: 88, sessionId: 'sess-rel' }),
+      });
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.attachedToTarget',
+          sessionId: 'spawriter-tab-88-1',
+          params: { sessionId: 'spawriter-tab-88-1', targetInfo: { targetId: 'T88', type: 'page', tabId: 88, url: 'about:blank', title: '' } },
+        },
+      }));
+
+      const waitFor = async (pred: () => boolean, what: string) => {
+        const end = Date.now() + 5000;
+        while (Date.now() < end) { if (pred()) return; await new Promise(r => setTimeout(r, 50)); }
+        assert.fail(`timeout waiting for ${what}; got: ${msgs.map(m => m.method).join(', ') || '(nothing)'}`);
+      };
+      await waitFor(() => msgs.some(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.targetId === 'T88'), 'owner attach');
+
+      ext.close();
+      await waitFor(() => msgs.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 88), 'tabReleased on extension drop');
+      await waitFor(() => msgs.some(m => m.method === 'Target.detachedFromTarget' && m.params?.targetId === 'T88'), 'detached (with targetId) on extension drop');
+    });
+  });
+
+  // ---- Shared helpers for the broader E2E matrix below ------------------------
+  type RelayMsg = { id?: number; method?: string; sessionId?: string; params?: any; result?: any };
+  const collect = (ws: { on: (ev: string, cb: (d: Buffer) => void) => void }): RelayMsg[] => {
+    const msgs: RelayMsg[] = [];
+    ws.on('message', (d: Buffer) => msgs.push(JSON.parse(d.toString())));
+    return msgs;
+  };
+  const openExt = (port: number, openWs: (url: string, opts?: Record<string, unknown>) => Promise<any>) =>
+    openWs(`ws://127.0.0.1:${port}/extension`, { headers: { origin: 'chrome-extension://testextension' } });
+  const claimVia = (port: number, tabId: number, sessionId: string, force = false) =>
+    fetch(`http://127.0.0.1:${port}/cli/tab/claim`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tabId, sessionId, force }),
+    });
+  const attachPage = (
+    ext: { send: (s: string) => void },
+    cdpSession: string, targetId: string, tabId: number | undefined, url = 'about:blank', type = 'page',
+  ) => ext.send(JSON.stringify({
+    method: 'forwardCDPEvent',
+    params: {
+      method: 'Target.attachedToTarget',
+      sessionId: cdpSession,
+      params: { sessionId: cdpSession, targetInfo: { targetId, type, tabId, url, title: '' } },
+    },
+  }));
+  const hasAttach = (msgs: RelayMsg[], targetId: string) =>
+    msgs.some(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.targetId === targetId);
+  const waitUntil = async (pred: () => boolean, what: string, dump?: () => string) => {
+    const end = Date.now() + 5000;
+    while (Date.now() < end) { if (pred()) return; await new Promise(r => setTimeout(r, 50)); }
+    assert.fail(`timeout waiting for ${what}${dump ? `; got: ${dump()}` : ''}`);
+  };
+
+  // Concurrent claims on one tab must be atomic: exactly one wins (200), the
+  // other is rejected (409), so ownership is single and stable (FP1).
+  it('concurrent claims on the same tab — exactly one wins', async () => {
+    await withRelay(PORT_BASE + 2, async ({ port }) => {
+      const [a, b] = await Promise.all([claimVia(port, 500, 'sess-A'), claimVia(port, 500, 'sess-B')]);
+      assert.deepEqual([a.status, b.status].sort(), [200, 409], 'one claim succeeds, the other conflicts');
+      const conflict = a.status === 409 ? await a.json() : await b.json();
+      assert.match(conflict.error, /owned by sess-(A|B)/, 'the conflict names the actual owner');
+    });
+  });
+
+  // Strict visibility end-to-end (FP2): two owners each see only their own page
+  // target, both over the live attach and via Target.getTargets.
+  it('two sessions are isolated: each sees only its own target (+ getTargets filter)', async () => {
+    await withRelay(PORT_BASE + 3, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const a = await openWs(`ws://127.0.0.1:${port}/cdp/pw-a?session=sess-ia`);
+      const b = await openWs(`ws://127.0.0.1:${port}/cdp/pw-b?session=sess-ib`);
+      const am = collect(a), bm = collect(b);
+      await claimVia(port, 601, 'sess-ia');
+      await claimVia(port, 602, 'sess-ib');
+      attachPage(ext, 'spawriter-tab-601-1', 'TA', 601, 'https://a/');
+      attachPage(ext, 'spawriter-tab-602-1', 'TB', 602, 'https://b/');
+
+      await waitUntil(() => hasAttach(am, 'TA'), 'A sees TA', () => am.map(m => m.method).join(','));
+      await waitUntil(() => hasAttach(bm, 'TB'), 'B sees TB', () => bm.map(m => m.method).join(','));
+      await new Promise(r => setTimeout(r, 300));
+      assert.ok(!hasAttach(am, 'TB'), 'A never sees the other-owned target');
+      assert.ok(!hasAttach(bm, 'TA'), 'B never sees the other-owned target');
+
+      a.send(JSON.stringify({ id: 1, method: 'Target.getTargets' }));
+      await waitUntil(() => am.some(m => m.id === 1 && m.result), 'getTargets reply for A');
+      const ids = (am.find(m => m.id === 1)!.result.targetInfos as Array<{ targetId: string }>).map(t => t.targetId);
+      assert.ok(ids.includes('TA'), 'A getTargets includes its own target');
+      assert.ok(!ids.includes('TB'), 'A getTargets excludes the other-owned target');
+    });
+  });
+
+  // A CDP-session swap on the same tab (debugger re-attach / cross-process nav):
+  // the stale target is detached, but ownership is keyed by tabId so the owner
+  // still receives the replacement target.
+  it('a CDP-session swap on the same tab keeps the owner and replays the new target', async () => {
+    await withRelay(PORT_BASE + 4, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-sw?session=sess-sw`);
+      const msgs = collect(owner);
+      await claimVia(port, 700, 'sess-sw');
+      attachPage(ext, 'spawriter-tab-700-1', 'TOLD', 700, 'https://x/');
+      await waitUntil(() => hasAttach(msgs, 'TOLD'), 'owner sees the first target');
+
+      attachPage(ext, 'spawriter-tab-700-2', 'TNEW', 700, 'https://x/');
+      await waitUntil(() => msgs.some(m => m.method === 'Target.detachedFromTarget' && m.params?.targetId === 'TOLD'), 'stale target detached');
+      await waitUntil(() => hasAttach(msgs, 'TNEW'), 'owner sees the replacement target (ownership preserved)');
+    });
+  });
+
+  // Explicit release transfers a tab: the old owner is notified, and a different
+  // session can re-claim it and receive the still-attached page target (FP3/FP4).
+  it('release frees a tab and a new session can re-claim and see its target', async () => {
+    await withRelay(PORT_BASE + 5, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const a = await openWs(`ws://127.0.0.1:${port}/cdp/pw-ra?session=sess-ra`);
+      const b = await openWs(`ws://127.0.0.1:${port}/cdp/pw-rb?session=sess-rb`);
+      const am = collect(a), bm = collect(b);
+      await claimVia(port, 800, 'sess-ra');
+      attachPage(ext, 'spawriter-tab-800-1', 'T800', 800, 'https://r/');
+      await waitUntil(() => hasAttach(am, 'T800'), 'A sees its target');
+
+      assert.equal((await claimVia(port, 800, 'sess-rb')).status, 409, 'an owned tab is not claimable by others');
+
+      const rel = await fetch(`http://127.0.0.1:${port}/cli/tab/release`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tabId: 800, sessionId: 'sess-ra' }),
+      });
+      assert.equal(rel.status, 200, 'owner releases its tab');
+      await waitUntil(() => am.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 800), 'old owner notified of release');
+      assert.equal((await claimVia(port, 800, 'sess-rb')).status, 200, 'released tab is re-claimable');
+      await waitUntil(() => hasAttach(bm, 'T800'), 'new owner receives the replayed target');
+    });
+  });
+
+  // A CDP client dropping (Playwright disconnect) releases the tabs it owned, so
+  // other clients are notified and can take over (FP4 close-handler convergence).
+  it('a CDP client disconnect releases its owned tabs', async () => {
+    await withRelay(PORT_BASE + 6, async ({ port, openWs }) => {
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-dc?session=sess-dc`);
+      const observer = await openWs(`ws://127.0.0.1:${port}/cdp/pw-ob?session=sess-ob`);
+      const om = collect(observer);
+      await claimVia(port, 900, 'sess-dc');
+      assert.equal((await claimVia(port, 900, 'sess-ob')).status, 409, 'tab owned while the client is connected');
+
+      owner.close();
+      await waitUntil(() => om.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 900), 'release broadcast on disconnect', () => om.map(m => m.method).join(','));
+      assert.equal((await claimVia(port, 900, 'sess-ob')).status, 200, 'tab is claimable after the owner disconnects');
+    });
+  });
+
+  // An unbound CDP client (no session declared) is in the early setAutoAttach
+  // window (FP2): it must receive no page target, but browser-level targets
+  // (no tabId) still bootstrap it.
+  it('an unbound client gets no page target but still sees browser-level targets', async () => {
+    await withRelay(PORT_BASE + 7, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const unbound = await openWs(`ws://127.0.0.1:${port}/cdp/pw-unbound`);
+      const um = collect(unbound);
+      await claimVia(port, 1000, 'sess-owner');
+      attachPage(ext, 'spawriter-tab-1000-1', 'TPAGE', 1000, 'https://p/');
+      attachPage(ext, 'browser-sess-1', 'TBROWSER', undefined, '', 'browser');
+
+      await waitUntil(() => hasAttach(um, 'TBROWSER'), 'unbound sees the browser-level target', () => um.map(m => m.method).join(','));
+      await new Promise(r => setTimeout(r, 300));
+      assert.ok(!hasAttach(um, 'TPAGE'), 'unbound never sees a page target');
+    });
+  });
+
+  // Force-claim takes a tab from its current owner and notifies them, so a stuck
+  // session can be recovered without leaving a phantom owner (claimTab force path).
+  it('force-claim takes a tab from its owner and notifies the old owner', async () => {
+    await withRelay(PORT_BASE + 8, async ({ port, openWs }) => {
+      const a = await openWs(`ws://127.0.0.1:${port}/cdp/pw-fa?session=sess-fa`);
+      const am = collect(a);
+      await claimVia(port, 1100, 'sess-fa');
+      assert.equal((await claimVia(port, 1100, 'sess-fb', true)).status, 200, 'force claim succeeds');
+      await waitUntil(
+        () => am.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 1100 && m.params?.reason === 'force-takeover'),
+        'old owner notified of force-takeover', () => am.map(m => m.method).join(','),
+      );
+      assert.equal((await claimVia(port, 1100, 'sess-fa')).status, 409, 'old owner can no longer claim without force');
+    });
+  });
+
+  // connect-tab must reuse an idle, unowned attached tab (decided against the
+  // relay's own state, never by scanning the user's tabs) rather than create one.
+  it('connect-tab reuses an idle attached tab instead of creating one', async () => {
+    await withRelay(PORT_BASE + 9, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      attachPage(ext, 'spawriter-tab-1200-1', 'TIDLE', 1200, 'https://reuse.example/');
+      await new Promise(r => setTimeout(r, 200));
+      const res = await fetch(`http://127.0.0.1:${port}/connect-tab`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: 'https://reuse.example/', sessionId: 'sess-reuse' }),
+      });
+      const body = await res.json() as { success: boolean; tabId?: number; reused?: boolean; created?: boolean; claimed?: boolean };
+      assert.equal(body.success, true);
+      assert.equal(body.tabId, 1200, 'reused the idle tab');
+      assert.equal(body.reused, true, 'flagged as a reuse');
+      assert.notEqual(body.created, true, 'did not create a new tab');
+      assert.equal(body.claimed, true, 'atomically claimed for the caller');
+    });
+  });
+
+  // Target.getTargetInfo is the fifth visibility call site: an owner can read its
+  // own target but an other-owned target is reported as missing (FP2).
+  it('Target.getTargetInfo is visibility-filtered like getTargets', async () => {
+    await withRelay(PORT_BASE + 10, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const a = await openWs(`ws://127.0.0.1:${port}/cdp/pw-gi?session=sess-gia`);
+      const am = collect(a);
+      await claimVia(port, 1300, 'sess-gia');
+      await claimVia(port, 1301, 'sess-gib');
+      attachPage(ext, 'spawriter-tab-1300-1', 'GA', 1300);
+      attachPage(ext, 'spawriter-tab-1301-1', 'GB', 1301);
+      await waitUntil(() => hasAttach(am, 'GA'), 'owner sees its own target');
+
+      a.send(JSON.stringify({ id: 10, method: 'Target.getTargetInfo', params: { targetId: 'GA' } }));
+      a.send(JSON.stringify({ id: 11, method: 'Target.getTargetInfo', params: { targetId: 'GB' } }));
+      await waitUntil(() => am.some(m => m.id === 10) && am.some(m => m.id === 11), 'both getTargetInfo replies');
+      assert.equal(am.find(m => m.id === 10)!.result?.targetInfo?.targetId, 'GA', 'own target is returned');
+      const other = am.find(m => m.id === 11)!;
+      assert.ok(other.error && !other.result, 'an other-owned target is not exposed');
+    });
+  });
+
+  // Extension resync re-announces every tab. An identical re-announce must be
+  // deduplicated (a duplicate attach trips CRBrowser's assert), but a changed
+  // targetId on the same CDP session (cross-process nav) must detach then re-attach.
+  it('same-session re-announce dedups an identical target and detaches on targetId change', async () => {
+    await withRelay(PORT_BASE + 11, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-ra2?session=sess-ra2`);
+      const msgs = collect(owner);
+      await claimVia(port, 1400, 'sess-ra2');
+      attachPage(ext, 'spawriter-tab-1400-1', 'RA1', 1400);
+      await waitUntil(() => hasAttach(msgs, 'RA1'), 'first attach');
+
+      attachPage(ext, 'spawriter-tab-1400-1', 'RA1', 1400);
+      await new Promise(r => setTimeout(r, 300));
+      const ra1 = msgs.filter(m => m.method === 'Target.attachedToTarget' && m.params?.targetInfo?.targetId === 'RA1').length;
+      assert.equal(ra1, 1, 'identical re-announce is deduplicated');
+
+      attachPage(ext, 'spawriter-tab-1400-1', 'RA2', 1400);
+      await waitUntil(() => msgs.some(m => m.method === 'Target.detachedFromTarget' && m.params?.targetId === 'RA1'), 'old targetId detached on change');
+      await waitUntil(() => hasAttach(msgs, 'RA2'), 'new targetId attached');
+    });
+  });
+
+  // A page closing: the extension forwards a detach for that CDP session. The
+  // relay enriches it with the targetId (Playwright resolves the page by it) and
+  // frees the tab so another session can take over.
+  it('an extension detachedFromTarget detaches the page and frees the tab', async () => {
+    await withRelay(PORT_BASE + 12, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-dt?session=sess-dt`);
+      const msgs = collect(owner);
+      await claimVia(port, 1500, 'sess-dt');
+      attachPage(ext, 'spawriter-tab-1500-1', 'DT', 1500);
+      await waitUntil(() => hasAttach(msgs, 'DT'), 'owner attach');
+
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: { method: 'Target.detachedFromTarget', sessionId: 'spawriter-tab-1500-1', params: { sessionId: 'spawriter-tab-1500-1' } },
+      }));
+      await waitUntil(() => msgs.some(m => m.method === 'Target.detachedFromTarget' && m.params?.targetId === 'DT'), 'detach carries the enriched targetId');
+      await waitUntil(() => msgs.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 1500 && m.params?.reason === 'tab-detached'), 'tab freed on page close');
+      assert.equal((await claimVia(port, 1500, 'sess-dt2')).status, 200, 're-claimable after the page closed');
+    });
+  });
+
+  // Connect-time replay (the remaining two FP2 visibility call sites): a late
+  // owner client replays its owned target on setAutoAttach (attachedToTarget) and
+  // setDiscoverTargets (targetCreated); a different session sees neither.
+  it('connect-time replay (setAutoAttach / setDiscoverTargets) is visibility-filtered', async () => {
+    await withRelay(PORT_BASE + 13, async ({ port, openWs }) => {
+      const ext = await openExt(port, openWs);
+      await claimVia(port, 1600, 'sess-rpa');
+      attachPage(ext, 'spawriter-tab-1600-1', 'RP', 1600);
+      await new Promise(r => setTimeout(r, 200));
+
+      const a = await openWs(`ws://127.0.0.1:${port}/cdp/pw-rpa?session=sess-rpa`);
+      const am = collect(a);
+      a.send(JSON.stringify({ id: 20, method: 'Target.setAutoAttach', params: { autoAttach: true, waitForDebuggerOnStart: false, flatten: true } }));
+      await waitUntil(() => hasAttach(am, 'RP'), 'owner replays its target on setAutoAttach', () => am.map(m => m.method).join(','));
+      a.send(JSON.stringify({ id: 21, method: 'Target.setDiscoverTargets', params: { discover: true } }));
+      await waitUntil(() => am.some(m => m.method === 'Target.targetCreated' && m.params?.targetInfo?.targetId === 'RP'), 'owner replays its target on setDiscoverTargets');
+
+      const b = await openWs(`ws://127.0.0.1:${port}/cdp/pw-rpb?session=sess-rpb`);
+      const bm = collect(b);
+      b.send(JSON.stringify({ id: 22, method: 'Target.setAutoAttach', params: { autoAttach: true, flatten: true } }));
+      b.send(JSON.stringify({ id: 23, method: 'Target.setDiscoverTargets', params: { discover: true } }));
+      await new Promise(r => setTimeout(r, 400));
+      assert.ok(!hasAttach(bm, 'RP'), 'a non-owner gets no attachedToTarget replay');
+      assert.ok(!bm.some(m => m.method === 'Target.targetCreated' && m.params?.targetInfo?.targetId === 'RP'), 'a non-owner gets no targetCreated replay');
+    });
   });
 });

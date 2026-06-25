@@ -101,10 +101,19 @@ function handleRecoverableProcessError(reason: unknown, origin: string): boolean
     return true;
   }
   if (isPlaywrightTargetRegistryAssert(reason)) {
-    error(`Playwright target-registry assert (${origin}); resetting executors instead of exiting:`, reason);
+    error(`Playwright target-registry assert (${origin}); resetting bridge state and executors:`, reason);
+    // The registry is already inconsistent, so a session-local reset is not
+    // enough: clear the whole target graph and drop all executors. This is
+    // process-wide on purpose; ordinary command errors must stay session-local.
+    // No extension command re-announces targets on demand, so ownership is
+    // synced empty and the next connect/execute re-attaches via
+    // connectTabByMatch; if targets do not reappear, `spawriter relay --replace`
+    // forces a clean re-attach.
+    resetBridgeState('target-registry-assert');
     void relayExecutorManager.resetAll().catch((e) => {
       error('Executor reset after target-registry assert failed:', e);
     });
+    sendOwnershipSnapshotToExtension('assert-recovery');
     return true;
   }
   return false;
@@ -201,6 +210,109 @@ function getOwnedTabs(sessionId: string): number[] {
 
 function getTabOwner(tabId: number): string | undefined {
   return tabOwners.get(tabId)?.sessionId;
+}
+
+// Strict Playwright target visibility (RC2/RC3). Browser-level (tab-less)
+// targets stay visible so Playwright can initialize its CRBrowser. A page
+// target is replayed only to the CDP client bound to its owning session:
+// unbound clients (the pre-execute window where pwClientToSession is still
+// empty), unowned tabs (the pre-claim handoff window), and other sessions'
+// tabs are all hidden so Playwright never registers a page it cannot control.
+export function isTargetVisibleToClient(
+  tabId: number | null | undefined,
+  boundSessionId: string | undefined,
+  owner: string | undefined,
+): boolean {
+  if (tabId == null) return true;
+  if (!boundSessionId) return false;
+  if (!owner) return false;
+  return owner === boundSessionId;
+}
+
+// Drop the virtual page sessions multiplexed onto a real CDP session, so
+// newCDPSession() maps never outlive the target/session they belonged to.
+function clearVirtualSessionsForRealSession(realSessionId: string): void {
+  const vpsIds = realToVirtualSessions.get(realSessionId);
+  if (!vpsIds) return;
+  for (const vps of vpsIds) virtualToRealSession.delete(vps);
+  realToVirtualSessions.delete(realSessionId);
+}
+
+// Single teardown for a relay session (RC5): ownership, activity, the CDP
+// client binding, the executor, and the virtual sessions linked to this
+// session's targets. Shared by /cli/session/reset, /cli/session/delete, and
+// the stale sweep so all three converge on identical relay state.
+async function resetRelaySession(sessionId: string): Promise<void> {
+  for (const tabId of getOwnedTabs(sessionId)) {
+    for (const target of attachedTargets.values()) {
+      if (target.tabId === tabId) clearVirtualSessionsForRealSession(target.sessionId);
+    }
+  }
+  releaseAllTabs(sessionId);
+  sessionActivity.delete(sessionId);
+  sessionToClientId.delete(sessionId);
+  for (const [pwId, sid] of pwClientToSession) {
+    if (sid === sessionId) pwClientToSession.delete(pwId);
+  }
+  await relayExecutorManager.remove(sessionId);
+}
+
+// After a claim, replay the now-owned target to the owner's Playwright client
+// if it connected before the claim — the strict visibility filter (RC2/RC3)
+// withholds the attach while the tab is still unowned, so without this a
+// pre-claim client never sees the page it just claimed.
+function replayClaimedTargetToOwner(tabId: number, sessionId: string): void {
+  const clientId = sessionToClientId.get(sessionId);
+  if (!clientId) return;
+  const client = cdpClients.get(clientId);
+  if (!client) return;
+  const target = [...attachedTargets.values()].find(t => t.tabId === tabId);
+  if (!target) return;
+  const targetInfo = buildTargetInfo(target);
+  const announcedId = targetInfo.targetId ?? target.sessionId;
+  if (client.announcedTargets.get(target.sessionId) === announcedId) return;
+  client.announcedTargets.set(target.sessionId, announcedId);
+  sendToCDPClient(clientId, {
+    method: 'Target.attachedToTarget',
+    params: {
+      sessionId: target.sessionId,
+      targetInfo: { ...targetInfo, attached: true },
+      waitingForDebugger: false,
+    },
+  });
+}
+
+// Reset the browser-side mirror (RC4): broadcast detach/release so Playwright
+// unregisters its targets, then drop the target graph, ownership, virtual CDP
+// sessions, and download behavior. Client-to-session bindings
+// (pwClientToSession/sessionToClientId) are deliberately left intact: the CDP
+// clients are still connected, so their session identity outlives an extension
+// drop and is cleared only when a CDP socket closes — or, in assert recovery,
+// when resetAll() drops the executors and their close handlers fire. Shared by
+// the extension disconnect path and target-registry assert recovery.
+function resetBridgeState(reason: string): void {
+  for (const [tabId] of tabOwners) {
+    broadcastToCDPClients({ method: 'Target.tabReleased', params: { tabId, reason } });
+  }
+  tabOwners.clear();
+  for (const target of attachedTargets.values()) {
+    broadcastToCDPClients({
+      method: 'Target.detachedFromTarget',
+      params: {
+        sessionId: target.sessionId,
+        // Without targetId Playwright cannot unregister the page; a later
+        // re-announce would then trip CRBrowser's duplicate-target assert.
+        targetId: buildTargetInfo(target).targetId,
+        reason,
+      },
+    });
+  }
+  attachedTargets.clear();
+  for (const client of cdpClients.values()) client.announcedTargets.clear();
+  virtualBrowserSessions.clear();
+  virtualToRealSession.clear();
+  realToVirtualSessions.clear();
+  activeDownloadBehavior = null;
 }
 
 function normalizeUrlHint(rawUrl: string): string | null {
@@ -314,20 +426,9 @@ function startStaleSweep(): void {
     const now = Date.now();
     for (const [sessionId, lastActive] of sessionActivity) {
       if (now - lastActive > STALE_SESSION_TTL) {
-        const count = releaseAllTabs(sessionId);
+        const count = getOwnedTabs(sessionId).length;
+        void resetRelaySession(sessionId);
         if (count > 0) log(`Stale session ${sessionId}: released ${count} tab(s)`);
-        sessionActivity.delete(sessionId);
-        sessionToClientId.delete(sessionId);
-        for (const [pwId, sid] of pwClientToSession) {
-          if (sid === sessionId) pwClientToSession.delete(pwId);
-        }
-        relayExecutorManager.remove(sessionId);
-      }
-    }
-    for (const [sessionId, lastActive] of sessionActivity) {
-      if (getOwnedTabs(sessionId).length === 0 && now - lastActive > STALE_SESSION_TTL) {
-        sessionActivity.delete(sessionId);
-        sessionToClientId.delete(sessionId);
       }
     }
   }, SWEEP_INTERVAL).unref();
@@ -346,8 +447,39 @@ app.post('/connect-tab', async (c) => {
     return c.json({ success: false, error: 'Extension not connected' }, 503);
   }
 
-  const body: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean } =
-    await c.req.json<{ url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }>().catch(() => ({}));
+  const body: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean; sessionId?: string } =
+    await c.req.json<{ url?: string; tabId?: number; create?: boolean; forceCreate?: boolean; sessionId?: string }>().catch(() => ({}));
+
+  // Connecting and claiming are one relay operation when sessionId is given: the
+  // tab is owned before this returns, so no other Playwright client can observe
+  // an unclaimed handoff window. Strict target visibility already hides unowned
+  // targets; the atomic claim also drops the second claim round-trip and lets
+  // the owner's CDP client receive an immediate target replay.
+  const claimForSession = (tabId: number): boolean => {
+    if (!body.sessionId) return false;
+    const r = claimTab(tabId, body.sessionId);
+    if (!r.ok) return false;
+    const executor = relayExecutorManager.get(body.sessionId);
+    if (executor) {
+      const claimedUrl = [...attachedTargets.values()].find(t => t.tabId === tabId)?.targetInfo?.url ?? body.url;
+      executor.claimTab(tabId, claimedUrl, targetIdForTab(tabId));
+      executor.switchToTab(tabId);
+    }
+    replayClaimedTargetToOwner(tabId, body.sessionId);
+    return true;
+  };
+
+  const respondFor = (tabId: number, extra: { created?: boolean; reused?: boolean }, claimed: boolean): Response => {
+    const target = [...attachedTargets.values()].find(t => t.tabId === tabId);
+    return c.json({
+      success: true,
+      tabId,
+      url: target?.targetInfo?.url ?? body.url,
+      targetId: target ? buildTargetInfo(target).targetId : undefined,
+      claimed,
+      ...extra,
+    });
+  };
 
   // Idle reuse is decided here, against the authoritative attachedTargets /
   // tabOwners state. The extension never scans the user's open tabs (S9).
@@ -355,7 +487,8 @@ app.post('/connect-tab', async (c) => {
     const reusable = pickReusableAttachedTab(body.url);
     if (reusable) {
       log(`/connect-tab: reusing idle tab ${reusable.tabId} (${reusable.reason}) for "${body.url}"`);
-      return c.json({ success: true, tabId: reusable.tabId, reused: true });
+      const claimed = claimForSession(reusable.tabId);
+      return respondFor(reusable.tabId, { reused: true }, claimed);
     }
   }
 
@@ -371,7 +504,13 @@ app.post('/connect-tab', async (c) => {
         clearTimeout(timeoutId);
         pendingExtensionCmdRequests.delete(relayId);
         try {
-          resolve(c.json(JSON.parse(data)));
+          const parsed = JSON.parse(data) as { success?: boolean; tabId?: number; created?: boolean; reused?: boolean; error?: string };
+          if (parsed?.success && typeof parsed.tabId === 'number') {
+            const claimed = claimForSession(parsed.tabId);
+            resolve(respondFor(parsed.tabId, { created: parsed.created, reused: parsed.reused }, claimed));
+          } else {
+            resolve(c.json(parsed));
+          }
         } catch {
           resolve(c.json({ success: false, error: 'Invalid response' }, 500));
         }
@@ -684,15 +823,12 @@ function clearAnnouncedTarget(sessionId: string): void {
 }
 
 function sendAttachedToTargetEvents(clientId: string): void {
-  // Only expose targets that this client's session owns (or unclaimed targets)
-  // to prevent Playwright from initializing pages it can't control
+  // Strict replay: only targets this client's bound session owns (RC2/RC3).
   const sessionId = pwClientToSession.get(clientId);
   const client = cdpClients.get(clientId);
   for (const target of attachedTargets.values()) {
-    if (target.tabId != null && sessionId) {
-      const owner = tabOwners.get(target.tabId);
-      if (owner && owner.sessionId !== sessionId) continue;
-    }
+    const owner = target.tabId != null ? getTabOwner(target.tabId) : undefined;
+    if (!isTargetVisibleToClient(target.tabId, sessionId, owner)) continue;
     const targetInfo = buildTargetInfo(target);
     const announcedId = targetInfo.targetId ?? target.sessionId;
     if (client?.announcedTargets.get(target.sessionId) === announcedId) continue;
@@ -714,10 +850,8 @@ function sendAttachedToTargetEvents(clientId: string): void {
 function sendTargetCreatedEvents(clientId: string): void {
   const sessionId = pwClientToSession.get(clientId);
   for (const target of attachedTargets.values()) {
-    if (target.tabId != null && sessionId) {
-      const owner = tabOwners.get(target.tabId);
-      if (owner && owner.sessionId !== sessionId) continue;
-    }
+    const owner = target.tabId != null ? getTabOwner(target.tabId) : undefined;
+    if (!isTargetVisibleToClient(target.tabId, sessionId, owner)) continue;
     const targetInfo = buildTargetInfo(target);
     sendToCDPClient(clientId, {
       method: 'Target.targetCreated',
@@ -843,16 +977,29 @@ function handleServerCdpCommand(
     }
 
     case 'Target.getTargets': {
-      const targetInfos = Array.from(attachedTargets.values()).map((target) => ({
-        ...buildTargetInfo(target),
-        attached: true,
-        owner: target.tabId != null ? (getTabOwner(target.tabId) ?? null) : null,
-      }));
+      const boundSessionId = pwClientToSession.get(clientId);
+      const targetInfos = Array.from(attachedTargets.values())
+        .filter((target) => isTargetVisibleToClient(
+          target.tabId,
+          boundSessionId,
+          target.tabId != null ? getTabOwner(target.tabId) : undefined,
+        ))
+        .map((target) => ({
+          ...buildTargetInfo(target),
+          attached: true,
+          owner: target.tabId != null ? (getTabOwner(target.tabId) ?? null) : null,
+        }));
       sendCdpResponse(clientId, { id, sessionId, result: { targetInfos } });
       return true;
     }
 
     case 'Target.getTargetInfo': {
+      const boundSessionId = pwClientToSession.get(clientId);
+      const visible = (t: AttachedTarget) => isTargetVisibleToClient(
+        t.tabId,
+        boundSessionId,
+        t.tabId != null ? getTabOwner(t.tabId) : undefined,
+      );
       const requestedTargetId = (params as { targetId?: string } | undefined)?.targetId;
       const targetById = requestedTargetId
         ? Array.from(attachedTargets.values()).find((target) => {
@@ -861,9 +1008,9 @@ function handleServerCdpCommand(
         })
         : undefined;
       const targetBySession = sessionId ? attachedTargets.get(sessionId) : undefined;
-      const target = targetById ?? targetBySession ?? Array.from(attachedTargets.values())[0];
+      const target = targetById ?? targetBySession ?? Array.from(attachedTargets.values()).find(visible);
 
-      if (!target) {
+      if (!target || !visible(target)) {
         sendCdpError(clientId, { id, sessionId, error: 'No targets attached' });
         return true;
       }
@@ -1029,11 +1176,11 @@ function handleExtensionMessage(data: Buffer) {
               // frame then hits CRBrowser's "Duplicate target" assert.
               const staleTargetId = buildTargetInfo(existing).targetId;
               attachedTargets.delete(existingSessionId);
-              if (incomingTabId != null && tabOwners.has(incomingTabId)) {
-                tabOwners.delete(incomingTabId);
-                broadcastOwnershipEvent('Target.tabReleased', { tabId: incomingTabId, reason: 'target-replaced' });
-                sendOwnershipSnapshotToExtension('target-replaced');
-              }
+              // Ownership is keyed by tabId: a CDP-session swap on the SAME tab
+              // (debugger re-attach / cross-process nav) keeps the owner. Only
+              // detach the stale CDP target so Playwright unregisters the dead
+              // page; releasing the tab here would strand the owner, because
+              // strict visibility then hides the replacement target from them.
               broadcastToCDPClients({
                 method: 'Target.detachedFromTarget',
                 params: { sessionId: existingSessionId, targetId: staleTargetId, reason: 'target-replaced' },
@@ -1076,10 +1223,8 @@ function handleExtensionMessage(data: Buffer) {
         const announcedId = enrichedTargetInfo.targetId ?? sessionId;
         for (const [cdpClientId, cdpClient] of cdpClients) {
           const boundSession = pwClientToSession.get(cdpClientId);
-          if (incomingTabId != null && boundSession) {
-            const owner = tabOwners.get(incomingTabId);
-            if (owner && owner.sessionId !== boundSession) continue;
-          }
+          const owner = incomingTabId != null ? getTabOwner(incomingTabId) : undefined;
+          if (!isTargetVisibleToClient(incomingTabId, boundSession, owner)) continue;
           if (cdpClient.announcedTargets.get(sessionId) === announcedId) continue;
           cdpClient.announcedTargets.set(sessionId, announcedId);
           sendToCDPClient(cdpClientId, {
@@ -1640,19 +1785,16 @@ app.get('/cli/sessions', (c) => {
 
 app.post('/cli/session/delete', async (c) => {
   const { sessionId } = await c.req.json();
-  releaseAllTabs(sessionId);
-  sessionActivity.delete(sessionId);
-  sessionToClientId.delete(sessionId);
-  const ok = await relayExecutorManager.remove(sessionId);
-  if (!ok) return c.json({ error: 'Session not found' }, 404);
+  const existed = relayExecutorManager.get(sessionId) != null;
+  await resetRelaySession(sessionId);
+  if (!existed) return c.json({ error: 'Session not found' }, 404);
   return c.json({ success: true });
 });
 
 app.post('/cli/session/reset', async (c) => {
   const { sessionId } = await c.req.json();
-  const executor = relayExecutorManager.get(sessionId);
-  if (!executor) return c.json({ error: 'Session not found' }, 404);
-  await executor.reset();
+  if (!relayExecutorManager.get(sessionId)) return c.json({ error: 'Session not found' }, 404);
+  await resetRelaySession(sessionId);
   return c.json({ success: true });
 });
 
@@ -1670,6 +1812,7 @@ app.post('/cli/tab/claim', async (c) => {
     // claim (bind/switch) would never redirect execute away from the first tab.
     executor.switchToTab(tabId);
   }
+  replayClaimedTargetToOwner(tabId, sessionId);
   return c.json({ success: true });
 });
 
@@ -1796,34 +1939,7 @@ export async function startRelayServer(): Promise<void> {
           extensionWs = null;
         }
 
-        for (const [tabId] of tabOwners) {
-          broadcastToCDPClients({
-            method: 'Target.tabReleased',
-            params: { tabId, reason: 'extension-disconnected' },
-          });
-        }
-        tabOwners.clear();
-        sessionActivity.clear();
-        sessionToClientId.clear();
-        pwClientToSession.clear();
-
-        for (const target of attachedTargets.values()) {
-          broadcastToCDPClients({
-            method: 'Target.detachedFromTarget',
-            params: {
-              sessionId: target.sessionId,
-              // Without targetId Playwright cannot unregister the page, and the
-              // re-announce after the extension reconnects would be a duplicate.
-              targetId: buildTargetInfo(target).targetId,
-              reason: 'extension-disconnected',
-            },
-          });
-        }
-        attachedTargets.clear();
-        for (const client of cdpClients.values()) {
-          client.announcedTargets.clear();
-        }
-        activeDownloadBehavior = null;
+        resetBridgeState('extension-disconnected');
         for (const pending of pendingRequests.values()) {
           clearTimeout(pending.timeoutId);
           sendCdpError(pending.clientId, {
@@ -1864,10 +1980,23 @@ export async function startRelayServer(): Promise<void> {
 
       log(`CDP WebSocket connected: ${clientId}`);
 
-    cdpClients.set(clientId, {
-      ws: ws as WebSocket,
-      announcedTargets: new Map(),
-    });
+      cdpClients.set(clientId, {
+        ws: ws as WebSocket,
+        announcedTargets: new Map(),
+      });
+
+      // A CDP client may declare its relay session at connect time (?session=).
+      // Binding here, before any Target.setAutoAttach/setDiscoverTargets replay,
+      // is the strongest form of the "bind before targets replay" rule (FP2):
+      // strict visibility then withholds page targets from any client that has
+      // not declared ownership. Executors that bind later via onCdpClientCreated
+      // still work; this only tightens the early unbound window.
+      const cdpReqUrl = new URL(req.url || '', `http://localhost:${port}`);
+      const declaredSession = cdpReqUrl.searchParams.get('session');
+      if (declaredSession) {
+        pwClientToSession.set(clientId, declaredSession);
+        sessionToClientId.set(declaredSession, clientId);
+      }
 
       ws.on('message', (data) => {
         handleCDPMessage(rawDataToBuffer(data), clientId);

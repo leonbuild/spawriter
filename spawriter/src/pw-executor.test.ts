@@ -1488,42 +1488,114 @@ describe('PlaywrightExecutor tab management', () => {
     assert.equal(executor.getOwnedTabIds().size, 0);
   });
 
-  it('switchToTab resolves the page by CDP targetId, not by ambiguous URL', () => {
+  it('findPageForTab resolves the page by CDP targetId, not by ambiguous URL', async () => {
     // Two about:blank tabs: URL matching alone would pick the first page and
-    // execute on a tab the session may not even own.
+    // execute on a tab the session may not even own. The connectOverCDP Page
+    // exposes no usable _delegate, so the real targetId is read over a CDP
+    // session (Target.getTargetInfo) — this is the page↔tab matching fix.
     const executor = new PlaywrightExecutor();
-    const fakePage = (targetId: string) => ({
-      url: () => 'about:blank',
-      isClosed: () => false,
-      _delegate: { _targetId: targetId },
-    });
+    const fakePage = (targetId: string) => {
+      const page: any = { url: () => 'about:blank', isClosed: () => false };
+      page.context = () => ({
+        newCDPSession: async () => ({
+          send: async (method: string) => {
+            assert.equal(method, 'Target.getTargetInfo');
+            return { targetInfo: { targetId } };
+          },
+          detach: async () => {},
+        }),
+      });
+      return page;
+    };
     const pageA = fakePage('TARGET-A');
     const pageB = fakePage('TARGET-B');
-    (executor as any).isConnected = true;
-    (executor as any).context = { pages: () => [pageA, pageB] };
-    (executor as any).setupPageListeners = () => {};
 
     executor.claimTab(1, 'about:blank', 'TARGET-B');
     executor.claimTab(2, 'about:blank', 'TARGET-A');
 
-    executor.switchToTab(1);
-    assert.equal((executor as any).page, pageB, 'tab 1 must map to TARGET-B page');
-
-    executor.switchToTab(2);
-    assert.equal((executor as any).page, pageA, 'tab 2 must map to TARGET-A page');
+    assert.equal(await (executor as any).findPageForTab([pageA, pageB], 1), pageB, 'tab 1 must map to TARGET-B page');
+    assert.equal(await (executor as any).findPageForTab([pageA, pageB], 2), pageA, 'tab 2 must map to TARGET-A page');
   });
 
-  it('falls back to URL matching when no targetId was recorded', () => {
+  it('findPageForTab falls back to URL matching when no targetId was recorded', async () => {
     const executor = new PlaywrightExecutor();
-    const pageA = { url: () => 'https://a.example/', isClosed: () => false };
-    const pageB = { url: () => 'https://b.example/', isClosed: () => false };
-    (executor as any).isConnected = true;
-    (executor as any).context = { pages: () => [pageA, pageB] };
-    (executor as any).setupPageListeners = () => {};
+    const pageA = { url: () => 'https://a.example/', isClosed: () => false } as any;
+    const pageB = { url: () => 'https://b.example/', isClosed: () => false } as any;
 
     executor.claimTab(1, 'https://b.example/');
-    executor.switchToTab(1);
-    assert.equal((executor as any).page, pageB);
+    assert.equal(await (executor as any).findPageForTab([pageA, pageB], 1), pageB);
+  });
+
+  // A Page whose CDP session reports a targetId (or fails to open), counting the
+  // sessions opened/detached — enough to assert both caching and cleanup.
+  const cdpPage = (opts: { targetId?: string; url?: string; throwOnSession?: boolean }) => {
+    const calls = { newSession: 0, detach: 0 };
+    const page: any = {
+      url: () => opts.url ?? 'about:blank',
+      isClosed: () => false,
+      _calls: calls,
+      context: () => ({
+        newCDPSession: async () => {
+          calls.newSession++;
+          if (opts.throwOnSession) throw new Error('CDP unavailable');
+          return {
+            send: async (method: string) => {
+              assert.equal(method, 'Target.getTargetInfo');
+              return { targetInfo: opts.targetId ? { targetId: opts.targetId } : {} };
+            },
+            detach: async () => { calls.detach++; },
+          };
+        },
+      }),
+    };
+    return page;
+  };
+
+  it('resolvePageTargetId caches the targetId and detaches its session', async () => {
+    const executor = new PlaywrightExecutor();
+    const page = cdpPage({ targetId: 'T1' });
+    assert.equal(await (executor as any).resolvePageTargetId(page), 'T1');
+    assert.equal(await (executor as any).resolvePageTargetId(page), 'T1');
+    assert.equal(page._calls.newSession, 1, 'second lookup is served from the WeakMap cache');
+    assert.equal(page._calls.detach, 1, 'the one CDP session is detached, not leaked');
+  });
+
+  it('resolvePageTargetId returns undefined (and still detaches) when CDP reports no targetId', async () => {
+    const executor = new PlaywrightExecutor();
+    const page = cdpPage({ targetId: undefined });
+    assert.equal(await (executor as any).resolvePageTargetId(page), undefined);
+    assert.equal(page._calls.detach, 1, 'session is detached on the empty path too');
+  });
+
+  it('findPageForTab falls back to URL when the CDP session is unavailable', async () => {
+    const executor = new PlaywrightExecutor();
+    const pageA = cdpPage({ url: 'https://a.example/', throwOnSession: true });
+    const pageB = cdpPage({ url: 'https://b.example/', throwOnSession: true });
+    // targetId recorded but unresolvable (newCDPSession throws) → URL fallback.
+    executor.claimTab(1, 'https://b.example/', 'WANT');
+    assert.equal(await (executor as any).findPageForTab([pageA, pageB], 1), pageB);
+  });
+
+  it('findPageForTab falls back to URL when no open page carries the recorded targetId', async () => {
+    const executor = new PlaywrightExecutor();
+    const pageA = cdpPage({ targetId: 'OTHER-1', url: 'https://a.example/' });
+    const pageB = cdpPage({ targetId: 'OTHER-2', url: 'https://b.example/' });
+    // The owned page (targetId MISSING) has not attached yet; match by URL.
+    executor.claimTab(1, 'https://b.example/', 'MISSING');
+    assert.equal(await (executor as any).findPageForTab([pageA, pageB], 1), pageB);
+  });
+
+  it('switchToTab leaves page null when URL cannot match, deferring to ensureConnection', () => {
+    const executor = new PlaywrightExecutor();
+    const stranger = { url: () => 'https://stranger.example/', isClosed: () => false } as any;
+    (executor as any).isConnected = true;
+    (executor as any).context = { pages: () => [stranger] };
+    (executor as any).setupPageListeners = () => {};
+    // Owned about:blank page not attached yet: no sync URL match, so page stays
+    // null and the authoritative targetId match runs later in ensureConnection.
+    executor.claimTab(5, 'about:blank', 'T5');
+    executor.switchToTab(5);
+    assert.equal((executor as any).page, null);
   });
 
   it('ensureConnection waits for the owned tab page instead of falling back to pages[0]', async () => {
@@ -1531,15 +1603,16 @@ describe('PlaywrightExecutor tab management', () => {
     // context.pages() yet when execute() starts. Falling back to pages[0]
     // would run code on an unrelated (possibly user-visible) page.
     const executor = new PlaywrightExecutor();
+    // No context().newCDPSession on these mocks, so targetId resolution fails
+    // and matching falls back to URL — the stranger (distinct URL) is never
+    // chosen, and the owned about:blank page is awaited.
     const strangerPage = {
       url: () => 'https://user-visible.example/',
       isClosed: () => false,
-      _delegate: { _targetId: 'STRANGER' },
     };
     const ownedPage = {
       url: () => 'about:blank',
       isClosed: () => false,
-      _delegate: { _targetId: 'OWNED' },
     };
     const pages: any[] = [strangerPage];
     (executor as any).isConnected = true;

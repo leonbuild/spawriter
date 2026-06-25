@@ -255,11 +255,11 @@ async function handleTabAction(
       if (!url && tabId === undefined) {
         return { content: [{ type: 'text', text: formatError({ error: 'Missing required parameter', hint: 'Provide either url or tabId to identify the tab to connect' }) }], isError: true };
       }
-      let result = await requestConnectTab(port, { url, tabId, create });
+      let result = await requestConnectTab(port, { url, tabId, create, sessionId: mySessionId });
       if (!result.success && (result as any).error === 'Extension not connected') {
         for (let retry = 0; retry < 6; retry++) {
           await sleep(2000);
-          result = await requestConnectTab(port, { url, tabId, create });
+          result = await requestConnectTab(port, { url, tabId, create, sessionId: mySessionId });
           if (result.success || (result as any).error !== 'Extension not connected') break;
         }
       }
@@ -267,44 +267,27 @@ async function handleTabAction(
         return { content: [{ type: 'text', text: formatError({ error: `Failed to connect tab: ${(result as any).error || 'Unknown error'}`, recovery: 'reset' }) }], isError: true };
       }
 
+      // connect-tab claims atomically for mySessionId; mirror that claim into the
+      // local executor view. Only create a fallback tab when the relay could not
+      // claim because a concurrent session already owns the matched tab.
       let claimStatus = 'unclaimed';
       if (result.tabId != null) {
-        try {
-          const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tabId: result.tabId, sessionId: mySessionId }),
-          });
-          if (claimResp.ok) {
-            claimStatus = 'claimed';
+        if (result.claimed) {
+          claimStatus = 'claimed';
+          const executor = await getOrCreateExecutor();
+          executor.claimTab(result.tabId, result.url ?? url, result.targetId);
+        } else if (create && url && !result.created) {
+          const fallback = await requestConnectTab(port, { url, create: true, forceCreate: true, sessionId: mySessionId });
+          if (fallback.success && fallback.claimed && fallback.tabId != null) {
+            result = fallback;
+            claimStatus = 'claimed (new tab created as fallback)';
             const executor = await getOrCreateExecutor();
-            executor.claimTab(result.tabId, url);
+            executor.claimTab(fallback.tabId, fallback.url ?? url, fallback.targetId);
           } else {
-            if (create && url && !result.created) {
-              const fallback = await requestConnectTab(port, { url, create: true, forceCreate: true });
-              if (fallback.success && fallback.created && fallback.tabId != null) {
-                result = fallback;
-                const fc = await fetch(`http://localhost:${port}/cli/tab/claim`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ tabId: fallback.tabId, sessionId: mySessionId }),
-                });
-                if (fc.ok) {
-                  claimStatus = 'claimed (new tab created as fallback)';
-                  const executor = await getOrCreateExecutor();
-                  executor.claimTab(fallback.tabId, url);
-                } else {
-                  claimStatus = 'fallback tab created but claim failed';
-                }
-              }
-            }
-            if (claimStatus === 'unclaimed') {
-              const claimErr = await claimResp.json().catch(() => ({}));
-              claimStatus = `claim failed: ${(claimErr as any).error || claimResp.status}`;
-            }
+            claimStatus = 'fallback tab created but claim failed';
           }
-        } catch (e: any) {
-          claimStatus = `claim failed: ${e.message}`;
+        } else {
+          claimStatus = 'claim failed: tab owned by another session';
         }
       }
 
@@ -451,7 +434,7 @@ async function releaseAllOwnedTabs(): Promise<number> {
   return released;
 }
 
-async function requestConnectTab(port: number, params: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean }): Promise<{ success: boolean; tabId?: number; created?: boolean }> {
+async function requestConnectTab(port: number, params: { url?: string; tabId?: number; create?: boolean; forceCreate?: boolean; sessionId?: string }): Promise<{ success: boolean; tabId?: number; created?: boolean; claimed?: boolean; targetId?: string; url?: string }> {
   try {
     const response = await fetch(`http://localhost:${port}/connect-tab`, {
       method: 'POST',
@@ -459,7 +442,7 @@ async function requestConnectTab(port: number, params: { url?: string; tabId?: n
       body: JSON.stringify(params),
       signal: AbortSignal.timeout(18000),
     });
-    return await response.json() as { success: boolean; tabId?: number; created?: boolean };
+    return await response.json() as { success: boolean; tabId?: number; created?: boolean; claimed?: boolean; targetId?: string; url?: string };
   } catch (e) {
     error('Failed to request connect-tab:', e);
     return { success: false };

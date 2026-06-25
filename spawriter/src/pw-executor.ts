@@ -316,6 +316,7 @@ export class PlaywrightExecutor {
   private activeTabId: number | null = null;
   private tabIdToUrl = new Map<number, string>();
   private tabIdToTargetId = new Map<number, string>();
+  private pageTargetIdCache = new WeakMap<Page, string>();
   private lastCdpClientId: string | null = null;
 
   private logger: ExecutorLogger;
@@ -388,26 +389,32 @@ export class PlaywrightExecutor {
     if (this.activeTabId == null) this.activeTabId = tabId;
   }
 
-  /** CDP targetId of a Playwright page (CRPage internal; undefined on API drift). */
-  private static pageTargetId(page: Page): string | undefined {
+  /**
+   * CDP targetId of a Playwright page. The connectOverCDP client Page exposes
+   * no `_delegate`, so the legacy `_delegate._targetId` is always undefined; a
+   * short-lived CDP session reads the real targetId reliably. Cached per page
+   * (a page keeps its targetId for life).
+   */
+  private async resolvePageTargetId(page: Page): Promise<string | undefined> {
+    const cached = this.pageTargetIdCache.get(page);
+    if (cached) return cached;
     try {
-      return (page as { _delegate?: { _targetId?: string } })._delegate?._targetId;
+      const session = await page.context().newCDPSession(page);
+      try {
+        const info = await session.send('Target.getTargetInfo') as { targetInfo?: { targetId?: string } };
+        const targetId = info.targetInfo?.targetId;
+        if (targetId) { this.pageTargetIdCache.set(page, targetId); return targetId; }
+      } finally {
+        await session.detach().catch(() => undefined);
+      }
     } catch {
-      return undefined;
+      // CDP can be momentarily unavailable while the tab is still attaching;
+      // the caller retries and falls back to URL matching.
     }
+    return undefined;
   }
 
-  /**
-   * Deterministic tab → page resolution. URL matching alone is ambiguous
-   * (e.g. several about:blank tabs), so prefer the CDP targetId recorded at
-   * claim time and use the URL only as fallback.
-   */
-  private findPageForTab(pages: Page[], tabId: number): Page | undefined {
-    const targetId = this.tabIdToTargetId.get(tabId);
-    if (targetId) {
-      const byTarget = pages.find(p => PlaywrightExecutor.pageTargetId(p) === targetId);
-      if (byTarget) return byTarget;
-    }
+  private findPageByUrl(pages: Page[], tabId: number): Page | undefined {
     const targetUrl = this.tabIdToUrl.get(tabId);
     if (!targetUrl) return undefined;
     return pages.find(p => {
@@ -415,6 +422,21 @@ export class PlaywrightExecutor {
       if (targetUrl === 'about:blank') return pUrl === '' || pUrl === 'about:blank';
       return pUrl === targetUrl || pUrl.startsWith(targetUrl);
     });
+  }
+
+  /**
+   * Deterministic tab → page resolution. URL matching alone is ambiguous
+   * (e.g. several about:blank tabs), so prefer the CDP targetId recorded at
+   * claim time and use the URL only as fallback.
+   */
+  private async findPageForTab(pages: Page[], tabId: number): Promise<Page | undefined> {
+    const targetId = this.tabIdToTargetId.get(tabId);
+    if (targetId) {
+      for (const p of pages) {
+        if (await this.resolvePageTargetId(p) === targetId) return p;
+      }
+    }
+    return this.findPageByUrl(pages, tabId);
   }
 
   /**
@@ -427,7 +449,7 @@ export class PlaywrightExecutor {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const pages = context.pages().filter(p => !p.isClosed());
-      const match = this.findPageForTab(pages, tabId);
+      const match = await this.findPageForTab(pages, tabId);
       if (match) return match;
       if (Date.now() >= deadline) {
         throw new Error(
@@ -446,14 +468,14 @@ export class PlaywrightExecutor {
     this.activeTabId = tabId;
 
     if (this.isConnected && this.context) {
-      {
-        const pages = this.context.pages().filter(p => !p.isClosed());
-        const match = this.findPageForTab(pages, tabId);
-        if (match && match !== this.page) {
-          this.page = match;
-          this.setupPageListeners(match);
-          return;
-        }
+      // Sync best-effort by URL; the reliable targetId match (async) runs in
+      // ensureConnection -> waitForPageForTab if this leaves page null.
+      const pages = this.context.pages().filter(p => !p.isClosed());
+      const match = this.findPageByUrl(pages, tabId);
+      if (match && match !== this.page) {
+        this.page = match;
+        this.setupPageListeners(match);
+        return;
       }
     }
 
