@@ -93,7 +93,7 @@ After any UI code change, automatically:
 3. Verify state via `single_spa { action: "status" }` / `execute`, not static assumptions
 4. Screenshot between major actions
 5. Don't assume code changes are live — confirm visually
-6. **CRITICAL: cache/cookie/storage clearing defaults to the current origin — never pass another site's origin explicitly**
+6. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("delete_cookie"/"clear_storage")` or `clearCacheAndReload({ clear })` — they always target the current page origin; origin overrides are rejected.**
 7. Mock rules persist until disabled — always clean up
 
 ## Troubleshooting

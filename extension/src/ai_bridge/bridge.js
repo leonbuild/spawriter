@@ -1,4 +1,9 @@
 import browser from "webextension-polyfill";
+import {
+  getGlobalClearDenial,
+  getClearDataForOriginDenial,
+  buildScopedBrowsingDataArgs,
+} from "./clear-policy.js";
 
 (function () {
   "use strict";
@@ -519,8 +524,6 @@ import browser from "webextension-polyfill";
   const SLOW_CDP_METHODS = new Set([
     "Accessibility.getFullAXTree",
     "Page.captureScreenshot",
-    "Network.clearBrowserCache",
-    "Network.clearBrowserCookies",
     "Page.reload",
     "Page.navigate",
   ]);
@@ -589,6 +592,30 @@ import browser from "webextension-polyfill";
     if (!targetTabId) {
       sendMessage({ id, error: "No target tab attached. Connect a tab first." });
       return;
+    }
+
+    // Browser-wide clears are functionally unsupported (see clear-policy.js).
+    // The relay already denies these; enforce again at the last hop.
+    const globalClearDenial = getGlobalClearDenial(method);
+    if (globalClearDenial) {
+      warn(`Denied ${method} for tab ${targetTabId}`);
+      sendMessage({ id, error: globalClearDenial });
+      return;
+    }
+    if (method === "Storage.clearDataForOrigin") {
+      let tabUrl = "";
+      try {
+        tabUrl = (await browser.tabs.get(targetTabId))?.url || "";
+      } catch (_) {
+        /* tab gone; denial below reports it */
+      }
+      const originDenial = getClearDataForOriginDenial(cdpParams?.origin, tabUrl);
+      if (originDenial) {
+        warn(`Denied Storage.clearDataForOrigin for tab ${targetTabId} (requested: ${cdpParams?.origin})`);
+        sendMessage({ id, error: originDenial });
+        return;
+      }
+      log(`AUDIT: Storage.clearDataForOrigin origin=${cdpParams?.origin} types=${cdpParams?.storageTypes} tab=${targetTabId}`);
     }
 
     try {
@@ -881,15 +908,26 @@ import browser from "webextension-polyfill";
 
   async function clearCacheAndReload(tabId) {
     if (browser.browsingData?.remove) {
-      await browser.browsingData.remove(
-        { since: 0 },
-        { cache: true, serviceWorkers: true }
+      const tab = await browser.tabs.get(tabId);
+      const isFirefox = browser.runtime.getURL("").startsWith("moz-extension:");
+      const scoped = buildScopedBrowsingDataArgs(
+        tab?.url || "",
+        { cache: true, serviceWorkers: true },
+        isFirefox
       );
+      if (scoped.error) {
+        warn(`browsingData clear skipped for tab ${tabId}: ${scoped.error}`);
+      } else {
+        await browser.browsingData.remove(scoped.removalOptions, scoped.dataTypes);
+        log(`AUDIT: browsingData.remove ${JSON.stringify(scoped.removalOptions)} ${JSON.stringify(scoped.dataTypes)}`);
+      }
     } else {
       warn("browsingData API not available, skipping cache clear");
     }
+    // bypassCache reload covers the HTTP cache even when the scoped clear was
+    // skipped (non-http tab, Firefox cache limitation).
     await browser.tabs.reload(tabId, { bypassCache: true });
-    log(`Cleared cache and reloaded tab ${tabId}`);
+    log(`Cleared scoped cache and reloaded tab ${tabId}`);
   }
 
   // --- Relay message handlers (commands from relay via offscreen) ---

@@ -1678,30 +1678,23 @@ export class PlaywrightExecutor {
           case 'delete_cookie': {
             const name = opts.name as string;
             if (!name) return 'Error: delete_cookie requires name';
-            if (cdpSession) {
-              const params: Record<string, unknown> = { name };
-              if (opts.domain) params.domain = opts.domain;
-              if (opts.url) params.url = opts.url;
-              if (opts.path) params.path = opts.path;
-              if (!params.url && !params.domain) {
-                const href = await evaluateJs('window.location.href') as string;
-                if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
-                  params.url = href;
-                } else {
-                  try { params.domain = new URL(page.url()).hostname; } catch { /* ignore */ }
-                  if (!params.domain) return 'Error: delete_cookie requires domain param — current page is not an http/https page.';
-                }
+            // Always per-cookie CDP deletion: Playwright's clearCookies() is
+            // "clear ALL cookies, re-add non-matching" under the hood and is
+            // blocked by the relay's global-clear policy.
+            const params: Record<string, unknown> = { name };
+            if (opts.domain) params.domain = opts.domain;
+            if (opts.url) params.url = opts.url;
+            if (opts.path) params.path = opts.path;
+            if (!params.url && !params.domain) {
+              const href = await evaluateJs('window.location.href') as string;
+              if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+                params.url = href;
+              } else {
+                try { params.domain = new URL(page.url()).hostname; } catch { /* ignore */ }
+                if (!params.domain) return 'Error: delete_cookie requires domain param — current page is not an http/https page.';
               }
-              await sendCdpCmd('Network.deleteCookies', params);
-              return `Cookie "${name}" deleted.`;
             }
-            const delDomain = (opts.domain as string) || undefined;
-            if (delDomain) {
-              await page.context().clearCookies({ name, domain: delDomain });
-            } else {
-              const currentOrigin = new URL(await evaluateJs('window.location.href') as string);
-              await page.context().clearCookies({ name, domain: currentOrigin.hostname });
-            }
+            await relayCdp('Network.deleteCookies', params);
             return `Cookie "${name}" deleted.`;
           }
           case 'get_local_storage':
@@ -1745,7 +1738,11 @@ export class PlaywrightExecutor {
             return `localStorage[${key}] removed.`;
           }
           case 'clear_storage': {
-            const origin = (opts.origin as string) || await evaluateJs('window.location.origin') as string;
+            if (opts.origin) return 'Error: origin override is not supported — clear_storage always targets the current page origin.';
+            const origin = await evaluateJs('window.location.origin') as string;
+            if (!origin || !origin.startsWith('http')) {
+              return `Error: clear_storage requires an http(s) page (current origin: ${origin || 'unknown'}).`;
+            }
             const types = opts.storage_types as string;
             if (!types) return 'Error: clear_storage requires storage_types parameter';
             if (cdpSession) {
@@ -1762,7 +1759,9 @@ export class PlaywrightExecutor {
                 const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
                 return originUrl.hostname === cd || originUrl.hostname.endsWith('.' + cd);
               });
-              for (const c of originCookies) await page.context().clearCookies({ name: c.name, domain: c.domain });
+              // Per-cookie CDP deletion — Playwright's clearCookies() is
+              // globally destructive under the hood and blocked by policy.
+              for (const c of originCookies) await relayCdp('Network.deleteCookies', { name: c.name, domain: c.domain });
               cleared.push(`cookies (${originCookies.length} for ${origin})`);
             }
             return cleared.length > 0
@@ -2199,7 +2198,10 @@ export class PlaywrightExecutor {
       },
 
       // --- Clear cache and reload ---
-      clearCacheAndReload: async (options?: { clear?: string; reload?: boolean; origin?: string }) => {
+      clearCacheAndReload: async (options?: { clear?: string; reload?: boolean }) => {
+        if ((options as Record<string, unknown> | undefined)?.origin) {
+          return 'Error: origin override is not supported — clearCacheAndReload always targets the current page origin.';
+        }
         const clearArg = options?.clear;
         const shouldReload = options?.reload !== false;
         let clearTypes: Set<string>;
@@ -2211,34 +2213,28 @@ export class PlaywrightExecutor {
         } else {
           clearTypes = new Set<string>();
         }
-        const origin = options?.origin || await evaluateJs('window.location.origin') as string;
+        const origin = await evaluateJs('window.location.origin') as string;
+        if (clearTypes.size > 0 && (!origin || !origin.startsWith('http'))) {
+          return `Error: clearing requires an http(s) page (current origin: ${origin || 'unknown'}).`;
+        }
         const cleared: string[] = [];
         let needsIgnoreCache = false;
 
         if (clearTypes.has('cache')) { needsIgnoreCache = true; cleared.push('cache (per-tab bypass via ignoreCache reload)'); }
 
         if (clearTypes.has('cookies')) {
-          if (cdpSession) {
-            const cookieResult = await sendCdpCmd('Network.getCookies') as any;
-            const originHost = new URL(origin).hostname;
-            const matching = (cookieResult?.cookies || []).filter((c: any) => {
-              const isDotPrefixed = c.domain.startsWith('.');
-              const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
-              if (isDotPrefixed && !originHost.includes('.')) return false;
-              return originHost === cd || originHost.endsWith('.' + cd);
-            });
-            for (const c of matching) await sendCdpCmd('Network.deleteCookies', { name: c.name, domain: c.domain });
-            cleared.push(`cookies (${origin}, ${matching.length} removed)`);
-          } else {
-            const originHost = new URL(origin).hostname;
-            const allCookies = await page.context().cookies();
-            const matching = allCookies.filter((c: any) => {
-              const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-              return originHost === cd || originHost.endsWith('.' + cd);
-            });
-            for (const c of matching) await page.context().clearCookies({ name: c.name, domain: c.domain });
-            cleared.push(`cookies (${origin}, ${matching.length} removed via Playwright)`);
-          }
+          // Per-cookie CDP deletion — Playwright's clearCookies() is globally
+          // destructive under the hood and blocked by policy.
+          const cookieResult = await relayCdp('Network.getCookies') as any;
+          const originHost = new URL(origin).hostname;
+          const matching = (cookieResult?.cookies || []).filter((c: any) => {
+            const isDotPrefixed = c.domain.startsWith('.');
+            const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
+            if (isDotPrefixed && !originHost.includes('.')) return false;
+            return originHost === cd || originHost.endsWith('.' + cd);
+          });
+          for (const c of matching) await relayCdp('Network.deleteCookies', { name: c.name, domain: c.domain });
+          cleared.push(`cookies (${origin}, ${matching.length} removed)`);
         }
 
         if (cdpSession) {

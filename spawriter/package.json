@@ -14,7 +14,7 @@
   "scripts": {
     "build": "node -e \"const fs=require('fs');if(fs.existsSync('dist'))fs.rmSync('dist',{recursive:true,force:true})\" && tsc",
     "watch": "tsc -w",
-    "test": "tsx --test src/mcp.test.ts src/pw-executor.test.ts src/ownership.test.ts src/utils.test.ts src/cli.test.ts src/relay.test.ts src/runtime/spa-helpers.test.ts src/runtime/ax-tree.test.ts src/runtime/labeled-screenshot.test.ts src/runtime/network-monitor.test.ts",
+    "test": "tsx --test src/mcp.test.ts src/pw-executor.test.ts src/ownership.test.ts src/utils.test.ts src/cli.test.ts src/relay.test.ts src/cdp-clear-policy.test.ts src/runtime/spa-helpers.test.ts src/runtime/ax-tree.test.ts src/runtime/labeled-screenshot.test.ts src/runtime/network-monitor.test.ts",
     "typecheck": "tsc --noEmit",
     "start:relay": "tsx src/relay.ts",
     "start:mcp": "tsx src/mcp.ts"

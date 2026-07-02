@@ -247,7 +247,7 @@ await storage("clear_storage", { storage_types: "local_storage" })
 await clearCacheAndReload({ clear: "cache,local_storage,session_storage" })
 ```
 
-All clearing operations must remain scoped to the current page origin.
+All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension, and `origin` overrides are rejected — clearing always targets the current page origin.
 
 ### Debugger and Source Inspection
 
@@ -290,7 +290,7 @@ await performance("get_metrics")
 
 1. Operate only on normal web pages, never `chrome://` or extension pages.
 2. Never use `/connect-active-tab`, the user's active tab, or arbitrary existing Chrome tabs.
-3. Cache, cookie, and storage clearing must remain scoped to the current origin.
+3. Cache, cookie, and storage clearing is always scoped to the current origin; browser-wide clears are functionally blocked (`context.clearCookies()`, `Network.clearBrowserCookies`, etc. return errors).
 4. Capture a screenshot between major actions.
 5. Verify visible state instead of relying on static assumptions.
 6. Disable all network mock rules when finished.

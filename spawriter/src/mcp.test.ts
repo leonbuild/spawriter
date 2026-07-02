@@ -7265,7 +7265,6 @@ describe('sendCdpCommand timeout pattern', () => {
   it('should use custom timeout for slow commands', () => {
     const SLOW_CDP_COMMANDS = new Set([
       'Accessibility.getFullAXTree', 'Page.captureScreenshot',
-      'Network.clearBrowserCache', 'Network.clearBrowserCookies',
       'Page.reload', 'Page.navigate',
     ]);
     function getCommandTimeout(method: string): number {
@@ -7410,9 +7409,10 @@ describe('Timeout error message format', () => {
 // ---------------------------------------------------------------------------
 
 describe('Extension sendCommandWithTimeout pattern', () => {
+  // Mirrors bridge.js — global clear commands are policy-denied, so they are
+  // no longer part of the slow set.
   const SLOW_CDP_METHODS = new Set([
     'Accessibility.getFullAXTree', 'Page.captureScreenshot',
-    'Network.clearBrowserCache', 'Network.clearBrowserCookies',
     'Page.reload', 'Page.navigate',
   ]);
   const CDP_COMMAND_TIMEOUT_MS = 30000;
@@ -7515,10 +7515,16 @@ describe('Extension sendCommandWithTimeout pattern', () => {
   it('SLOW_CDP_METHODS matches SLOW_CDP_COMMANDS from mcp.ts', () => {
     const mcpSlowCommands = new Set([
       'Accessibility.getFullAXTree', 'Page.captureScreenshot',
-      'Network.clearBrowserCache', 'Network.clearBrowserCookies',
       'Page.reload', 'Page.navigate',
     ]);
     assert.deepEqual(SLOW_CDP_METHODS, mcpSlowCommands);
+  });
+
+  it('SLOW_CDP_METHODS matches the live set in bridge.js', () => {
+    const bridgeSrc = fsReadFileSync(new URL('../../extension/src/ai_bridge/bridge.js', import.meta.url), 'utf8');
+    const setBody = bridgeSrc.match(/SLOW_CDP_METHODS = new Set\(\[([^\]]*)\]/)?.[1] ?? '';
+    const bridgeSet = new Set([...setBody.matchAll(/"([^"]+)"/g)].map(m => m[1]));
+    assert.deepEqual(bridgeSet, SLOW_CDP_METHODS);
   });
 });
 
@@ -7555,7 +7561,6 @@ describe('Extension timeout hierarchy', () => {
     const extensionSlowTimeout = 60000;
     const SLOW_CDP_COMMANDS = new Set([
       'Accessibility.getFullAXTree', 'Page.captureScreenshot',
-      'Network.clearBrowserCache', 'Network.clearBrowserCookies',
       'Page.reload', 'Page.navigate',
     ]);
     function getCommandTimeout(method: string): number {
@@ -8091,6 +8096,10 @@ describe('clear_cache_and_reload reload parameter', () => {
 // ---------------------------------------------------------------------------
 
 describe('clear_cache_and_reload scenario simulation', () => {
+  // Mirrors the current implementation: no browser-wide CDP clears at all —
+  // cache is a per-tab ignoreCache reload, cookies are enumerated and deleted
+  // one by one, storage goes through origin-scoped Storage.clearDataForOrigin,
+  // and explicit origin overrides are rejected outright.
   function simulateClear(args: {
     clear?: string;
     mode?: string;
@@ -8100,33 +8109,40 @@ describe('clear_cache_and_reload scenario simulation', () => {
     cdpCommands: string[];
     summary: string;
   } {
+    if (args.origin) {
+      return { cdpCommands: [], summary: 'Error: origin override is not supported — clearCacheAndReload always targets the current page origin.' };
+    }
     const { types } = parseClearTypes(args.clear, args.mode);
     const shouldReload = args.reload !== false;
-    const origin = args.origin || 'https://example.com';
+    const origin = 'https://example.com';
     const cdpCommands: string[] = [];
     const cleared: string[] = [];
+    let needsIgnoreCache = false;
 
     if (types.has('cache')) {
-      cdpCommands.push('Network.clearBrowserCache');
-      cleared.push('cache (global)');
+      needsIgnoreCache = true;
+      cleared.push('cache (per-tab bypass via ignoreCache reload)');
     }
     if (types.has('cookies')) {
-      cdpCommands.push('Network.getCookies');
+      cdpCommands.push('Network.getCookies', 'Network.deleteCookies');
       cleared.push(`cookies (${origin}, origin-scoped)`);
     }
 
     const storageParts: string[] = [];
-    for (const t of ['local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']) {
+    for (const t of ['local_storage', 'cache_storage', 'indexeddb', 'service_workers']) {
       if (types.has(t)) storageParts.push(t);
     }
     if (storageParts.length > 0) {
       cdpCommands.push('Storage.clearDataForOrigin');
       cleared.push(`${storageParts.join(', ')} (${origin})`);
     }
+    if (types.has('session_storage')) {
+      cleared.push('session_storage');
+    }
 
-    if (shouldReload) {
+    if (shouldReload || needsIgnoreCache) {
       cdpCommands.push('Page.reload');
-      cleared.push('page reloaded');
+      cleared.push(needsIgnoreCache ? 'page reloaded (cache bypassed)' : 'page reloaded');
     }
 
     const summary = cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'Page reloaded (no storage cleared)';
@@ -8145,53 +8161,52 @@ describe('clear_cache_and_reload scenario simulation', () => {
     assert.deepStrictEqual(result.cdpCommands, ['Page.reload']);
   });
 
-  it('scenario: mode=aggressive → global cache + origin-scoped cookies + reload', () => {
+  it('scenario: mode=aggressive → per-tab cache bypass + origin-scoped cookies, never global CDP clears', () => {
     const result = simulateClear({ mode: 'aggressive' });
-    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
     assert.ok(result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(result.cdpCommands.includes('Network.deleteCookies'));
     assert.ok(result.cdpCommands.includes('Page.reload'));
-    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
     assert.ok(result.summary.includes('origin-scoped'));
+    assert.ok(result.summary.includes('cache bypassed'));
   });
 
-  it('scenario: clear=cache → Network.clearBrowserCache + reload, no cookies', () => {
+  it('scenario: clear=cache → ignoreCache reload only, no clearing CDP commands', () => {
     const result = simulateClear({ clear: 'cache' });
-    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
-    assert.ok(result.cdpCommands.includes('Page.reload'));
-    assert.ok(!result.cdpCommands.includes('Network.getCookies'));
-    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.deepStrictEqual(result.cdpCommands, ['Page.reload']);
+    assert.ok(result.summary.includes('per-tab bypass'));
+    assert.ok(result.summary.includes('cache bypassed'));
   });
 
-  it('scenario: clear=cache,service_workers → cache + Storage.clearDataForOrigin + reload', () => {
+  it('scenario: clear=cache,service_workers → origin-scoped storage clear + bypass reload', () => {
     const result = simulateClear({ clear: 'cache,service_workers' });
-    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCache'));
     assert.ok(result.cdpCommands.includes('Storage.clearDataForOrigin'));
     assert.ok(result.cdpCommands.includes('Page.reload'));
     assert.ok(!result.cdpCommands.includes('Network.getCookies'));
   });
 
-  it('scenario: clear=cookies → origin-scoped cookie deletion + reload', () => {
+  it('scenario: clear=cookies → origin-scoped per-cookie deletion + reload', () => {
     const result = simulateClear({ clear: 'cookies' });
     assert.ok(result.cdpCommands.includes('Network.getCookies'));
+    assert.ok(result.cdpCommands.includes('Network.deleteCookies'));
     assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
     assert.ok(result.cdpCommands.includes('Page.reload'));
     assert.ok(result.summary.includes('origin-scoped'));
   });
 
-  it('scenario: clear=cache, reload=false → cache cleared but no Page.reload', () => {
+  it('scenario: clear=cache, reload=false → reload still happens (ignoreCache reload IS the clearing mechanism)', () => {
     const result = simulateClear({ clear: 'cache', reload: false });
-    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
-    assert.ok(!result.cdpCommands.includes('Page.reload'));
-    assert.ok(!result.summary.includes('page reloaded'));
+    assert.deepStrictEqual(result.cdpCommands, ['Page.reload']);
+    assert.ok(result.summary.includes('cache bypassed'));
   });
 
-  it('scenario: clear=all → 3 CDP commands (cache + cookies + storage) + reload', () => {
+  it('scenario: clear=all → per-cookie + origin storage + bypass reload, never global clears', () => {
     const result = simulateClear({ clear: 'all' });
-    assert.ok(result.cdpCommands.includes('Network.clearBrowserCache'));
-    assert.ok(result.cdpCommands.includes('Network.getCookies'));
-    assert.ok(result.cdpCommands.includes('Storage.clearDataForOrigin'));
-    assert.ok(result.cdpCommands.includes('Page.reload'));
-    assert.equal(result.cdpCommands.length, 4);
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCache'));
+    assert.ok(!result.cdpCommands.includes('Network.clearBrowserCookies'));
+    assert.deepStrictEqual(result.cdpCommands, ['Network.getCookies', 'Network.deleteCookies', 'Storage.clearDataForOrigin', 'Page.reload']);
   });
 
   it('scenario: clear=local_storage → only Storage.clearDataForOrigin + reload', () => {
@@ -8210,9 +8225,10 @@ describe('clear_cache_and_reload scenario simulation', () => {
     assert.ok(result.summary.includes('origin-scoped'));
   });
 
-  it('scenario: origin specified → appears in summary', () => {
+  it('scenario: explicit origin override → rejected, nothing cleared', () => {
     const result = simulateClear({ clear: 'cookies', origin: 'https://cursor.com' });
-    assert.ok(result.summary.includes('https://cursor.com'));
+    assert.deepStrictEqual(result.cdpCommands, []);
+    assert.ok(result.summary.includes('origin override is not supported'));
   });
 
   it('scenario: reload=false + no clear → no CDP commands at all', () => {

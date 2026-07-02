@@ -20,6 +20,7 @@ import type {
 } from './protocol.js';
 import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 import { ExecutorManager } from './pw-executor.js';
+import { getCdpClearDenial } from './cdp-clear-policy.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -1466,6 +1467,14 @@ function handleCDPMessage(data: Buffer, clientId: string) {
         return;
       }
 
+      const wrappedDenial = getCdpClearDenial(params.method, params.params);
+      if (wrappedDenial) {
+        log(`AUDIT: denied ${params.method} (client=${clientId})`);
+        sendCdpError(clientId, { id, sessionId: params.sessionId, error: wrappedDenial });
+        return;
+      }
+      auditScopedClear(params.method, params.params, `client=${clientId}`);
+
       // Translate virtual session IDs to real ones
       const origSessionId = params.sessionId;
       const realSid = origSessionId ? (virtualToRealSession.get(origSessionId) ?? origSessionId) : origSessionId;
@@ -1503,6 +1512,14 @@ function handleCDPMessage(data: Buffer, clientId: string) {
 
     const params = asRecord(parsed.params);
     const sessionId = asString(parsed.sessionId);
+
+    const clearDenial = getCdpClearDenial(method, params);
+    if (clearDenial) {
+      log(`AUDIT: denied ${method} (client=${clientId})`);
+      sendCdpError(clientId, { id, sessionId, error: clearDenial });
+      return;
+    }
+    auditScopedClear(method, params, `client=${clientId}`);
 
     // Browser-level tab lifecycle requires awaiting the extension, so it is
     // handled outside the synchronous server-command switch.
@@ -1586,7 +1603,21 @@ export function resolveCdpSessionForCaller(
   return undefined;
 }
 
-function relaySendCdp(method: string, params?: Record<string, unknown>, timeout = 30000, callerSessionId?: string): Promise<unknown> {
+// Audit trail for allowed-but-destructive clears, so a future "my logins are
+// gone" report can be traced to the exact origin/session in relay.log.
+function auditScopedClear(method: string, params: Record<string, unknown> | undefined, source: string): void {
+  if (method === 'Storage.clearDataForOrigin') {
+    log(`AUDIT: Storage.clearDataForOrigin origin=${params?.origin} types=${params?.storageTypes} (${source})`);
+  }
+}
+
+export function relaySendCdp(method: string, params?: Record<string, unknown>, timeout = 30000, callerSessionId?: string): Promise<unknown> {
+  const clearDenial = getCdpClearDenial(method, params);
+  if (clearDenial) {
+    log(`AUDIT: denied ${method} (session=${callerSessionId ?? '(internal)'})`);
+    return Promise.reject(new Error(clearDenial));
+  }
+  auditScopedClear(method, params, `session=${callerSessionId ?? '(internal)'}`);
   return new Promise((resolve, reject) => {
     const sessionId = resolveCdpSessionForCaller(attachedTargets, getTabOwner, callerSessionId);
     if (!sessionId) {

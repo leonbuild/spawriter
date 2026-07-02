@@ -2,6 +2,7 @@
 // Runs as a Service Worker in Manifest V3
 
 import browser from "webextension-polyfill";
+import { buildScopedBrowsingDataArgs } from "./ai_bridge/clear-policy.js";
 
 // AI Bridge module (MCP support)
 import "./ai_bridge/bridge.js";
@@ -12,22 +13,31 @@ import "./ai_bridge/bridge.js";
 // But connections will be re-established when panel is opened
 let portsToPanel = new Map();
 
-// Handle clear cache request
+// Handle clear cache request. Clearing is always scoped to the tab's origin —
+// an unscoped browsingData.remove would wipe cache/service workers for every
+// site in the profile (see ai_bridge/clear-policy.js).
 async function handleClearCache(msg) {
   const { tabId, dataTypes } = msg;
 
   try {
-    // Clear browsing data
-    // Note: Firefox doesn't support cacheStorage property
-    await browser.browsingData.remove(
-      { since: 0 },
-      dataTypes || {
-        cache: true,
-        serviceWorkers: true,
-      }
+    if (tabId == null) {
+      return { success: false, error: "No tabId specified" };
+    }
+    const tab = await browser.tabs.get(tabId);
+    const isFirefox = browser.runtime.getURL("").startsWith("moz-extension:");
+    const scoped = buildScopedBrowsingDataArgs(
+      tab?.url || "",
+      dataTypes || { cache: true, serviceWorkers: true },
+      isFirefox
     );
+    if (scoped.error) {
+      console.warn("Scoped browsingData clear skipped:", scoped.error);
+    } else {
+      await browser.browsingData.remove(scoped.removalOptions, scoped.dataTypes);
+    }
 
-    // Reload the tab with cache bypass
+    // bypassCache reload covers the HTTP cache even when the scoped clear was
+    // skipped (non-http tab, Firefox cache limitation).
     await browser.tabs.reload(tabId, { bypassCache: true });
 
     return { success: true };

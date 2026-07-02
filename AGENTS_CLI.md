@@ -269,7 +269,7 @@ spawriter -s sw-1 -e 'page.url()'
 
 1. Only operate on normal web pages — never `chrome://` or extension pages
 2. Never use `/connect-active-tab` or bind arbitrary active/existing Chrome tabs. Only use your owned tab, a blue-dot idle spawriter tab, or a newly created tab.
-3. **CRITICAL: cache/cookie/storage clearing defaults to the current tab's origin. Never pass another site's origin explicitly — this would destroy the user's login sessions on other sites.**
+3. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("delete_cookie"/"clear_storage")` or `clearCacheAndReload({ clear })` — they always target the current tab's origin; origin overrides are rejected.**
 4. Screenshot between major actions for verification
 5. Don't assume code changes are live — verify with `screenshot()` or `snapshot()`
 6. Mock rules persist until disabled — always clean up with `networkIntercept.disable()`
