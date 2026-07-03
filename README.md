@@ -166,7 +166,12 @@ AI Agent ──→ MCP Server (stdio) ──→ CDP Relay (:19989) ←──→ 
 
 ### Security model
 
-The relay listens on `127.0.0.1` only. Without `SSPA_MCP_TOKEN` set, **any local process** can execute browser code (including your logged-in sessions) through port 19989. On multi-user or shared machines, set `SSPA_MCP_TOKEN` — all `/cli/*` endpoints then require `Authorization: Bearer <token>`.
+The relay binds to `127.0.0.1` only by default, so it is not reachable from the network. Without `SSPA_MCP_TOKEN` set, **any local process** can execute browser code (including your logged-in sessions) through port 19989. On multi-user or shared machines, set `SSPA_MCP_TOKEN` — all `/cli/*` endpoints then require `Authorization: Bearer <token>`.
+
+Additional hardening enforced by the relay:
+
+- **Loopback by default.** Binding to a public host (`--host 0.0.0.0`, `SSPA_RELAY_BIND_HOST`) is refused unless `SSPA_MCP_TOKEN` is set, and any non-localhost request must then carry the token — health check `GET /` aside.
+- **Browser CSRF / DNS-rebinding guard.** Every route rejects requests whose `Sec-Fetch-Site` is cross-site/same-site, so a malicious web page cannot drive or shut down the relay. Non-browser clients (CLI, MCP) are unaffected.
 
 Monorepo with two packages managed via **npm workspaces**:
 

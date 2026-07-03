@@ -8,7 +8,7 @@ spawriter also extends Playwright with single-spa microfrontend tooling. You can
 
 ## Tool Catalog (4 tools)
 
-- **`execute`** — Playwright JS code with spawriter extensions. Globals: `page`, `context`, `browser`, `state`, `navigate`, `ensureFreshRender`, `screenshot`, `screenshotWithLabels`, `snapshot`/`accessibilitySnapshot`, `interact`, `refToLocator`, `consoleLogs`, `getLatestLogs`, `clearAllLogs`, `networkLog`, `networkDetail`, `clearNetworkLog`, `networkIntercept`, `dbg`, `editor`, `browserFetch`, `storage`, `emulation`, `performance`, `cssInspect`, `pageContent`, `singleSpa`, `clearCacheAndReload`, `getCDPSession`, `resetPlaywright`, `require`, `import`
+- **`execute`** — Playwright JS code with spawriter extensions. Globals: `page`, `context`, `browser`, `state`, `navigate`, `ensureFreshRender`, `screenshot`, `screenshotWithLabels`, `snapshot`/`accessibilitySnapshot`, `interact`, `refToLocator`, `consoleLogs`, `getLatestLogs`, `clearAllLogs`, `networkLog`, `networkDetail`, `clearNetworkLog`, `networkIntercept`, `dbg`, `editor`, `browserFetch`, `storage`, `emulation`, `performance`, `cssInspect`, `pageContent`, `getPageMarkdown`, `getCleanHTML`, `waitForPageLoad`, `getReactSource`, `getReactComponentInfo`, `singleSpa`, `clearCacheAndReload`, `getCDPSession`, `resetPlaywright`, `require`, `import`
 - **`reset`** — Reconnect + clear all state, releasing every tab owned by this MCP server
 - **`single_spa`** — Override management, app lifecycle (status/override_set/override_remove/override_enable/override_disable/override_reset_all/mount/unmount/unload)
 - **`tab`** — Tab management (connect/list/switch/release) with ownership isolation

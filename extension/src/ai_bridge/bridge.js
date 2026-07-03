@@ -4,6 +4,7 @@ import {
   getClearDataForOriginDenial,
   buildScopedBrowsingDataArgs,
 } from "./clear-policy.js";
+import { decidePopupRelocation, POPUP_SOURCE_TTL_MS } from "./popup-relocation.mjs";
 
 (function () {
   "use strict";
@@ -327,6 +328,7 @@ import {
     });
 
     browser.tabs.onRemoved.addListener((tabId) => {
+      popupSourceTabMap.delete(tabId);
       emitDetachedFromTarget(tabId, "tab-removed");
       setTabState(tabId, "idle");
       updateIcons();
@@ -1015,6 +1017,88 @@ import {
 
     return { success: false, error: "Unknown command" };
   }
+
+  // --- Popup relocation (ported from playwriter) ---
+  // The debugger cannot attach to separate popup windows, so window.open
+  // popups (OAuth flows etc.) opened by an attached tab would dead-end the
+  // agent. Relocate them into the opener's window as regular tabs, attach,
+  // and tell the relay so ownership follows the opener's session.
+
+  // chrome.tabs.Tab.openerTabId is unreliable for window.open popups (left
+  // null on recent Chromium); webNavigation.onCreatedNavigationTarget gives a
+  // reliable source_tab_id → new_tab_id mapping. Entries expire to cap memory
+  // for plain new-tab cases that never trigger windows.onCreated.
+  const popupSourceTabMap = new Map();
+
+  chrome.webNavigation?.onCreatedNavigationTarget.addListener((details) => {
+    popupSourceTabMap.set(details.tabId, details.sourceTabId);
+    setTimeout(() => popupSourceTabMap.delete(details.tabId), POPUP_SOURCE_TTL_MS);
+  });
+
+  chrome.windows?.onCreated.addListener(async (popupWindow) => {
+    // Cheap guard before any tabs.query: normal window creation is frequent.
+    if (popupWindow.type !== "popup" || popupWindow.id === undefined) return;
+    try {
+      // windows.onCreated can fire before tabs.query sees the popup's tab.
+      let popupTabs = [];
+      for (let attempt = 0; attempt < 5; attempt++) {
+        popupTabs = await browser.tabs.query({ windowId: popupWindow.id });
+        if (popupTabs.length > 0) break;
+        await sleep(20);
+      }
+      const tabIds = popupTabs.map((t) => t.id).filter((id) => id !== undefined);
+
+      const decision = decidePopupRelocation({
+        windowType: popupWindow.type,
+        windowId: popupWindow.id,
+        tabIds,
+        sourceTabByTabId: popupSourceTabMap,
+        attachedTabIds: new Set(attachedTabs.keys()),
+      });
+      for (const tabId of tabIds) popupSourceTabMap.delete(tabId);
+      if (!decision.relocate) {
+        if (decision.reason === "source-not-attached" && tabIds.length > 0) {
+          log(`Popup window ${popupWindow.id} not opened by an attached tab, leaving alone`);
+        }
+        return;
+      }
+
+      let destinationWindowId;
+      try {
+        const sourceTab = await browser.tabs.get(decision.sourceTabId);
+        destinationWindowId = sourceTab.windowId;
+      } catch (e) {
+        log(`Popup source tab ${decision.sourceTabId} no longer exists, skipping relocation`);
+        return;
+      }
+      if (destinationWindowId === undefined || destinationWindowId === popupWindow.id) return;
+
+      log(`Relocating ${tabIds.length} popup tab(s) from window ${popupWindow.id} into window ${destinationWindowId} (opener tab ${decision.sourceTabId})`);
+      await browser.tabs.move(tabIds, { windowId: destinationWindowId, index: -1 });
+      try {
+        await browser.windows.remove(popupWindow.id);
+      } catch (_) {
+        // Chrome may have already closed the empty popup window.
+      }
+      for (const tabId of tabIds) {
+        if (!attachedTabs.has(tabId)) {
+          try {
+            await connectTab(tabId);
+          } catch (e) {
+            warn(`Failed to auto-connect relocated popup tab ${tabId}:`, e);
+          }
+        }
+        // Ownership is the relay's call: it claims the popup for the opener's
+        // owning session, or leaves it available if the opener is unowned.
+        sendMessage({
+          method: "popupRelocated",
+          params: { tabId, sourceTabId: decision.sourceTabId },
+        });
+      }
+    } catch (e) {
+      warn("Failed to relocate popup window:", e);
+    }
+  });
 
   // --- Init ---
 

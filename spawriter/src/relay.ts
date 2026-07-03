@@ -3,11 +3,13 @@ import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import http from 'http';
 import { pathToFileURL } from 'node:url';
 import {
+  getEnv,
   getRelayPort,
   getRelayToken,
   getCdpUrl,
   getAllowedExtensionIds,
   isLocalhost,
+  isLoopbackHost,
   log,
   error,
   enableFileLog,
@@ -21,6 +23,7 @@ import type {
 import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 import { ExecutorManager } from './pw-executor.js';
 import { getCdpClearDenial } from './cdp-clear-policy.js';
+import { createCdpLogger, DROPPED_CDP_EVENTS, NOISY_LOG_EVENTS, type CdpLogger, type CdpLogDirection } from './cdp-log.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -60,6 +63,42 @@ interface DownloadBehavior {
 }
 
 const app = new Hono();
+
+// Dedicated JSONL log for CDP traffic (separate from relay.log). Initialized
+// by startRelayServer; a null logger keeps unit tests importing this module
+// from touching the filesystem.
+let cdpLogger: CdpLogger | null = null;
+
+// Extract the CDP method for noise filtering: events from the extension are
+// wrapped in a forwardCDPEvent/forwardCDPCommand envelope with the real CDP
+// method under params.method; relay-originated messages carry it top-level.
+function cdpMethodOf(message: unknown): string | undefined {
+  const m = message as { method?: string; params?: { method?: string } } | null;
+  if (!m) return undefined;
+  if ((m.method === 'forwardCDPEvent' || m.method === 'forwardCDPCommand') && m.params?.method) {
+    return m.params.method;
+  }
+  return m.method;
+}
+
+function logCdp(direction: CdpLogDirection, message: unknown, clientId?: string): void {
+  if (!cdpLogger) return;
+  const method = cdpMethodOf(message);
+  if (method && NOISY_LOG_EVENTS.has(method)) return;
+  cdpLogger.log({ timestamp: new Date().toISOString(), direction, clientId, message });
+}
+
+// Browser CSRF / DNS-rebinding guard for every route. Non-browser clients
+// (CLI, MCP) omit Sec-Fetch-Site and are allowed; a malicious web page's
+// cross-site fetch carries `sec-fetch-site: cross-site` and is rejected — this
+// protects even bodyless routes like /shutdown from browser-driven abuse.
+app.use('*', async (c, next) => {
+  const secFetchSite = c.req.header('sec-fetch-site');
+  if (secFetchSite && secFetchSite !== 'none' && secFetchSite !== 'same-origin') {
+    return c.json({ error: 'Cross-origin requests not allowed' }, 403);
+  }
+  await next();
+});
 
 interface ExtensionCmdPending {
   ws: WebSocket;
@@ -132,7 +171,22 @@ export function shouldEscalateAssertRecovery(now = Date.now()): boolean {
   return true;
 }
 
+// A double-spawn race (ensureRelay + `relay --replace` + MCP autostart) makes a
+// second instance fail to bind. With a WebSocketServer attached to the http
+// server, that listen error surfaces as uncaughtException instead of reaching
+// server.on('error'), so it must be recognised here too. Losing the bind race
+// is expected and harmless — another relay already serves the port.
+export function isPortInUseError(reason: unknown): boolean {
+  return reason instanceof Error && (reason as NodeJS.ErrnoException).code === 'EADDRINUSE';
+}
+
 function handleRecoverableProcessError(reason: unknown, origin: string): boolean {
+  if (isPortInUseError(reason)) {
+    log(`Port already in use — another relay instance is running (${origin}). Exiting gracefully.`);
+    process.exitCode = 0;
+    setImmediate(() => process.exit(0));
+    return true;
+  }
   if (isRecoverablePlaywrightDialogRace(reason)) {
     error(`Recovered Playwright dialog race (${origin}):`, reason);
     return true;
@@ -158,6 +212,11 @@ function handleRecoverableProcessError(reason: unknown, origin: string): boolean
 function installRelayProcessErrorHandlers(): void {
   if (relayProcessErrorHandlersInstalled) return;
   relayProcessErrorHandlersInstalled = true;
+
+  // If the parent that owns our stdio dies, later writes to these streams emit
+  // 'error' (EPIPE) which would otherwise become an uncaughtException.
+  process.stdout.on('error', () => {});
+  process.stderr.on('error', () => {});
 
   process.on('unhandledRejection', (reason) => {
     if (handleRecoverableProcessError(reason, 'unhandledRejection')) return;
@@ -666,6 +725,7 @@ function sendExtensionCommand(method: string, params?: Record<string, unknown>, 
 
 function sendToExtension(message: unknown): void {
   if (extensionWs?.readyState === WebSocket.OPEN) {
+    logCdp('to-extension', message);
     extensionWs.send(JSON.stringify(message));
   } else {
     error('Extension WebSocket not connected, cannot send message');
@@ -681,11 +741,13 @@ function isExtensionConnected(): boolean {
 function sendToCDPClient(clientId: string, message: unknown): void {
   const client = cdpClients.get(clientId);
   if (client?.ws.readyState === WebSocket.OPEN) {
+    logCdp('to-playwright', message, clientId);
     client.ws.send(JSON.stringify(message));
   }
 }
 
 function broadcastToCDPClients(message: unknown): void {
+  logCdp('to-playwright', message, '*');
   for (const client of cdpClients.values()) {
     if (client.ws.readyState === WebSocket.OPEN) {
       client.ws.send(JSON.stringify(message));
@@ -1174,8 +1236,41 @@ function handleExtensionMessage(data: Buffer) {
       return;
     }
 
+    // High-frequency events no Playwright API depends on saturate the relay
+    // on realtime/large pages — drop them before any forwarding or logging.
+    const cdpMethod = cdpMethodOf(message);
+    if (cdpMethod && DROPPED_CDP_EVENTS.has(cdpMethod)) {
+      return;
+    }
+    logCdp('from-extension', message);
+
     if (message.method === 'requestOwnershipSnapshot') {
       sendOwnershipSnapshotToExtension('requested');
+      return;
+    }
+
+    // A popup window opened by an attached tab was relocated into its opener's
+    // window by the extension. If the opener is owned, the popup joins the
+    // same session immediately, so context.pages() picks it up without a
+    // manual claim; an unowned opener leaves the new tab AVAILABLE.
+    if (message.method === 'popupRelocated') {
+      const params = (message as { params?: { tabId?: number; sourceTabId?: number } }).params;
+      const tabId = params?.tabId;
+      const sourceTabId = params?.sourceTabId;
+      if (tabId != null && sourceTabId != null) {
+        const ownerSession = getTabOwner(sourceTabId);
+        if (ownerSession) {
+          const result = claimTab(tabId, ownerSession);
+          if (result.ok) {
+            const executor = relayExecutorManager.get(ownerSession);
+            if (executor) executor.claimTab(tabId, undefined, targetIdForTab(tabId));
+            replayClaimedTargetToOwner(tabId, ownerSession);
+            log(`Popup tab ${tabId} auto-claimed for session ${ownerSession} (opener tab ${sourceTabId})`);
+          }
+        } else {
+          log(`Popup tab ${tabId} relocated (opener tab ${sourceTabId} unowned) — left available`);
+        }
+      }
       return;
     }
 
@@ -1365,12 +1460,15 @@ function handleExtensionMessage(data: Buffer) {
 
       const pending = pendingRequests.get(response.id);
       if (!pending) {
+        // A response arriving after its request was purged is expected whenever
+        // a client disconnects mid-flight — the extension still answers the
+        // in-flight command. This is routine bookkeeping, not an error.
         const deleted = recentlyDeletedRequests.get(response.id);
         if (deleted) {
           const ageMs = Date.now() - deleted.createdAt;
-          error(`Late response for relay id ${response.id}: method=${deleted.method ?? '?'}, deletedReason=${deleted.deleteReason}, age=${(ageMs / 1000).toFixed(1)}s`);
+          log(`Late response for relay id ${response.id}: method=${deleted.method ?? '?'}, deletedReason=${deleted.deleteReason}, age=${(ageMs / 1000).toFixed(1)}s`);
         } else {
-          error(`Received response for unknown request id: ${response.id}`);
+          log(`Response for unknown/expired relay id ${response.id} (client likely disconnected)`);
         }
         return;
       }
@@ -1386,6 +1484,9 @@ function handleExtensionMessage(data: Buffer) {
     error('Error parsing extension message:', e);
   }
 }
+
+const OWNERSHIP_BLOCK_LOG_WINDOW_MS = 1000;
+const ownershipBlockLogAt = new Map<string, number>();
 
 function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: number): boolean {
   if (!cdpSessionId) return true;
@@ -1403,7 +1504,16 @@ function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: 
     if (boundSession === undefined) return true;
   }
 
-  log(`OWNERSHIP BLOCKED: client=${clientId}, cdpSession=${cdpSessionId}, tabId=${tabId}, owner=${owner.sessionId}, sessionToClientId=${ownerClientId}, pwBound=${pwClientToSession.get(clientId)}`);
+  // Target-announce fan-out can trigger this check ~10×/ms for the same
+  // (client, tab); collapse repeats within a short window so one real conflict
+  // is one log line, not a burst.
+  const blockKey = `${clientId}:${tabId}`;
+  const nowMs = Date.now();
+  const lastLogged = ownershipBlockLogAt.get(blockKey);
+  if (lastLogged === undefined || nowMs - lastLogged > OWNERSHIP_BLOCK_LOG_WINDOW_MS) {
+    ownershipBlockLogAt.set(blockKey, nowMs);
+    log(`OWNERSHIP BLOCKED: client=${clientId}, cdpSession=${cdpSessionId}, tabId=${tabId}, owner=${owner.sessionId}, sessionToClientId=${ownerClientId}, pwBound=${pwClientToSession.get(clientId)}`);
+  }
   sendCdpError(clientId, {
     id,
     sessionId: cdpSessionId,
@@ -1519,6 +1629,7 @@ function handleCDPMessage(data: Buffer, clientId: string) {
     const parsed = JSON.parse(data.toString()) as Record<string, unknown>;
     const method = asString(parsed.method);
     const id = asNumber(parsed.id);
+    logCdp('from-playwright', parsed, clientId);
 
     if (method === 'forwardCDPCommand') {
       const params = parseForwardCommandParams(parsed.params);
@@ -1730,10 +1841,6 @@ startStaleSweep();
 // ---------------------------------------------------------------------------
 
 app.use('/cli/*', async (c, next) => {
-  const secFetchSite = c.req.header('sec-fetch-site');
-  if (secFetchSite && secFetchSite !== 'none' && secFetchSite !== 'same-origin') {
-    return c.json({ error: 'Cross-origin requests not allowed' }, 403);
-  }
   if (c.req.method === 'POST') {
     const contentType = c.req.header('content-type');
     if (!contentType?.includes('application/json')) {
@@ -1752,8 +1859,8 @@ app.use('/cli/*', async (c, next) => {
 
 app.post('/cli/execute', async (c) => {
   try {
-    const body = await c.req.json() as { sessionId: string; code: string; timeout?: number };
-    const executor = relayExecutorManager.getOrCreate(body.sessionId);
+    const body = await c.req.json() as { sessionId: string; code: string; timeout?: number; cwd?: string };
+    const executor = relayExecutorManager.getOrCreate(body.sessionId, body.cwd);
     sessionActivity.set(body.sessionId, Date.now());
 
     if (executor.getActiveTabId() == null) {
@@ -1860,8 +1967,9 @@ app.post('/cli/execute', async (c) => {
 
 app.post('/cli/session/new', async (c) => {
   try {
+    const { cwd } = await c.req.json<{ cwd?: string }>().catch(() => ({} as { cwd?: string }));
     const id = `sw-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-    relayExecutorManager.getOrCreate(id);
+    relayExecutorManager.getOrCreate(id, cwd);
     return c.json({ id });
   } catch (err: any) {
     return c.json({ error: err.message }, 400);
@@ -1954,21 +2062,45 @@ app.post('/cli/cdp', async (c) => {
   }
 });
 
-export async function startRelayServer(): Promise<void> {
+export async function startRelayServer(options?: { host?: string }): Promise<http.Server> {
   installRelayProcessErrorHandlers();
   // The relay is usually spawned with stdio:'ignore' — mirror logs to the
   // file that `spawriter logfile` points at, or they are lost entirely.
   const os = await import('node:os');
   const path = await import('node:path');
   enableFileLog(path.join(os.tmpdir(), 'spawriter', 'relay.log'));
+  const cdpLogPath = path.join(os.tmpdir(), 'spawriter', 'cdp.jsonl');
   const port = getRelayPort();
+
+  // Default to loopback so the browser-control API is never network-reachable.
+  // A public bind is opt-in and only permitted with a token, otherwise any host
+  // on the network could drive the user's logged-in browser.
+  const bindHost = options?.host || getEnv('SSPA_RELAY_BIND_HOST') || '127.0.0.1';
+  const loopbackOnly = isLoopbackHost(bindHost);
+  if (!loopbackOnly && !getRelayToken()) {
+    error(`Refusing to bind relay to public host "${bindHost}" without SSPA_MCP_TOKEN. Set a token or use 127.0.0.1.`);
+    process.exit(1);
+  }
+
   if (ALLOW_ANY_EXTENSION) {
-    error('No SSPA_EXTENSION_IDS configured. Allowing any chrome-extension origin.');
+    log('No SSPA_EXTENSION_IDS configured; allowing any chrome-extension origin. Set SSPA_EXTENSION_IDS to restrict.');
   }
 
   const server = http.createServer(async (req, res) => {
     try {
+      // Defence in depth: even if bound to a public host, every route except the
+      // health check requires a valid token when the caller is not on loopback.
+      const remoteAddr = req.socket?.remoteAddress || '';
       const url = new URL(req.url ?? '/', `http://localhost:${port}`);
+      const isHealthCheck = req.method === 'GET' && url.pathname === '/';
+      if (!isHealthCheck && !isLocalhost(remoteAddr)) {
+        const token = getRelayToken();
+        if (!token || req.headers['authorization'] !== `Bearer ${token}`) {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Forbidden: non-localhost access requires a valid token' }));
+          return;
+        }
+      }
       const init: RequestInit & { duplex?: 'half' } = {
         method: req.method,
         headers: req.headers as any,
@@ -2172,10 +2304,16 @@ export async function startRelayServer(): Promise<void> {
     process.exit(1);
   });
 
-  server.listen(port, () => {
-    log(`Relay server started on port ${port}`);
-    log(`Extension endpoint: ws://localhost:${port}/extension`);
-    log(`CDP endpoint: ws://localhost:${port}/cdp/:clientId`);
+  server.listen(port, bindHost, () => {
+    // Created only after the port is won: createCdpLogger truncates the file,
+    // and a losing EADDRINUSE race must not wipe the active instance's log.
+    cdpLogger = createCdpLogger({ logFilePath: cdpLogPath });
+    // Batched writes lose up to 500ms of entries on exit; flush on the normal
+    // shutdown path so crash forensics keep the final protocol exchange.
+    process.on('beforeExit', () => { void cdpLogger?.flush(); });
+    log(`Relay server started on ${bindHost}:${port}${loopbackOnly ? ' (localhost only)' : ' (public — token required)'}`);
+    log(`Extension endpoint: ws://${bindHost}:${port}/extension`);
+    log(`CDP endpoint: ws://${bindHost}:${port}/cdp/:clientId`);
   });
 
   const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -2190,6 +2328,9 @@ export async function startRelayServer(): Promise<void> {
         process.exit(0);
       }
     }, IDLE_TIMEOUT_MS);
+    // The listening socket keeps the process alive; these timers must not, so an
+    // embedder that closes the server can exit cleanly.
+    idleTimer.unref();
   }
 
   checkIdleShutdown();
@@ -2199,7 +2340,9 @@ export async function startRelayServer(): Promise<void> {
       extensionWs.send(JSON.stringify({ method: 'ping' }));
     }
     checkIdleShutdown();
-  }, 30000);
+  }, 30000).unref();
+
+  return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

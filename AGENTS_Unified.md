@@ -166,6 +166,11 @@ The following globals are available in MCP `execute` and CLI `spawriter -e`:
 | `performance(action?)` | Read performance metrics |
 | `cssInspect(selector, props?)` | Read computed CSS styles |
 | `pageContent(action, opts?)` | Read text, HTML, metadata, or search the DOM |
+| `getPageMarkdown(opts?)` | Extract the main article content as Markdown (Readability); diffs since last call, supports `search` |
+| `getCleanHTML(opts?)` | Deeply cleaned LLM-friendly HTML of the page or a `selector` subtree; diffs since last call |
+| `waitForPageLoad(opts?)` | Wait until the page truly settles: readyState complete + no meaningful pending requests (SPA-aware) |
+| `getReactSource(target)` | React component name + source file:line for a snapshot ref or CSS selector |
+| `getReactComponentInfo(target)` | React component props + component hierarchy for a snapshot ref or CSS selector |
 | `singleSpa` | Manage single-spa applications and overrides |
 | `clearCacheAndReload(opts?)` | Clear origin-scoped data and reload |
 | `getCDPSession()` | Access the raw CDP session when supported |
@@ -272,6 +277,39 @@ await pageContent("get_metadata")
 await pageContent("search_dom", { query: "button" })
 await performance("get_web_vitals")
 await performance("get_metrics")
+```
+
+### LLM-Friendly Content Extraction
+
+`getPageMarkdown()` extracts the main article content (Readability, like Firefox Reader View); `getCleanHTML()` returns deeply cleaned HTML of the page or a subtree. Both return a diff on repeated calls by default (`showDiffSinceLastCall: false` for full content) and accept `search` to filter for matching lines with context.
+
+```javascript
+await getPageMarkdown()
+await getPageMarkdown({ search: "pricing" })
+await getCleanHTML()
+await getCleanHTML({ selector: "#main", includeStyles: false })
+await getCleanHTML({ search: /aria-label/ })
+```
+
+### Smart Page-Load Waiting
+
+`waitForPageLoad()` waits until the page truly settles: `document.readyState === "complete"` and no meaningful pending network requests (ad/analytics beacons and stuck requests are ignored). Use it after navigation or actions that trigger SPA data loading.
+
+```javascript
+await navigate("https://example.com")
+await waitForPageLoad()
+await waitForPageLoad({ timeout: 10000 })
+```
+
+### React Component Inspection
+
+Map a DOM element to the React component that rendered it. The target is a snapshot ref number (run `snapshot()` first) or a CSS selector. Source file:line requires a dev build of React.
+
+```javascript
+await snapshot()
+await getReactSource(5)                      // { componentName, fileName, lineNumber, columnNumber }
+await getReactSource(".nav-item")
+await getReactComponentInfo(5)               // + props and component hierarchy
 ```
 
 ## Key Usage Notes

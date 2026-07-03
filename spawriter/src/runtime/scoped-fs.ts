@@ -3,10 +3,17 @@ import path from 'node:path';
 import os from 'node:os';
 
 export class ScopedFS {
-  private allowedDirs: string[];
-  private baseDir: string;
+  private allowedDirs: string[] = [];
+  private baseDir: string = process.cwd();
 
   constructor(allowedDirs?: string[], baseDir?: string) {
+    this.configure(allowedDirs, baseDir);
+  }
+
+  // Re-point the sandbox at a different working directory (e.g. when a relay
+  // session's real cwd arrives with the execute request) without replacing the
+  // instance, so references captured by the sandboxed require() stay valid.
+  configure(allowedDirs?: string[], baseDir?: string): void {
     this.baseDir = path.resolve(baseDir || process.cwd());
     const defaultDirs = [this.baseDir, '/tmp', os.tmpdir()];
     const dirs = allowedDirs ?? defaultDirs;

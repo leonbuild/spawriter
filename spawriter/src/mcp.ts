@@ -132,12 +132,22 @@ export function ownerBelongsToThisMcp(owner: string | null | undefined, mcpClien
 // Executor management
 // ---------------------------------------------------------------------------
 
+// Relay control routes require the token when SSPA_MCP_TOKEN is set; without
+// these headers a token-protected relay would reject every MCP call with 401.
+function relayHeaders(): Record<string, string> {
+  const token = getRelayToken();
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
 async function remoteRelaySendCdp(method: string, params?: Record<string, unknown>, timeout?: number): Promise<unknown> {
   const port = getRelayPort();
   const mcpSessionId = getRelaySessionId();
   const resp = await fetch(`http://localhost:${port}/cli/cdp`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: relayHeaders(),
     body: JSON.stringify({ method, params, timeout, sessionId: mcpSessionId }),
     signal: AbortSignal.timeout(timeout || 30000),
   });
@@ -159,8 +169,8 @@ async function executeViaRelay(code: string, timeout: number): Promise<ExecuteRe
   const mcpSessionId = getRelaySessionId();
   const resp = await fetch(`http://localhost:${port}/cli/execute`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sessionId: mcpSessionId, code, timeout }),
+    headers: relayHeaders(),
+    body: JSON.stringify({ sessionId: mcpSessionId, code, timeout, cwd: process.cwd() }),
   });
   const body = await resp.json() as Record<string, unknown>;
   return {
@@ -327,8 +337,8 @@ async function handleTabAction(
       try {
         const claimResp = await fetch(`http://localhost:${port}/cli/tab/claim`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tabId: switchTabId, sessionId: mySessionId }),
+      headers: relayHeaders(),
+      body: JSON.stringify({ tabId: switchTabId, sessionId: mySessionId }),
         });
         if (!claimResp.ok) {
           const claimErr = await claimResp.json().catch(() => ({}));
@@ -350,7 +360,7 @@ async function handleTabAction(
         try {
           const resp = await fetch(`http://localhost:${port}/cli/tab/release`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: relayHeaders(),
             body: JSON.stringify({ tabId: releaseTabId, sessionId: mySessionId }),
           });
           released = resp.ok;
@@ -366,7 +376,7 @@ async function handleTabAction(
           try {
             await fetch(`http://localhost:${port}/cli/tab/release`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: relayHeaders(),
               body: JSON.stringify({ tabId: t.tabId, sessionId: mySessionId }),
             });
             releasedCount++;
@@ -420,14 +430,14 @@ async function releaseAllOwnedTabs(): Promise<number> {
         released++;
         return fetch(`http://localhost:${port}/cli/tab/release`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: relayHeaders(),
           body: JSON.stringify({ tabId: t.tabId, sessionId: t.owner }),
         }).catch(() => {});
       }));
     await Promise.all([...ownedSessions].map(sid =>
       fetch(`http://localhost:${port}/cli/session/delete`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: relayHeaders(),
         body: JSON.stringify({ sessionId: sid }),
       }).catch(() => {})));
   } catch { /* relay may not be running */ }
@@ -438,7 +448,7 @@ async function requestConnectTab(port: number, params: { url?: string; tabId?: n
   try {
     const response = await fetch(`http://localhost:${port}/connect-tab`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: relayHeaders(),
       body: JSON.stringify(params),
       signal: AbortSignal.timeout(18000),
     });
@@ -472,7 +482,7 @@ const tools = [
       properties: {
         code: {
           type: 'string',
-          description: 'Playwright JS code. Globals: {page, context, browser, state, navigate, ensureFreshRender, screenshot, screenshotWithLabels, snapshot/accessibilitySnapshot, interact, refToLocator, consoleLogs, getLatestLogs, clearAllLogs, networkLog, networkDetail, clearNetworkLog, networkIntercept, dbg, editor, browserFetch, storage, emulation, performance, cssInspect, pageContent, singleSpa, clearCacheAndReload, getCDPSession, resetPlaywright, require, import}. Use ; for multiple statements.',
+          description: 'Playwright JS code. Globals: {page, context, browser, state, navigate, ensureFreshRender, screenshot, screenshotWithLabels, snapshot/accessibilitySnapshot, interact, refToLocator, consoleLogs, getLatestLogs, clearAllLogs, networkLog, networkDetail, clearNetworkLog, networkIntercept, dbg, editor, browserFetch, storage, emulation, performance, cssInspect, pageContent, getPageMarkdown, getCleanHTML, waitForPageLoad, getReactSource, getReactComponentInfo, singleSpa, clearCacheAndReload, getCDPSession, resetPlaywright, require, import}. Use ; for multiple statements.',
         },
         timeout: {
           type: 'number',

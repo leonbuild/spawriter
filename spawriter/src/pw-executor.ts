@@ -37,6 +37,14 @@ import {
   formatNetworkEntries as fmtNetwork,
 } from './runtime/network-monitor.js';
 import { ScopedFS } from './runtime/scoped-fs.js';
+import { waitForPageLoad } from './runtime/wait-for-page-load.js';
+import { getCleanHTML, type GetCleanHTMLOptions } from './runtime/clean-html.js';
+import { getPageMarkdown, type GetPageMarkdownOptions } from './runtime/page-markdown.js';
+import {
+  getReactSource,
+  getReactComponentInfo,
+  type ReactElementTarget,
+} from './runtime/react-source.js';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
@@ -329,6 +337,9 @@ export class PlaywrightExecutor {
   private networkMonitor = new NetworkMonitor();
   private debugger: DebuggerState = createDebuggerState();
   private lastSnapshot: string | null = null;
+  // Previous getCleanHTML/getPageMarkdown outputs for showDiffSinceLastCall,
+  // keyed by kind+selector (session-scoped, like lastSnapshot).
+  private contentSnapshots: Map<string, string> = new Map();
   private refCacheByTab: Map<string, Map<number, RefInfo>> = new Map();
   private savedOverrides: OverrideState = {};
   private cachedCdpSession: { page: Page; session: any } | null = null;
@@ -344,18 +355,34 @@ export class PlaywrightExecutor {
   relaySendCdp: RelayCdpSender | null = null;
   onCdpClientCreated: ((clientId: string) => void) | null = null;
   private scopedFs: ScopedFS;
+  private scopedCwd: string | null = null;
   private sandboxedRequire: NodeRequire;
   private warningEvents: Array<{ id: number; message: string }> = [];
   private nextWarningEventId = 0;
 
   constructor(logger?: ExecutorLogger, cwd?: string) {
     this.logger = logger || { log, error };
-    const sessionCwd = cwd ? path.resolve(cwd) : null;
+    this.scopedCwd = cwd ? path.resolve(cwd) : null;
     this.scopedFs = new ScopedFS(
-      sessionCwd ? [sessionCwd, '/tmp', os.tmpdir()] : undefined,
-      sessionCwd || undefined,
+      this.scopedCwd ? [this.scopedCwd, '/tmp', os.tmpdir()] : undefined,
+      this.scopedCwd || undefined,
     );
     this.sandboxedRequire = this.createSandboxedRequire();
+  }
+
+  // The relay is a long-lived detached process whose own cwd is unrelated to the
+  // caller's project. Callers pass their real cwd with each request so file
+  // writes (screenshots, temp files) land in — and stay scoped to — that project.
+  updateCwd(cwd?: string): void {
+    if (!cwd) return;
+    const resolved = path.resolve(cwd);
+    if (resolved === this.scopedCwd) return;
+    this.scopedCwd = resolved;
+    this.scopedFs.configure([resolved, '/tmp', os.tmpdir()], resolved);
+  }
+
+  getScopedCwd(): string | null {
+    return this.scopedCwd;
   }
 
   private createSandboxedRequire(): NodeRequire {
@@ -2377,6 +2404,30 @@ export class PlaywrightExecutor {
         return 'Page reloaded but may not have fully stabilized — verify with screenshot() or snapshot()';
       },
 
+      // --- Smart page-load wait (readyState + pending-request settling) ---
+      waitForPageLoad: async (options?: { timeout?: number; pollInterval?: number; minWait?: number }) =>
+        waitForPageLoad(evaluateJs, options),
+
+      // --- LLM-friendly content extraction ---
+      getCleanHTML: async (options?: GetCleanHTMLOptions) =>
+        getCleanHTML(evaluateJs, self.contentSnapshots, options, (page as any)._guid || 'default'),
+
+      getPageMarkdown: async (options?: GetPageMarkdownOptions) =>
+        getPageMarkdown(evaluateJs, self.contentSnapshots, options, (page as any)._guid || 'default'),
+
+      // --- React component source lookup (bippy) ---
+      getReactSource: async (target: ReactElementTarget) => {
+        const targetId = (page as any)._guid || 'default';
+        const refCache = self.getRefCache(targetId);
+        return getReactSource(relayCdp, target, (ref) => refCache.get(ref)?.backendDOMNodeId);
+      },
+
+      getReactComponentInfo: async (target: ReactElementTarget) => {
+        const targetId = (page as any)._guid || 'default';
+        const refCache = self.getRefCache(targetId);
+        return getReactComponentInfo(relayCdp, target, (ref) => refCache.get(ref)?.backendDOMNodeId);
+      },
+
       // --- Reset (callable from VM) ---
       resetPlaywright: async () => {
         self.page = null;
@@ -2385,6 +2436,7 @@ export class PlaywrightExecutor {
         self.networkMonitor.clearAll();
         self.debugger = createDebuggerState();
         self.lastSnapshot = null;
+        self.contentSnapshots.clear();
         self.refCacheByTab.clear();
         self.savedOverrides = {};
         setTimeout(() => self.closeQuietly().catch(() => {}), 100);
@@ -2543,7 +2595,7 @@ export class ExecutorManager {
     this.relaySendCdp = options?.relaySendCdp;
   }
 
-  getOrCreate(sessionId: string): PlaywrightExecutor {
+  getOrCreate(sessionId: string, cwd?: string): PlaywrightExecutor {
     let executor = this.executors.get(sessionId);
     if (!executor) {
       if (this.executors.size >= this.maxSessions) {
@@ -2553,9 +2605,11 @@ export class ExecutorManager {
           `Delete an existing session first.`,
         );
       }
-      executor = new PlaywrightExecutor(this.logger);
+      executor = new PlaywrightExecutor(this.logger, cwd);
       if (this.relaySendCdp) executor.relaySendCdp = this.relaySendCdp;
       this.executors.set(sessionId, executor);
+    } else if (cwd) {
+      executor.updateCwd(cwd);
     }
     return executor;
   }

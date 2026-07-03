@@ -120,7 +120,7 @@ async function executeCode(options: {
         'Content-Type': 'application/json',
         ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       },
-      body: JSON.stringify({ sessionId, code, timeout }),
+      body: JSON.stringify({ sessionId, code, timeout, cwd: process.cwd() }),
     });
 
     if (!response.ok) {
@@ -209,7 +209,7 @@ cli.command('serve', 'Start the MCP server (includes relay if not running)')
 // === relay ===
 cli.command('relay', 'Start the CDP relay server')
   .option('--port <port>', 'Port (default: 19989)')
-  .option('--host <host>', 'Bind host (default: 0.0.0.0)')
+  .option('--host <host>', 'Bind host (default: 127.0.0.1; a public host requires --token)')
   .option('--token <token>', 'Auth token (required for public host)')
   .option('--replace', 'Kill existing server if running')
   .action(async (options: Record<string, unknown>) => {
@@ -230,8 +230,9 @@ cli.command('relay', 'Start the CDP relay server')
     }
 
     process.env.SSPA_MCP_PORT = String(port);
+    if (options.token) process.env.SSPA_MCP_TOKEN = String(options.token);
     const { startRelayServer } = await import('./relay.js');
-    await startRelayServer();
+    await startRelayServer({ host: options.host as string | undefined });
   });
 
 // === session new ===
@@ -414,6 +415,7 @@ cli.command('logfile', 'Print log file paths').action(async () => {
   const os = await import('node:os');
   const logDir = path.join(os.tmpdir(), 'spawriter');
   console.log(`relay: ${path.join(logDir, 'relay.log')}`);
+  console.log(`cdp: ${path.join(logDir, 'cdp.jsonl')}`);
 });
 
 cli.help();

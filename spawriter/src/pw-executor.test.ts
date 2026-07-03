@@ -6,6 +6,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import * as path from 'node:path';
 
 import {
   getAutoReturnExpression,
@@ -786,6 +787,36 @@ describe('ExecutorManager', () => {
     assert.notStrictEqual(exec1, exec2);
     assert.equal(exec1.getStatus().connected, false);
     assert.equal(exec2.getStatus().connected, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test: ExecutorManager – cwd threading (relay drops screenshots into project)
+// ---------------------------------------------------------------------------
+
+describe('ExecutorManager – cwd threading', () => {
+  it('getOrCreate applies the caller cwd to a new executor', () => {
+    const mgr = new ExecutorManager();
+    const exec = mgr.getOrCreate('s', path.resolve('/tmp/project-x'));
+    assert.equal(exec.getScopedCwd(), path.resolve('/tmp/project-x'));
+  });
+
+  it('getOrCreate on an existing session updates its cwd', () => {
+    const mgr = new ExecutorManager();
+    const first = mgr.getOrCreate('s', path.resolve('/tmp/project-x'));
+    const second = mgr.getOrCreate('s', path.resolve('/tmp/project-y'));
+    assert.strictEqual(first, second);
+    assert.equal(second.getScopedCwd(), path.resolve('/tmp/project-y'));
+  });
+
+  it('getOrCreate without cwd leaves the executor unscoped and does not reset an existing scope', () => {
+    const mgr = new ExecutorManager();
+    const unscoped = mgr.getOrCreate('u');
+    assert.equal(unscoped.getScopedCwd(), null);
+
+    const scoped = mgr.getOrCreate('s', path.resolve('/tmp/project-x'));
+    mgr.getOrCreate('s'); // no cwd — must not clear the previous scope
+    assert.equal(scoped.getScopedCwd(), path.resolve('/tmp/project-x'));
   });
 });
 

@@ -106,6 +106,11 @@ All globals are injected into the Playwright VM sandbox. Playwright native opera
 | `performance(action?)` | Performance metrics |
 | `cssInspect(selector, props?)` | Computed CSS styles for elements |
 | `pageContent(action, opts?)` | Page content: `get_text`, `get_html`, `get_metadata`, `search_dom` |
+| `getPageMarkdown(opts?)` | Main article content as Markdown (Readability); diff on repeat calls, `search` filter |
+| `getCleanHTML(opts?)` | Deeply cleaned LLM-friendly HTML (`selector`, `search`, `includeStyles`); diff on repeat calls |
+| `waitForPageLoad(opts?)` | Wait until readyState complete + no meaningful pending requests (SPA-aware) |
+| `getReactSource(target)` | React component name + source file:line for a snapshot ref or CSS selector |
+| `getReactComponentInfo(target)` | React component props + hierarchy for a snapshot ref or CSS selector |
 | `singleSpa` | Single-spa management (`.status()`, `.override()`, `.mount()`, `.unmount()`, `.unload()`) |
 | `clearCacheAndReload(opts?)` | Origin-scoped cache/storage clear + reload |
 | `getCDPSession()` | Raw CDP session accessor (normally returns a live session, including through the relay; null only if creation failed) |
@@ -235,6 +240,35 @@ spawriter -s sw-1 -e 'await browserFetch("https://api.example.com/data")'
 spawriter -s sw-1 -e 'await pageContent("get_text")'
 spawriter -s sw-1 -e 'await pageContent("get_metadata")'
 spawriter -s sw-1 -e 'await pageContent("search_dom", { query: "button" })'
+```
+
+### LLM-Friendly Content Extraction
+
+```bash
+spawriter -s sw-1 -e 'await getPageMarkdown()'                          # main article as Markdown (Readability)
+spawriter -s sw-1 -e 'await getPageMarkdown({ search: "pricing" })'     # matching lines with context
+spawriter -s sw-1 -e 'await getCleanHTML()'                             # deeply cleaned HTML of <body>
+spawriter -s sw-1 -e 'await getCleanHTML({ selector: "#main" })'
+# Repeat calls return a diff by default; pass { showDiffSinceLastCall: false } for full content.
+```
+
+### Smart Page-Load Waiting
+
+```bash
+spawriter -s sw-1 -e 'await navigate("https://example.com"); await waitForPageLoad()'
+spawriter -s sw-1 -e 'await waitForPageLoad({ timeout: 10000 })'
+# Settles when readyState is complete AND no meaningful requests are pending
+# (ad/analytics beacons and stuck requests are ignored).
+```
+
+### React Component Inspection
+
+```bash
+spawriter -s sw-1 -e 'await snapshot()'                                 # populates refs
+spawriter -s sw-1 -e 'await getReactSource(5)'                          # component name + source file:line
+spawriter -s sw-1 -e 'await getReactSource(".nav-item")'                # CSS selector target
+spawriter -s sw-1 -e 'await getReactComponentInfo(5)'                   # + props and hierarchy
+# Source locations require a React dev build; production builds return an explanatory error.
 ```
 
 ### Cache & Reload

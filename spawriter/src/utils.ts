@@ -46,6 +46,13 @@ export function isLocalhost(address: string): boolean {
   );
 }
 
+// A bind host that keeps the relay reachable only from the local machine.
+// Anything else (0.0.0.0, ::, a LAN IP) exposes the browser-control API to the
+// network and must require a token before the server is allowed to start.
+export function isLoopbackHost(host: string): boolean {
+  return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
 // Optional file sink: the relay is spawned with stdio:'ignore', so without
 // this its stderr logs are lost and `spawriter logfile` points at nothing.
 let logFilePath: string | null = null;
@@ -64,7 +71,13 @@ export function enableFileLog(filePath: string): void {
 }
 
 function writeLine(line: string): void {
-  process.stderr.write(line);
+  // The relay is often spawned as a child; when its parent exits, the inherited
+  // stderr pipe closes and a plain write() throws EPIPE synchronously, which
+  // used to crash the process via uncaughtException. Logging must never be able
+  // to kill the server, so swallow any stderr write failure.
+  try {
+    process.stderr.write(line);
+  } catch { /* stderr pipe closed (parent gone) — ignore */ }
   if (logFilePath) {
     try {
       fs.appendFileSync(logFilePath, line);
