@@ -141,6 +141,27 @@ export function getAutoReturnExpression(code: string): string | null {
   }
 }
 
+// A `return` nested inside a function expression (e.g. a page.evaluate
+// callback) must not block auto-return of the last statement — only a
+// top-level return conflicts with the async-IIFE wrapping. Walk the AST,
+// skipping function subtrees, which a plain regex on the source cannot do.
+function containsTopLevelReturn(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false;
+  if (Array.isArray(node)) return node.some(containsTopLevelReturn);
+  const n = node as { type?: unknown } & Record<string, unknown>;
+  if (typeof n.type === 'string') {
+    if (n.type === 'ReturnStatement') return true;
+    if (n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression') {
+      return false;
+    }
+  }
+  for (const [key, value] of Object.entries(n)) {
+    if (key === 'type' || key === 'start' || key === 'end') continue;
+    if (containsTopLevelReturn(value)) return true;
+  }
+  return false;
+}
+
 /**
  * For multi-statement code (e.g. `state.x = 1; state.y`), split off the last
  * statement and try to auto-return it while preserving the preceding statements.
@@ -149,7 +170,6 @@ export function getAutoReturnExpression(code: string): string | null {
 export function getLastExpressionReturn(code: string): { preamble: string; returnExpr: string } | null {
   const trimmed = code.replace(/;+\s*$/, '').trim();
   if (!trimmed) return null;
-  if (/\breturn\b/.test(trimmed)) return null;
 
   try {
     const ast = acorn.parse(trimmed, {
@@ -159,6 +179,7 @@ export function getLastExpressionReturn(code: string): { preamble: string; retur
       sourceType: 'module',
     } as acorn.Options);
     if (ast.body.length < 2) return null;
+    if (containsTopLevelReturn(ast.body)) return null;
     const lastStmt = ast.body[ast.body.length - 1] as acorn.ExpressionStatement;
     if (lastStmt.type !== 'ExpressionStatement') return null;
     const preamble = trimmed.slice(0, lastStmt.start).trim();

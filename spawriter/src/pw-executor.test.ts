@@ -162,8 +162,27 @@ describe('getLastExpressionReturn', () => {
     assert.equal(getLastExpressionReturn(''), null);
   });
 
-  it('should return null for code with return keyword', () => {
+  it('should return null for code with top-level return keyword', () => {
     assert.equal(getLastExpressionReturn('state.x = 1; return state.x'), null);
+  });
+
+  it('a return inside a callback must not block the auto-return', () => {
+    // Regression: `page.evaluate(() => { return x; })` made the old regex
+    // check bail out, so multi-statement snippets ending in an expression
+    // silently returned nothing ("no output").
+    const result = getLastExpressionReturn(
+      'const r = await page.evaluate(() => { return location.href; }); JSON.stringify(r)',
+    );
+    assert.ok(result);
+    assert.equal(result!.returnExpr, 'JSON.stringify(r)');
+  });
+
+  it('a return inside a function declaration must not block the auto-return', () => {
+    const result = getLastExpressionReturn(
+      'function pick(v) { return v + 1; } pick(41)',
+    );
+    assert.ok(result);
+    assert.equal(result!.returnExpr, 'pick(41)');
   });
 
   it('should return null when last part is a declaration', () => {

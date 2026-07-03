@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { VERSION, getCdpUrl, DEFAULT_PORT } from './utils.js';
 import { OWNERSHIP_ERROR_CODE } from './protocol.js';
-import { resolveCdpSessionForCaller, isPlaywrightTargetRegistryAssert, isTargetVisibleToClient } from './relay.js';
+import { resolveCdpSessionForCaller, isPlaywrightTargetRegistryAssert, isDuplicateFrameAttachAssert, isTargetVisibleToClient, shouldEscalateAssertRecovery } from './relay.js';
 
 // ---------------------------------------------------------------------------
 // Simulated relay state (mirrors relay.ts structures)
@@ -1237,7 +1237,7 @@ describe('regression: live target lifecycle events are browser-level', () => {
     // only sends params.sessionId. Without enrichment page.close() hangs.
     const idx = relaySource.indexOf("method === 'Target.detachedFromTarget'");
     assert.ok(idx > -1);
-    const block = relaySource.slice(idx, idx + 1600);
+    const block = relaySource.slice(idx, relaySource.indexOf('maybeSynthesizeBrowserDownloadEvent', idx));
     assert.ok(block.includes('detachedTargetId'), 'expected targetId enrichment');
     assert.ok(block.includes('broadcastToCDPClients({'), 'expected browser-level broadcast');
     assert.ok(block.includes('return;'), 'must return instead of falling through to routeCdpEvent');
@@ -1408,6 +1408,58 @@ describe('isPlaywrightTargetRegistryAssert', () => {
     other.stack = 'Error: Assertion error\n    at somewhere (/x/app/main.js:1:1)';
     assert.ok(!isPlaywrightTargetRegistryAssert(other));
   });
+
+  it('matches the CRSession stale-response assert', () => {
+    // crConnection.js:129 `assert(!object.id, ...)` — a response routed to a
+    // session object that replaced the one holding the callback.
+    const err = new Error('Assertion error');
+    err.stack = `Error: Assertion error\n    at assert (/x/node_modules/playwright-core/lib/utils/isomorphic/assert.js:5:11)\n    at CRSession._onMessage (/x/node_modules/playwright-core/lib/server/chromium/crConnection.js:129:30)`;
+    assert.ok(isPlaywrightTargetRegistryAssert(err));
+  });
+});
+
+describe('isDuplicateFrameAttachAssert', () => {
+  const frameAttachedAssert = () => {
+    const err = new Error('Assertion error');
+    err.stack = 'Error: Assertion error\n'
+      + '    at assert (/x/node_modules/playwright-core/lib/utils/isomorphic/assert.js:26:11)\n'
+      + '    at FrameManager.frameAttached (/x/node_modules/playwright-core/lib/server/frames.js:113:31)\n'
+      + '    at FrameSession._onFrameAttached (/x/node_modules/playwright-core/lib/server/chromium/crPage.js:507:29)\n'
+      + '    at /x/node_modules/playwright-core/lib/server/chromium/crConnection.js:133:14';
+    return err;
+  };
+
+  it('matches the duplicate Page.frameAttached init race', () => {
+    assert.ok(isDuplicateFrameAttachAssert(frameAttachedAssert()));
+  });
+
+  it('is a subset of the registry-assert classifier (still handled, never fatal)', () => {
+    assert.ok(isPlaywrightTargetRegistryAssert(frameAttachedAssert()));
+  });
+
+  it('does not match other chromium asserts (those still escalate on bursts)', () => {
+    const err = new Error('Assertion error');
+    err.stack = 'Error: Assertion error\n    at CRSession._onMessage (/x/node_modules/playwright-core/lib/server/chromium/crConnection.js:129:30)';
+    assert.ok(!isDuplicateFrameAttachAssert(err));
+  });
+});
+
+describe('shouldEscalateAssertRecovery', () => {
+  it('stays log-only below the burst threshold and escalates at it', () => {
+    const t0 = 10_000_000;
+    assert.equal(shouldEscalateAssertRecovery(t0), false);
+    assert.equal(shouldEscalateAssertRecovery(t0 + 1_000), false);
+    assert.equal(shouldEscalateAssertRecovery(t0 + 2_000), true, 'third assert within the window escalates');
+    // Escalation clears the window; the next assert starts a fresh count.
+    assert.equal(shouldEscalateAssertRecovery(t0 + 3_000), false);
+  });
+
+  it('a slow trickle outside the window never escalates', () => {
+    const t0 = 20_000_000;
+    assert.equal(shouldEscalateAssertRecovery(t0), false);
+    assert.equal(shouldEscalateAssertRecovery(t0 + 31_000), false);
+    assert.equal(shouldEscalateAssertRecovery(t0 + 62_000), false);
+  });
 });
 
 describe('regression: duplicate attach announces are contained', () => {
@@ -1449,6 +1501,39 @@ describe('regression: duplicate attach announces are contained', () => {
   it('extension resync is single-flight', () => {
     assert.ok(bridgeSource.includes('if (resyncInFlight) return resyncInFlight'), 'concurrent resyncs must share one pass');
     assert.ok(bridgeSource.includes('doResyncAttachedTabs().finally'), 'in-flight marker must always clear');
+  });
+
+  it('extension mints the targetId once per attach and reuses it on resync', () => {
+    // The main frame id changes on cross-process navigation (prerender
+    // activation / BFCache swap); re-reading it re-announces the same live
+    // session as a "new" target and churns Playwright's registry.
+    assert.match(
+      bridgeSource,
+      /attachedTabs\.set\(tabId, \{\s*sessionId,\s*targetId,/,
+      'attachTab must persist the minted targetId with the entry',
+    );
+    assert.ok(bridgeSource.includes('if (!existing.targetId)'), 'resync must mint only when the entry has none');
+    assert.ok(bridgeSource.includes('targetId: existing.targetId'), 'resync must re-announce the stored targetId');
+  });
+
+  it('relay drops child-target attach/detach churn instead of treating it as tab announces', () => {
+    const block = relaySource.slice(
+      relaySource.indexOf("method === 'Target.attachedToTarget' && sessionId"),
+      relaySource.indexOf('Target.tabAvailable'),
+    );
+    assert.ok(
+      block.includes('innerSessionId !== undefined && innerSessionId !== sessionId'),
+      'attaches whose inner sessionId differs from the envelope must not touch the registry',
+    );
+    const detachStart = relaySource.indexOf("method === 'Target.detachedFromTarget'");
+    const detachBlock = relaySource.slice(
+      detachStart,
+      relaySource.indexOf('maybeSynthesizeBrowserDownloadEvent', detachStart),
+    );
+    assert.ok(
+      detachBlock.includes('detachedSessionId !== sessionId'),
+      'detaches whose inner sessionId differs from the envelope must be dropped',
+    );
   });
 });
 
@@ -1543,6 +1628,36 @@ describe('behavioral: duplicate attach announces over WS', () => {
       announce(ext, 'spawriter-tab-42-1', 'TT42');
       await new Promise(r => setTimeout(r, 400));
       assert.equal(attaches().length, 1, 'duplicate announce must be swallowed');
+
+      // 2b. Child-target churn (OOPIF auto-attach forwarded under the tab's
+      //     envelope sessionId, no tabId in targetInfo — the Turnstile
+      //     pattern): must neither corrupt the tab registry nor emit a
+      //     'target-id-changed' detach that would close the live page.
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.attachedToTarget',
+          sessionId: 'spawriter-tab-42-1',
+          params: {
+            sessionId: 'oopif-child-1',
+            targetInfo: { targetId: 'OOPIF1', type: 'iframe', url: 'https://challenges.cloudflare.com/x' },
+            waitingForDebugger: false,
+          },
+        },
+      }));
+      ext.send(JSON.stringify({
+        method: 'forwardCDPEvent',
+        params: {
+          method: 'Target.detachedFromTarget',
+          sessionId: 'spawriter-tab-42-1',
+          params: { sessionId: 'oopif-child-1' },
+        },
+      }));
+      await new Promise(r => setTimeout(r, 400));
+      assert.equal(attaches().length, 1, 'child-target attach must not become a tab announce');
+      assert.equal(detaches().length, 0, 'child-target churn must not detach the tab');
+      const listed = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json() as Array<{ tabId?: number; targetId?: string }>;
+      assert.equal(listed.find(t => t.tabId === 42)?.targetId, 'TT42', 'registry must keep the tab targetId');
 
       // 3. Same session, new targetId (cross-process nav while bridge was down):
       //    old identity is detached, new one announced.
@@ -1700,23 +1815,32 @@ describe('FP1–FP5: relay source invariants', () => {
     assert.ok(body.includes('realToVirtualSessions.clear()'));
   });
 
-  // 14: the CDP socket close handler drops client bindings and releases tabs
-  // (the indirect convergence relied on after resetAll()).
-  it('CDP websocket close clears client bindings and releases its tabs', () => {
+  // 14: the CDP socket close handler drops connection bindings ONLY. Tab
+  // ownership is session-scoped and must survive a reconnect: the executor's
+  // stale-context recovery closes the socket and reconnects immediately, and
+  // releasing tabs here made strict visibility hide the tab from the new
+  // client ("No targets attached" on every recovery retry).
+  it('CDP websocket close clears client bindings but never releases tabs', () => {
     const idx = relaySource.indexOf('log(`CDP WebSocket disconnected');
-    const body = relaySource.slice(idx, idx + 700);
+    const body = relaySource.slice(idx, idx + 900);
     assert.ok(body.includes('pwClientToSession.delete(clientId)'), 'clears client→session');
     assert.ok(body.includes('sessionToClientId.delete(sid)'), 'clears session→client');
-    assert.ok(body.includes('releaseAllTabs(sid)'), 'releases the client tabs');
+    assert.ok(!body.includes('releaseAllTabs('), 'ownership must survive CDP reconnects');
   });
 
-  // 15: only the registry-assert branch is process-wide; it uses resetAll.
-  it('registry-assert recovery is process-wide and resets all executors', () => {
+  // 15: registry-assert recovery never tears down the bridge; a full executor
+  // reset happens only for rate-limited assert bursts. Bridge teardown here
+  // used to amplify one dropped Playwright message into a full disconnect
+  // storm (detach broadcast → every page closed → resync → re-assert loop).
+  it('registry-assert recovery is rate-limited and never resets bridge state', () => {
     const idx = relaySource.indexOf('function handleRecoverableProcessError');
     const body = relaySource.slice(idx, relaySource.indexOf('\nfunction ', idx + 1));
     assert.ok(body.includes('isPlaywrightTargetRegistryAssert(reason)'), 'classifies registry asserts');
-    assert.ok(body.includes('resetBridgeState('), 'resets bridge state');
-    assert.ok(body.includes('relayExecutorManager.resetAll()'), 'resets all executors');
+    assert.ok(body.includes('isDuplicateFrameAttachAssert(reason)'), 'benign frameAttached duplicates bypass escalation');
+    assert.ok(body.indexOf('isDuplicateFrameAttachAssert') < body.indexOf('shouldEscalateAssertRecovery'), 'bypass is checked before the burst counter');
+    assert.ok(body.includes('shouldEscalateAssertRecovery()'), 'escalation is rate-limited');
+    assert.ok(body.includes('relayExecutorManager.resetAll()'), 'burst recovery resets executors');
+    assert.ok(!body.includes('resetBridgeState('), 'assert recovery must not tear down the bridge');
   });
 });
 
@@ -2082,9 +2206,12 @@ describe('FP1/FP5 behavioral E2E (real relay over WS)', () => {
     });
   });
 
-  // A CDP client dropping (Playwright disconnect) releases the tabs it owned, so
-  // other clients are notified and can take over (FP4 close-handler convergence).
-  it('a CDP client disconnect releases its owned tabs', async () => {
+  // A CDP client dropping (Playwright disconnect/reconnect) must NOT release
+  // the session's tabs: the executor's stale-context recovery closes the socket
+  // and reconnects under the same session, and strict visibility would hide a
+  // released (unowned) tab from the new client ("No targets attached" on every
+  // recovery retry). Ownership is session-scoped, not connection-scoped.
+  it('a CDP client disconnect keeps the session tab claims', async () => {
     await withRelay(PORT_BASE + 6, async ({ port, openWs }) => {
       const owner = await openWs(`ws://127.0.0.1:${port}/cdp/pw-dc?session=sess-dc`);
       const observer = await openWs(`ws://127.0.0.1:${port}/cdp/pw-ob?session=sess-ob`);
@@ -2093,8 +2220,13 @@ describe('FP1/FP5 behavioral E2E (real relay over WS)', () => {
       assert.equal((await claimVia(port, 900, 'sess-ob')).status, 409, 'tab owned while the client is connected');
 
       owner.close();
-      await waitUntil(() => om.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 900), 'release broadcast on disconnect', () => om.map(m => m.method).join(','));
-      assert.equal((await claimVia(port, 900, 'sess-ob')).status, 200, 'tab is claimable after the owner disconnects');
+      await new Promise(r => setTimeout(r, 500));
+      assert.ok(
+        !om.some(m => m.method === 'Target.tabReleased' && m.params?.tabId === 900),
+        'no release broadcast on disconnect',
+      );
+      assert.equal((await claimVia(port, 900, 'sess-ob')).status, 409, 'claim survives the owner reconnect window');
+      assert.equal((await claimVia(port, 900, 'sess-dc')).status, 200, 'the owning session itself can still re-claim');
     });
   });
 

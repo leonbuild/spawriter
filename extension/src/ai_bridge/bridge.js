@@ -745,18 +745,23 @@ import {
     ]);
 
     const sessionId = `spawriter-tab-${tabId}-${Date.now()}`;
-    let mainFrameId = sessionId;
+    // Mint the Playwright targetId once per attach and persist it with the
+    // entry: the debugger session survives cross-process navigations, but the
+    // main frame id does not (prerender activation / BFCache swaps mint a new
+    // one), so a re-read id would announce the same live page as a "new"
+    // target and churn Playwright's registry into duplicate-target asserts.
+    let targetId = sessionId;
     try {
       const frameTree = await chrome.debugger.sendCommand(
         { tabId },
         "Page.getFrameTree"
       );
-      mainFrameId = frameTree?.frameTree?.frame?.id || sessionId;
+      targetId = frameTree?.frameTree?.frame?.id || sessionId;
     } catch (e) {
       warn(`attachTab: failed to get frame tree for tab ${tabId}:`, e?.message);
     }
     const targetInfo = {
-      targetId: mainFrameId,
+      targetId,
       type: "page",
       tabId,
       title: tab?.title || "",
@@ -765,6 +770,7 @@ import {
 
     attachedTabs.set(tabId, {
       sessionId,
+      targetId,
       attachedAt: Date.now(),
     });
     persistState();
@@ -860,16 +866,23 @@ import {
           log(`resyncAttachedTabs: new entry for tab ${tabId} with sessionId ${sessionId}`);
         }
 
-        // Re-announce to relay (may be a new relay after reconnect)
-        let mainFrameId = existing.sessionId;
-        try {
-          const frameTree = await chrome.debugger.sendCommand(
-            { tabId },
-            "Page.getFrameTree"
-          );
-          mainFrameId = frameTree?.frameTree?.frame?.id || existing.sessionId;
-        } catch (e) {
-          warn(`resyncAttachedTabs: failed to get frame tree for tab ${tabId}:`, e?.message);
+        // Re-announce to relay (may be a new relay after reconnect). The
+        // targetId is minted once per attach and reused verbatim: re-reading
+        // the frame tree here would pick up a new main frame id after a
+        // cross-process navigation and announce the same live session as a
+        // different target — the churn that trips Playwright's
+        // duplicate-target assert. Mint only for entries that have none yet.
+        if (!existing.targetId) {
+          existing.targetId = existing.sessionId;
+          try {
+            const frameTree = await chrome.debugger.sendCommand(
+              { tabId },
+              "Page.getFrameTree"
+            );
+            existing.targetId = frameTree?.frameTree?.frame?.id || existing.sessionId;
+          } catch (e) {
+            warn(`resyncAttachedTabs: failed to get frame tree for tab ${tabId}:`, e?.message);
+          }
         }
 
         let tab;
@@ -885,7 +898,7 @@ import {
             params: {
               sessionId: existing.sessionId,
               targetInfo: {
-                targetId: mainFrameId,
+                targetId: existing.targetId,
                 type: "page",
                 tabId,
                 title: tab?.title || target.title || "",

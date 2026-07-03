@@ -82,12 +82,15 @@ export function isRecoverablePlaywrightDialogRace(reason: unknown): boolean {
   return text.includes('Page.handleJavaScriptDialog') && text.includes('No dialog is showing');
 }
 
-// Playwright's CRBrowser hard-asserts when its page registry sees an attach for
-// a targetId it already knows (or similar registry corruption). That rejection
-// fires inside playwright-core's event handler — no executor call site can catch
-// it. It only poisons the in-process Playwright connections, never the relay's
-// own state, so the correct blast radius is "reset the executors", not "kill
-// the relay" (which would tear down the extension bridge and every CLI session).
+// Playwright asserts inside playwright-core event dispatch (CRBrowser's
+// "Duplicate target", CRSession's stale-response "Assertion error") reject as
+// unhandledRejection — no executor call site can catch them. Each one only
+// drops the offending event/response inside a single in-process Playwright
+// connection: the waiting caller times out and that executor reconnects on
+// its own. Relay-side state (attachedTargets, ownership) is never touched, so
+// recovery is log-only; tearing down the bridge here used to amplify one
+// dropped message into a full disconnect storm (detach broadcast → every
+// page closed → resync → re-assert loop).
 export function isPlaywrightTargetRegistryAssert(reason: unknown): boolean {
   const text = reason instanceof Error
     ? `${reason.name}: ${reason.message}\n${reason.stack ?? ''}`
@@ -96,25 +99,57 @@ export function isPlaywrightTargetRegistryAssert(reason: unknown): boolean {
   return text.includes('Assertion error') && /[\\/]chromium[\\/]cr(?:Browser|Connection|ServiceWorker|Page)/.test(text);
 }
 
+// Duplicate Page.frameAttached delivered to a freshly attached page session:
+// the bridge cannot pause a live tab the way waitForDebuggerOnStart does, so
+// Playwright's Page.getFrameTree init snapshot races the live frame events.
+// The event is a pure duplicate — the frame is already registered, Playwright
+// state stays correct — so dropping it is lossless and must never count
+// toward assert escalation (escalating here killed healthy executes).
+export function isDuplicateFrameAttachAssert(reason: unknown): boolean {
+  const text = reason instanceof Error
+    ? `${reason.name}: ${reason.message}\n${reason.stack ?? ''}`
+    : String(reason);
+  return text.includes('Assertion error')
+    && text.includes('frameAttached')
+    && /[\\/]frames\.js/.test(text);
+}
+
+const ASSERT_ESCALATION_WINDOW_MS = 30_000;
+const ASSERT_ESCALATION_THRESHOLD = 3;
+const recentAssertTimes: number[] = [];
+
+// A lone assert heals itself (see above). A burst means a Playwright
+// connection is poisoned and re-asserting on every dispatch — only then drop
+// the executors so fresh connections are built. Never reset bridge state:
+// the extension-side target graph is still valid.
+export function shouldEscalateAssertRecovery(now = Date.now()): boolean {
+  while (recentAssertTimes.length && now - recentAssertTimes[0] > ASSERT_ESCALATION_WINDOW_MS) {
+    recentAssertTimes.shift();
+  }
+  recentAssertTimes.push(now);
+  if (recentAssertTimes.length < ASSERT_ESCALATION_THRESHOLD) return false;
+  recentAssertTimes.length = 0;
+  return true;
+}
+
 function handleRecoverableProcessError(reason: unknown, origin: string): boolean {
   if (isRecoverablePlaywrightDialogRace(reason)) {
     error(`Recovered Playwright dialog race (${origin}):`, reason);
     return true;
   }
   if (isPlaywrightTargetRegistryAssert(reason)) {
-    error(`Playwright target-registry assert (${origin}); resetting bridge state and executors:`, reason);
-    // The registry is already inconsistent, so a session-local reset is not
-    // enough: clear the whole target graph and drop all executors. This is
-    // process-wide on purpose; ordinary command errors must stay session-local.
-    // No extension command re-announces targets on demand, so ownership is
-    // synced empty and the next connect/execute re-attaches via
-    // connectTabByMatch; if targets do not reappear, `spawriter relay --replace`
-    // forces a clean re-attach.
-    resetBridgeState('target-registry-assert');
-    void relayExecutorManager.resetAll().catch((e) => {
-      error('Executor reset after target-registry assert failed:', e);
-    });
-    sendOwnershipSnapshotToExtension('assert-recovery');
+    const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    const census = `clients=[${[...cdpClients.keys()].join(', ')}]`;
+    if (isDuplicateFrameAttachAssert(reason)) {
+      error(`Playwright duplicate frameAttached dropped (${origin}); ${census}:`, detail);
+    } else if (shouldEscalateAssertRecovery()) {
+      error(`Playwright target-registry assert (${origin}); repeated asserts, resetting executors; ${census}:`, detail);
+      void relayExecutorManager.resetAll().catch((e) => {
+        error('Executor reset after target-registry assert failed:', e);
+      });
+    } else {
+      error(`Playwright target-registry assert (${origin}); event dropped, executor self-recovery handles it; ${census}:`, detail);
+    }
     return true;
   }
   return false;
@@ -1012,6 +1047,11 @@ function handleServerCdpCommand(
       const target = targetById ?? targetBySession ?? Array.from(attachedTargets.values()).find(visible);
 
       if (!target || !visible(target)) {
+        const owners = [...tabOwners.entries()].map(([t, o]) => `${t}:${o.sessionId}`).join(', ');
+        error(
+          `getTargetInfo denied for client ${clientId}: targets=${attachedTargets.size}, ` +
+          `bound=${boundSessionId ?? '(unbound)'}, owners=[${owners}], requestedTargetId=${requestedTargetId ?? '-'}`,
+        );
         sendCdpError(clientId, { id, sessionId, error: 'No targets attached' });
         return true;
       }
@@ -1168,26 +1208,39 @@ function handleExtensionMessage(data: Buffer) {
       if (method === 'Target.attachedToTarget' && sessionId) {
         const targetInfo = (params as { targetInfo?: TargetInfo }).targetInfo;
         const incomingTabId = targetInfo?.tabId;
-        if (incomingTabId !== undefined) {
-          for (const [existingSessionId, existing] of attachedTargets) {
-            if (existing.tabId === incomingTabId && existingSessionId !== sessionId) {
-              log(`Replacing stale target for tabId ${incomingTabId}: ${existingSessionId} → ${sessionId}`);
-              // Enrich with targetId or Playwright cannot resolve which page
-              // died and keeps it registered — the next attach for the same
-              // frame then hits CRBrowser's "Duplicate target" assert.
-              const staleTargetId = buildTargetInfo(existing).targetId;
-              attachedTargets.delete(existingSessionId);
-              // Ownership is keyed by tabId: a CDP-session swap on the SAME tab
-              // (debugger re-attach / cross-process nav) keeps the owner. Only
-              // detach the stale CDP target so Playwright unregisters the dead
-              // page; releasing the tab here would strand the owner, because
-              // strict visibility then hides the replacement target from them.
-              broadcastToCDPClients({
-                method: 'Target.detachedFromTarget',
-                params: { sessionId: existingSessionId, targetId: staleTargetId, reason: 'target-replaced' },
-              });
-              clearAnnouncedTarget(existingSessionId);
-            }
+        // The extension's own announces always carry params.sessionId equal to
+        // the envelope sessionId. A mismatch is a child-target attach
+        // (OOPIF/worker) the browser auto-attached inside the tab's debugger
+        // session and the extension forwarded verbatim — Turnstile challenge
+        // iframes churn these constantly. Treating one as a tab announce
+        // would overwrite the tab's registry entry with the child's
+        // targetInfo and broadcast a false 'target-id-changed' detach, making
+        // Playwright close the live page mid-execute. Drop it: forwarding the
+        // attach would only make Playwright build a dead child session that
+        // the extension cannot command (chrome.debugger routes by tabId).
+        const innerSessionId = (params as { sessionId?: string }).sessionId;
+        if (innerSessionId !== undefined && innerSessionId !== sessionId) {
+          log(`Ignoring child-target attach in session ${sessionId}: ${targetInfo?.type ?? '?'} ${targetInfo?.url ?? ''}`);
+          return;
+        }
+        for (const [existingSessionId, existing] of attachedTargets) {
+          if (existing.tabId === incomingTabId && existingSessionId !== sessionId) {
+            log(`Replacing stale target for tabId ${incomingTabId}: ${existingSessionId} → ${sessionId}`);
+            // Enrich with targetId or Playwright cannot resolve which page
+            // died and keeps it registered — the next attach for the same
+            // frame then hits CRBrowser's "Duplicate target" assert.
+            const staleTargetId = buildTargetInfo(existing).targetId;
+            attachedTargets.delete(existingSessionId);
+            // Ownership is keyed by tabId: a CDP-session swap on the SAME tab
+            // (debugger re-attach / cross-process nav) keeps the owner. Only
+            // detach the stale CDP target so Playwright unregisters the dead
+            // page; releasing the tab here would strand the owner, because
+            // strict visibility then hides the replacement target from them.
+            broadcastToCDPClients({
+              method: 'Target.detachedFromTarget',
+              params: { sessionId: existingSessionId, targetId: staleTargetId, reason: 'target-replaced' },
+            });
+            clearAnnouncedTarget(existingSessionId);
           }
         }
         // Same-session re-announce (extension resync after reconnect): if the
@@ -1253,6 +1306,12 @@ function handleExtensionMessage(data: Buffer) {
 
       if (method === 'Target.detachedFromTarget') {
         const detachedSessionId = (params as { sessionId?: string }).sessionId;
+        // Mirror of the child-target attach drop above: the extension's own
+        // detaches carry params.sessionId equal to the envelope sessionId; a
+        // mismatch is forwarded child-target churn, not a tab detach.
+        if (sessionId && detachedSessionId && detachedSessionId !== sessionId) {
+          return;
+        }
         let detachedTargetId: string | undefined;
         if (detachedSessionId) {
           const detachedTarget = attachedTargets.get(detachedSessionId);
@@ -2039,11 +2098,14 @@ export async function startRelayServer(): Promise<void> {
         if (current?.ws === ws) {
           cdpClients.delete(clientId);
           pwClientToSession.delete(clientId);
+          // Only drop the connection binding. Tab ownership is session-scoped
+          // state and must survive a CDP reconnect: the executor's stale-context
+          // recovery closes this socket and immediately reconnects, and strict
+          // visibility would hide the (now unowned) tab from the new client.
+          // Abandoned claims are handled by explicit release/session-reset and
+          // the stale sweep, not by connection lifetime.
           for (const [sid, cid] of sessionToClientId) {
-            if (cid === clientId) {
-              releaseAllTabs(sid);
-              sessionToClientId.delete(sid);
-            }
+            if (cid === clientId) sessionToClientId.delete(sid);
           }
         }
         for (const [requestId, pending] of pendingRequests.entries()) {
