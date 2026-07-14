@@ -1,10 +1,10 @@
-# spawriter CLI Agent Guide
+# spawriter CLI Guide for AI Agents
 
 spawriter provides the full Playwright browser automation capabilities for the user's real, visible Chrome browser. It can navigate, click, type, upload files, inspect content, capture screenshots, observe network and console activity, and follow the same end-to-end flows a user would perform.
 
 It also extends Playwright with single-spa microfrontend tooling. You can override an individual microfrontend with a local or specified build inside the real host application, then inspect and verify the integrated page with the surrounding applications still running. This makes it possible to evaluate the overall experience after an override, not just the microfrontend in isolation.
 
-Proactively use spawriter whenever browser context would improve the work. Do not wait to be asked when inspecting, reproducing, or verifying the visible page is useful.
+Use spawriter proactively when browser context materially improves inspection, reproduction, or verification. Do not use it for purely backend, algorithmic, documentation-only, or configuration tasks unless browser verification is relevant.
 
 ## Quick Start
 
@@ -16,13 +16,13 @@ spawriter -s sw-abc123 -e 'page.url()'
 
 **Why single quotes?** In bash, always wrap `-e` code in single quotes (`'...'`) to prevent the shell from interpreting `$`, backticks, and other special characters. Use double quotes or backtick template literals for strings inside the JS code.
 
-**Windows (PowerShell/CMD):** quoting rules differ and inner double quotes are often mangled. Prefer stdin or a file instead of inline `-e`:
+**Windows:** quoting rules differ from bash. Prefer stdin or a file instead of inline `-e`.
 
 ```powershell
-# stdin: no shell quoting issues at all
+# Single quotes preserve the JavaScript exactly; do not backslash-escape inner double quotes.
 'await navigate("https://example.com")' | spawriter -s sw-abc123 -e -
 
-# or write the code to a file and run it
+# Or write the code to a file and run it.
 spawriter -s sw-abc123 -f script.js
 ```
 
@@ -78,7 +78,7 @@ After binding, `-e` commands work normally.
 
 ## VM Globals Reference
 
-All globals are injected into the Playwright VM sandbox. Playwright native operations (`page.goto()`, `page.click()`, etc.) are used directly — no wrappers needed.
+All globals are injected into the Playwright VM sandbox, and native Playwright APIs remain available. Through the relay, prefer `navigate()`, `ensureFreshRender()`, and `screenshot()` for navigation, reloads, and screenshots because they include relay-safe fallbacks.
 
 | Global | Description |
 |--------|-------------|
@@ -304,7 +304,7 @@ spawriter -s sw-1 -e 'page.url()'
 1. Only operate on normal web pages — never `chrome://` or extension pages
 2. Never use `/connect-active-tab` or bind arbitrary active/existing Chrome tabs. Only use your owned tab, a blue-dot idle spawriter tab, or a newly created tab.
 3. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("delete_cookie"/"clear_storage")` or `clearCacheAndReload({ clear })` — they always target the current tab's origin; origin overrides are rejected.**
-4. Screenshot between major actions for verification
+4. Verify major state transitions; prefer `snapshot()` for structural checks and use `screenshot()` when visual confirmation matters
 5. Don't assume code changes are live — verify with `screenshot()` or `snapshot()`
 6. Mock rules persist until disabled — always clean up with `networkIntercept.disable()`
 
@@ -317,7 +317,7 @@ spawriter -s sw-1 -e 'page.url()'
 
 ## Troubleshooting
 
-Do not ask the user for help — recover autonomously using this table:
+Attempt these recovery steps before asking the user. Ask for user action only when authentication, permissions, extension setup, or another user-controlled prerequisite blocks progress:
 
 | Symptom | Recovery |
 |---------|----------|

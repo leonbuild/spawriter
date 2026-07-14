@@ -1,10 +1,10 @@
-# spawriter MCP Tools
+# spawriter MCP Guide for AI Agents
 
 spawriter provides the full Playwright browser automation capabilities for the user's **real, visible Chrome browser** through CDP. It can navigate, click, type, upload files, inspect content, capture screenshots, observe network and console activity, and follow the same end-to-end flows a user would perform. It is not headless; all actions affect the visible browser.
 
 spawriter also extends Playwright with single-spa microfrontend tooling. You can override an individual microfrontend with a local or specified build inside the real host application, then inspect and verify the integrated page with the surrounding applications still running. This makes it possible to evaluate the overall experience after an override, not just the microfrontend in isolation.
 
-**Proactively use these tools whenever browser context would improve your work.** Don't wait to be asked — if seeing, reproducing, or verifying the page helps, just do it. Tool parameters are self-documented via MCP tool definitions; this file covers behavioral guidance and non-obvious details.
+Use these tools proactively when browser context materially improves inspection, reproduction, or verification. Do not use them for purely backend, algorithmic, documentation-only, or configuration tasks unless browser verification is relevant. Tool parameters are self-documented via MCP tool definitions; this file covers behavioral guidance and non-obvious details.
 
 ## Tool Catalog (4 tools)
 
@@ -91,14 +91,14 @@ After any UI code change, automatically:
 1. Only operate on normal web pages — never `chrome://` or extension pages
 2. Never use `/connect-active-tab`, the user's active/current tab, or arbitrary existing Chrome tabs
 3. Verify state via `single_spa { action: "status" }` / `execute`, not static assumptions
-4. Screenshot between major actions
+4. Verify major state transitions; prefer `snapshot()` for structural checks and use screenshots when visual confirmation matters
 5. Don't assume code changes are live — confirm visually
 6. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("delete_cookie"/"clear_storage")` or `clearCacheAndReload({ clear })` — they always target the current page origin; origin overrides are rejected.**
 7. Mock rules persist until disabled — always clean up
 
 ## Troubleshooting
 
-Do not ask the user for help — recover autonomously using this table:
+Attempt these recovery steps before asking the user. Ask for user action only when authentication, permissions, extension setup, or another user-controlled prerequisite blocks progress:
 
 | Symptom | Recovery |
 |---------|----------|

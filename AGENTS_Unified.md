@@ -4,7 +4,7 @@ spawriter provides the full Playwright browser automation capabilities for the u
 
 spawriter also extends Playwright with single-spa microfrontend tooling. You can override an individual microfrontend with a local or specified build inside the real host application, then inspect and verify the integrated page with the surrounding applications still running. This makes it possible to evaluate the overall experience after an override, not just the microfrontend in isolation.
 
-Proactively use spawriter whenever browser context would improve the work. Do not wait to be asked when inspecting, reproducing, or verifying the visible page is useful.
+Use spawriter proactively when browser context materially improves inspection, reproduction, or verification. Do not use it for purely backend, algorithmic, documentation-only, or configuration tasks unless browser verification is relevant.
 
 ## Transport Priority
 
@@ -45,7 +45,7 @@ spawriter session new
 spawriter -s sw-abc123 -e 'page.url()'
 ```
 
-In bash, always wrap `-e` code in single quotes (`'...'`) so the shell does not interpret `$`, backticks, or other JavaScript syntax. Use double quotes or template literals for strings inside the JavaScript code. On Windows (PowerShell/CMD), prefer stdin (`-e -`) or a file (`-f <path>`) instead of inline `-e` to avoid shell quoting issues.
+In bash, always wrap `-e` code in single quotes (`'...'`) so the shell does not interpret `$`, backticks, or other JavaScript syntax. Use double quotes or template literals for strings inside the JavaScript code. On Windows, prefer stdin (`-e -`) or a file (`-f <path>`) instead of inline `-e`. In PowerShell, single-quoted pipeline input preserves inner double quotes without backslash escaping; in CMD, prefer `-f <path>` to avoid quoting and pipe-escaping issues.
 
 ### CLI Session Commands
 
@@ -329,13 +329,13 @@ await getReactComponentInfo(5)               // + props and component hierarchy
 1. Operate only on normal web pages, never `chrome://` or extension pages.
 2. Never use `/connect-active-tab`, the user's active tab, or arbitrary existing Chrome tabs.
 3. Cache, cookie, and storage clearing is always scoped to the current origin; browser-wide clears are functionally blocked (`context.clearCookies()`, `Network.clearBrowserCookies`, etc. return errors).
-4. Capture a screenshot between major actions.
+4. Verify major state transitions; prefer `snapshot()` for structural checks and use screenshots when visual confirmation matters.
 5. Verify visible state instead of relying on static assumptions.
 6. Disable all network mock rules when finished.
 
 ## Troubleshooting
 
-Recover autonomously before asking the user for help:
+Attempt recovery before asking the user. Ask for user action only when authentication, permissions, extension setup, or another user-controlled prerequisite blocks progress:
 
 | Symptom | MCP recovery | CLI recovery |
 |---------|--------------|--------------|
