@@ -123,8 +123,8 @@ export default function Apps(props) {
       const link = document.createElement('a');
       link.href = url;
       const filename = siteHost
-        ? `single-spa-overrides_${siteHost}.json`
-        : 'single-spa-overrides.json';
+        ? `spawriter-overrides_${siteHost}.json`
+        : 'spawriter-overrides.json';
       link.download = filename;
       link.click();
       URL.revokeObjectURL(url);
