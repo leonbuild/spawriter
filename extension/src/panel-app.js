@@ -291,8 +291,8 @@ function PanelRoot(props) {
         ) : (
           <p>
             Loading... if you see this message for a long time, either single-spa is
-            not on the page or you are not running a version of single-spa that
-            supports developer tools
+            not on the page or you are not running a version that supports
+            developer tools
           </p>
         )}
         <button

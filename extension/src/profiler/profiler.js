@@ -128,7 +128,7 @@ export default function Profiler() {
           </div>
         </div>
         <div className="actions">
-          <a href={csvUrl()} download="single-spa-profiling.csv">
+          <a href={csvUrl()} download="spawriter-profiling.csv">
             Download Report
           </a>
           <Button onClick={() => setGetEvents(!getEvents)}>Refresh</Button>
@@ -159,7 +159,7 @@ export default function Profiler() {
         </tbody>
       </table>
       <p className="explanation">
-        The single-spa profiler shows how long microfrontends take to load,
+        The spawriter profiler shows how long microfrontends take to load,
         mount, unmount, etc. The timestamps come from{" "}
         <a
           target="_blank"
