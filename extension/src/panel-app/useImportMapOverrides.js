@@ -109,6 +109,11 @@ function isMissingImportMapOverrides(err) {
   );
 }
 
+// Origin-scoped storage key. Falls back to global key if origin unknown.
+function makeStorageKey(origin) {
+  return origin ? `savedOverrides:${origin}` : "savedOverrides";
+}
+
 export default function useImportMapOverrides() {
   const [importMapsEnabled, setImportMapEnabled] = useState(false);
   const [overrides, setOverrides] = useState({});
@@ -131,6 +136,8 @@ export default function useImportMapOverrides() {
   // savedOverrides 的最新值引用，供 polling 读取（避免将 savedOverrides 放入 dependency array）
   const savedOverridesRef = useRef(savedOverrides);
   savedOverridesRef.current = savedOverrides;
+  // Origin of the inspected page, used as storage key scope
+  const originRef = useRef(null);
 
   if (appError) {
     throw appError;
@@ -438,13 +445,14 @@ export default function useImportMapOverrides() {
 
   // ========== 新增方法: Storage 操作 ==========
 
-  // 从 browser.storage.local 加载已保存的 overrides
+  // 从 browser.storage.local 加载已保存的 overrides（origin-scoped）
   const loadSavedOverrides = useCallback(async () => {
     try {
-      const result = await browser.storage.local.get("savedOverrides");
-      if (result.savedOverrides) {
-        setSavedOverrides(result.savedOverrides);
-        return result.savedOverrides;
+      const key = makeStorageKey(originRef.current);
+      const result = await browser.storage.local.get(key);
+      if (result[key]) {
+        setSavedOverrides(result[key]);
+        return result[key];
       }
       return {};
     } catch (err) {
@@ -469,7 +477,7 @@ export default function useImportMapOverrides() {
         ...savedOverrides,
         [appName]: { url, enabled: true }
       };
-      await browser.storage.local.set({ savedOverrides: newSavedOverrides });
+      await browser.storage.local.set({ [makeStorageKey(originRef.current)]: newSavedOverrides });
       setSavedOverrides(newSavedOverrides);
       
       // 检查这是否仍是最新操作
@@ -530,7 +538,7 @@ export default function useImportMapOverrides() {
         ...savedOverrides,
         [appName]: { ...saved, enabled }
       };
-      await browser.storage.local.set({ savedOverrides: newSavedOverrides });
+      await browser.storage.local.set({ [makeStorageKey(originRef.current)]: newSavedOverrides });
       setSavedOverrides(newSavedOverrides);
 
       // 检查这是否仍是最新操作
@@ -594,7 +602,7 @@ export default function useImportMapOverrides() {
     try {
       const newSavedOverrides = { ...savedOverrides };
       delete newSavedOverrides[appName];
-      await browser.storage.local.set({ savedOverrides: newSavedOverrides });
+      await browser.storage.local.set({ [makeStorageKey(originRef.current)]: newSavedOverrides });
       setSavedOverrides(newSavedOverrides);
       
       // 检查这是否仍是最新操作
@@ -662,7 +670,7 @@ export default function useImportMapOverrides() {
       }
 
       // 清空扩展的 storage
-      await browser.storage.local.set({ savedOverrides: {} });
+      await browser.storage.local.set({ [makeStorageKey(originRef.current)]: {} });
       setSavedOverrides({});
       
       // 使用 bypassCache 刷新页面，确保加载原版资源
@@ -713,7 +721,7 @@ export default function useImportMapOverrides() {
       }
 
       if (hasNewOverrides) {
-        await browser.storage.local.set({ savedOverrides: merged });
+        await browser.storage.local.set({ [makeStorageKey(originRef.current)]: merged });
         setSavedOverrides(merged);
         console.debug("[spawriter] Synced page overrides into savedOverrides on init");
         return merged;
@@ -726,13 +734,49 @@ export default function useImportMapOverrides() {
     }
   }
 
+  // Migrate old global "savedOverrides" key to origin-scoped key (one-time)
+  async function migrateGlobalOverrides(origin) {
+    try {
+      const key = makeStorageKey(origin);
+      const [globalResult, scopedResult] = await Promise.all([
+        browser.storage.local.get("savedOverrides"),
+        browser.storage.local.get(key)
+      ]);
+      // Only migrate if scoped key is empty and global key has data
+      if (!scopedResult[key] && globalResult.savedOverrides && Object.keys(globalResult.savedOverrides).length > 0) {
+        console.debug(`[spawriter] Migrating global savedOverrides to ${key}`);
+        await browser.storage.local.set({ [key]: globalResult.savedOverrides });
+        await browser.storage.local.remove("savedOverrides");
+        return globalResult.savedOverrides;
+      }
+    } catch (err) {
+      console.warn("[spawriter] Migration error:", err);
+    }
+    return null;
+  }
+
   // 初始化时加载 importMapOverrides 和已保存的配置
   useEffect(() => {
     async function initImportMapsOverrides() {
+      // Resolve origin of the inspected page
+      try {
+        const origin = await evalCmd("window.location.origin");
+        originRef.current = origin || null;
+      } catch (err) {
+        console.warn("[spawriter] Could not get page origin:", err?.message);
+      }
+
       const hasImportMapsEnabled = await checkImportMapOverrides();
       if (hasImportMapsEnabled) {
         setImportMapEnabled(hasImportMapsEnabled);
         await getImportMapOverrides();
+        // One-time migration from global key
+        if (originRef.current) {
+          const migrated = await migrateGlobalOverrides(originRef.current);
+          if (migrated) {
+            setSavedOverrides(migrated);
+          }
+        }
         let saved = await loadSavedOverrides();
         saved = await importPageOverridesIfNeeded(saved);
         await ensureSavedOverridesApplied("init", saved);
@@ -809,7 +853,7 @@ export default function useImportMapOverrides() {
 
         if (hasChanges && !cancelled) {
           console.debug("[spawriter] External override change detected, syncing savedOverrides");
-          await browser.storage.local.set({ savedOverrides: newSavedOverrides });
+          await browser.storage.local.set({ [makeStorageKey(originRef.current)]: newSavedOverrides });
           setSavedOverrides(newSavedOverrides);
         }
       } catch (err) {
@@ -837,6 +881,12 @@ export default function useImportMapOverrides() {
     setOverrides(newOverrides);
   };
 
+  // 直接写入 scoped storage（供外部组件在不经 saveOverride 流程时使用）
+  const writeScopedOverrides = useCallback(async (newOverrides) => {
+    await browser.storage.local.set({ [makeStorageKey(originRef.current)]: newOverrides });
+    setSavedOverrides(newOverrides);
+  }, []);
+
   // ========== 返回值 ==========
 
   return {
@@ -851,6 +901,7 @@ export default function useImportMapOverrides() {
     commitOverrides: batchSetOverrides,
     loadSavedOverrides,  // 暴露加载方法供外部使用
     ensureSavedOverridesApplied,  // 暴露应用方法供外部使用
+    writeScopedOverrides,  // 写入 origin-scoped storage
     // 新增：暴露状态和方法供外部使用
     isLoading,
     protocolError,

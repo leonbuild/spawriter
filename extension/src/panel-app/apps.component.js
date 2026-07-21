@@ -8,7 +8,7 @@ import { evalDevtoolsCmd, evalCmd } from "../inspected-window.helper.js";
 import useImportMapOverrides from "./useImportMapOverrides";
 import ToggleGroup from "./toggle-group";
 import ToggleOption from "./toggle-option";
-import browser from "webextension-polyfill";
+
 
 const OFF = "off",
   ON = "on",
@@ -210,11 +210,8 @@ export default function Apps(props) {
           ...newSavedOverrides
         };
 
-        // Save to storage
-        await browser.storage.local.set({ savedOverrides: mergedOverrides });
-        
-        // Immediately reload the savedOverrides state to show in UI
-        await importMaps.loadSavedOverrides();
+        // Save to origin-scoped storage
+        await importMaps.writeScopedOverrides(mergedOverrides);
         
         // Apply imported overrides to the page
         // Note: This will reload the page after applying overrides
@@ -304,8 +301,7 @@ export default function Apps(props) {
         ...importMaps.savedOverrides,
         [appName]: { url: url.trim(), enabled: false }
       };
-      await browser.storage.local.set({ savedOverrides: newSavedOverrides });
-      await importMaps.loadSavedOverrides();
+      await importMaps.writeScopedOverrides(newSavedOverrides);
     } else {
       await importMaps.clearSavedOverride(appName);
     }
