@@ -792,13 +792,25 @@ export default function useImportMapOverrides() {
   }, []);
 
   // 监听页面加载完成（包括手动刷新）后再校验一次
-  // 注意：在 Firefox devtools panel 中无法直接访问 browser.tabs API，
-  // 需要通过 background script 转发 tab-updated 事件
+  // 导航到不同 origin 时，切换 storage scope 并加载对应 overrides，
+  // 防止不同站点间串台。
   useEffect(() => {
     const tabId = browser.devtools.inspectedWindow.tabId;
-    const handler = (event) => {
+    const handler = async (event) => {
       const msg = event.detail;
-      if (msg?.type === "tab-updated" && msg.tabId === tabId) {
+      if (msg?.type !== "tab-updated" || msg.tabId !== tabId) return;
+
+      let newOrigin = null;
+      try {
+        newOrigin = await evalCmd("window.location.origin");
+      } catch { /* best-effort */ }
+
+      if (newOrigin && newOrigin !== originRef.current) {
+        console.debug(`[spawriter] Origin changed: ${originRef.current} → ${newOrigin}`);
+        originRef.current = newOrigin;
+        const saved = await loadSavedOverrides();
+        await ensureSavedOverridesApplied("origin-change", saved);
+      } else {
         ensureSavedOverridesApplied("tab-updated");
       }
     };
