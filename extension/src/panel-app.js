@@ -47,6 +47,9 @@ function PanelRoot(props) {
     try {
       const results = await evalDevtoolsCmd(`exposedMethods?.getRawAppData()`);
       if (isMountedRef.current && results) {
+        if (!Array.isArray(results)) {
+          throw new TypeError(`getRawAppData() expected array, got ${typeof results}`);
+        }
         setApps(results);
         setIsNavigating(false);
       }
