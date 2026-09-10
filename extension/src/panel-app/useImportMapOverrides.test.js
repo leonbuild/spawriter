@@ -15,6 +15,11 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
+// Replicate the scoped-package guard from useImportMapOverrides.js
+function isScopedPackage(appName) {
+  return typeof appName === 'string' && appName.startsWith('@') && appName.includes('/');
+}
+
 // Simulate the ref-based guard logic from useImportMapOverrides
 function createPollingGuard() {
   const state = {
@@ -54,6 +59,7 @@ function createPollingGuard() {
     const newSavedOverrides = { ...currentSaved };
 
     for (const appName of pageKeys) {
+      if (!isScopedPackage(appName)) continue;
       const pageUrl = pageMap[appName];
       const saved = currentSaved[appName];
       if (!saved || saved.url !== pageUrl) {
@@ -328,6 +334,59 @@ describe("Polling: external change detection logic", () => {
       url: "http://c",
       enabled: true,
     });
+  });
+});
+
+// ========== Scoped-package guard tests ==========
+
+describe("Scoped-package guard: only @org/name overrides are persisted", () => {
+  let guard;
+
+  beforeEach(() => {
+    guard = createPollingGuard();
+  });
+
+  it("bare package 'single-spa' on page is NOT imported", () => {
+    guard.state.savedOverrides = {};
+    const result = guard.simulatePoll({
+      "single-spa": "/js/single-spa.dev.js",
+      "@app/edit": "http://localhost:9130/app.js",
+    });
+    assert.equal(result.hasChanges, true);
+    assert.equal(guard.state.savedOverrides["single-spa"], undefined);
+    assert.deepEqual(guard.state.savedOverrides["@app/edit"], {
+      url: "http://localhost:9130/app.js",
+      enabled: true,
+    });
+  });
+
+  it("bare package with slash but no @ prefix is rejected", () => {
+    guard.state.savedOverrides = {};
+    const result = guard.simulatePoll({
+      "single-spa/single-spa.min.js": "/js/single-spa.dev.js",
+      "react-dom/client": "http://localhost/react.js",
+    });
+    assert.equal(result.hasChanges, false);
+  });
+
+  it("scoped packages (@org/name) are accepted", () => {
+    guard.state.savedOverrides = {};
+    const result = guard.simulatePoll({
+      "@journal/edit": "http://localhost:9130/app.js",
+      "@cnic/main": "http://localhost:9000/app.js",
+    });
+    assert.equal(result.hasChanges, true);
+    assert.equal(guard.state.savedOverrides["@journal/edit"].url, "http://localhost:9130/app.js");
+    assert.equal(guard.state.savedOverrides["@cnic/main"].url, "http://localhost:9000/app.js");
+  });
+
+  it("bare package names like 'lodash', 'react' are rejected", () => {
+    guard.state.savedOverrides = {};
+    const result = guard.simulatePoll({
+      "lodash": "http://localhost/lodash.js",
+      "react": "http://localhost/react.js",
+    });
+    assert.equal(result.hasChanges, false);
   });
 });
 

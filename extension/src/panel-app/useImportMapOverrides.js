@@ -109,6 +109,14 @@ function isMissingImportMapOverrides(err) {
   );
 }
 
+// Only scoped package names (@org/name) should be persisted as overrides.
+// Bare names like "single-spa" are base dependencies loaded before the
+// import map; overriding them breaks the entire host if the target file
+// is missing on the current server.
+function isScopedPackage(appName) {
+  return typeof appName === 'string' && appName.startsWith('@') && appName.includes('/');
+}
+
 // Origin-scoped storage key. Falls back to global key if origin unknown.
 function makeStorageKey(origin) {
   return origin ? `savedOverrides:${origin}` : "savedOverrides";
@@ -451,8 +459,21 @@ export default function useImportMapOverrides() {
       const key = makeStorageKey(originRef.current);
       const result = await browser.storage.local.get(key);
       if (result[key]) {
-        setSavedOverrides(result[key]);
-        return result[key];
+        // Purge any previously-saved blacklisted entries
+        let cleaned = false;
+        const data = { ...result[key] };
+        for (const appName of Object.keys(data)) {
+          if (!isScopedPackage(appName)) {
+            delete data[appName];
+            cleaned = true;
+            console.debug(`[spawriter] Purged blacklisted override from storage: ${appName}`);
+          }
+        }
+        if (cleaned) {
+          await browser.storage.local.set({ [key]: data });
+        }
+        setSavedOverrides(data);
+        return data;
       }
       return {};
     } catch (err) {
@@ -464,6 +485,10 @@ export default function useImportMapOverrides() {
 
   // 保存单个 override 到 storage，并应用到页面
   const saveOverride = useCallback(async (appName, url) => {
+    if (!isScopedPackage(appName)) {
+      console.warn(`[spawriter] Refusing to persist non-scoped override: ${appName}`);
+      return;
+    }
     try {
       internalOpActiveRef.current = true;
       // 递增全局操作版本号
@@ -712,6 +737,10 @@ export default function useImportMapOverrides() {
       const merged = { ...effectiveSaved };
 
       for (const appName of pageKeys) {
+        if (!isScopedPackage(appName)) {
+          console.debug(`[spawriter] Skipping non-scoped override on import: ${appName}`);
+          continue;
+        }
         const pageUrl = pageMap[appName];
         if (pageUrl && !effectiveSaved[appName]) {
           merged[appName] = { url: pageUrl, enabled: true };
@@ -845,6 +874,7 @@ export default function useImportMapOverrides() {
         const newSavedOverrides = { ...currentSaved };
 
         for (const appName of pageKeys) {
+          if (!isScopedPackage(appName)) continue;
           const pageUrl = pageMap[appName];
           const saved = currentSaved[appName];
           if (!saved || saved.url !== pageUrl) {
