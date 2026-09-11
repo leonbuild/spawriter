@@ -2691,6 +2691,10 @@ describe('app_action JS code generation', () => {
  * Simulates the override_app parameter validation and JS code generation
  * logic from mcp.ts without needing a live CDP session.
  */
+function isScopedPackage(name: string): boolean {
+  return name.startsWith('@') && name.includes('/');
+}
+
 function buildOverrideCode(
   action: string,
   appName?: string,
@@ -2699,6 +2703,7 @@ function buildOverrideCode(
   switch (action) {
     case 'set':
       if (!appName || !url) return { error: '"set" requires both appName and url' };
+      if (!isScopedPackage(appName)) return { error: `Refusing to override bare package "${appName}". Only scoped packages (@org/name) are allowed.` };
       return {
         code: `(function() {
               if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
@@ -2819,6 +2824,25 @@ describe('override_app parameter validation', () => {
     assert.ok(result.error);
     assert.ok(result.error!.includes('unknown action'));
     assert.ok(result.error!.includes('toggle'));
+  });
+
+  it('set: should reject bare package name (single-spa)', () => {
+    const result = buildOverrideCode('set', 'single-spa', '/js/single-spa.dev.js');
+    assert.ok(result.error);
+    assert.ok(result.error!.includes('bare package'));
+    assert.ok(result.error!.includes('single-spa'));
+  });
+
+  it('set: should reject bare package name (vue)', () => {
+    const result = buildOverrideCode('set', 'vue', 'http://localhost/vue.js');
+    assert.ok(result.error);
+    assert.ok(result.error!.includes('bare package'));
+  });
+
+  it('set: should accept scoped package name', () => {
+    const result = buildOverrideCode('set', '@journal/edit', 'http://localhost:9130/app.js');
+    assert.ok(!result.error);
+    assert.ok(result.code!.includes('@journal/edit'));
   });
 });
 

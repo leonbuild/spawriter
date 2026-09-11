@@ -48,11 +48,11 @@ describe('buildDashboardStateCode', () => {
 // buildOverrideCode
 // ---------------------------------------------------------------------------
 describe('buildOverrideCode', () => {
-  it('generates set code with appName and url', () => {
-    const { code, error } = buildOverrideCode('set', 'my-app', 'http://localhost:8080/app.js');
+  it('generates set code with scoped appName and url', () => {
+    const { code, error } = buildOverrideCode('set', '@org/app', 'http://localhost:8080/app.js');
     assert.ok(!error);
     assert.ok(code.includes('addOverride'));
-    assert.ok(code.includes('"my-app"'));
+    assert.ok(code.includes('@org/app'));
     assert.ok(code.includes('http://localhost:8080/app.js'));
   });
 
@@ -63,8 +63,27 @@ describe('buildOverrideCode', () => {
   });
 
   it('returns error for set without url', () => {
-    const { error } = buildOverrideCode('set', 'app', undefined);
+    const { error } = buildOverrideCode('set', '@org/app', undefined);
     assert.ok(error);
+  });
+
+  it('rejects set with bare package name', () => {
+    const { error } = buildOverrideCode('set', 'single-spa', '/js/single-spa.dev.js');
+    assert.ok(error);
+    assert.ok(error!.includes('bare package'));
+    assert.ok(error!.includes('single-spa'));
+  });
+
+  it('rejects set with unscoped name (no @)', () => {
+    const { error } = buildOverrideCode('set', 'my-app', 'http://localhost:8080/app.js');
+    assert.ok(error);
+    assert.ok(error!.includes('bare package'));
+  });
+
+  it('accepts set with scoped package (@org/name)', () => {
+    const { code, error } = buildOverrideCode('set', '@cnic/main', 'http://localhost:9100/app.js');
+    assert.ok(!error);
+    assert.ok(code.includes('@cnic/main'));
   });
 
   it('generates remove code', () => {

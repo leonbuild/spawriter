@@ -30,11 +30,20 @@ export function buildDashboardStateCode(appName?: string): string {
   })(${targetAppName})`;
 }
 
+// Bare names (e.g. "single-spa", "vue") are base dependencies loaded before
+// the import map; overriding them breaks the host if the target file is absent.
+function isScopedPackage(name: string): boolean {
+  return name.startsWith('@') && name.includes('/');
+}
+
 export function buildOverrideCode(action: string, appName?: string, url?: string): { code: string; error?: string } {
   switch (action) {
     case 'set':
       if (!appName || !url) {
         return { code: '', error: '"set" requires both appName and url' };
+      }
+      if (!isScopedPackage(appName)) {
+        return { code: '', error: `Refusing to override bare package "${appName}". Only scoped packages (@org/name) are allowed.` };
       }
       return { code: `(function() {
         if (!window.importMapOverrides) return JSON.stringify({ success: false, error: 'importMapOverrides not available' });
