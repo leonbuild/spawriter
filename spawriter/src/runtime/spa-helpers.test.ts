@@ -26,6 +26,9 @@ describe('buildDashboardStateCode', () => {
     assert.ok(code.includes('__SINGLE_SPA_DEVTOOLS__'));
     assert.ok(code.includes('importMapOverrides'));
     assert.ok(code.includes('(null)'));
+    assert.ok(code.includes('defaultImports'));
+    assert.ok(code.includes('entries'));
+    assert.ok(code.includes('getDefaultMap'));
   });
 
   it('generates code with appName', () => {
@@ -67,17 +70,16 @@ describe('buildOverrideCode', () => {
     assert.ok(error);
   });
 
-  it('rejects set with bare package name', () => {
-    const { error } = buildOverrideCode('set', 'single-spa', '/js/single-spa.dev.js');
-    assert.ok(error);
-    assert.ok(error!.includes('bare package'));
-    assert.ok(error!.includes('single-spa'));
+  it('accepts set with bare package name (no longer restricted)', () => {
+    const { code, error } = buildOverrideCode('set', 'single-spa', '/js/single-spa.dev.js');
+    assert.ok(!error);
+    assert.ok(code.includes('single-spa'));
   });
 
-  it('rejects set with unscoped name (no @)', () => {
-    const { error } = buildOverrideCode('set', 'my-app', 'http://localhost:8080/app.js');
-    assert.ok(error);
-    assert.ok(error!.includes('bare package'));
+  it('accepts set with unscoped name', () => {
+    const { code, error } = buildOverrideCode('set', 'my-app', 'http://localhost:8080/app.js');
+    assert.ok(!error);
+    assert.ok(code.includes('my-app'));
   });
 
   it('accepts set with scoped package (@org/name)', () => {
@@ -263,10 +265,17 @@ describe('buildOverrideVerifyCode', () => {
     assert.ok(code.includes('present'));
   });
 
-  it('wraps in IIFE returning JSON', () => {
+  it('wraps in async IIFE returning JSON', () => {
     const code = buildOverrideVerifyCode('@org/app');
-    assert.ok(code.trim().startsWith('(function()'));
+    assert.ok(code.trim().startsWith('(async function()'));
     assert.ok(code.includes('JSON.stringify'));
+  });
+
+  it('includes HTML fallback preflight check', () => {
+    const code = buildOverrideVerifyCode('@org/app');
+    assert.ok(code.includes('fetch'));
+    assert.ok(code.includes('text/html'));
+    assert.ok(code.includes('preflight'));
   });
 
   it('checks both importMapOverrides API and localStorage', () => {

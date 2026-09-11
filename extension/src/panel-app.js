@@ -3,6 +3,7 @@ import ReactDOM from "react-dom";
 import { evalDevtoolsCmd, ProtocolError } from "./inspected-window.helper";
 import browser from "webextension-polyfill";
 import Apps from "./panel-app/apps.component";
+import OverrideManager from "./panel-app/import-map/override-manager.component";
 import ErrorBoundary from "./panel-app/ErrorBoundary.component";
 import Profiler from "./profiler/profiler.js";
 import { Tabs, TabList, Tab, TabPanels, TabPanel } from "@reach/tabs";
@@ -358,7 +359,9 @@ function PanelRoot(props) {
 
         <TabPanels>
           <TabPanel>
-            <Apps apps={apps} theme={props.theme} />
+            <ErrorBoundary>
+              <OverrideManager apps={apps} theme={props.theme} />
+            </ErrorBoundary>
           </TabPanel>
           <TabPanel>
             <Profiler />
