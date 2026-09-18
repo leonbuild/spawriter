@@ -41,40 +41,47 @@ export async function readImportMapSnapshot() {
     const syncData = typeof syncRaw === "string" ? JSON.parse(syncRaw) : syncRaw;
     if (!syncData || syncData.available === false) return null;
 
-    // Phase 2: async getDefaultMap — store result in a page global, then read back
+    // Phase 2: async getDefaultMap — fire on page, poll result until available
     let defaultImports = {};
     let effectiveImports = {};
     if (syncData.hasGetDefaultMap) {
       try {
+        // Fire the async map calls; page-side code stores result in a global
         await evalCmd(`(function() {
           var imo = window.importMapOverrides;
+          delete window.__spawriter_mapResult;
           Promise.all([
             typeof imo.getDefaultMap === "function" ? imo.getDefaultMap() : Promise.resolve(null),
             typeof imo.getCurrentPageMap === "function" ? imo.getCurrentPageMap() : Promise.resolve(null)
           ]).then(function(results) {
-            window.__spawriter_defaultMap = results[0];
-            window.__spawriter_currentPageMap = results[1];
+            window.__spawriter_mapResult = JSON.stringify({
+              d: (results[0] && results[0].imports) || {},
+              e: (results[1] && results[1].imports) || {}
+            });
           }).catch(function() {
-            window.__spawriter_defaultMap = null;
-            window.__spawriter_currentPageMap = null;
+            window.__spawriter_mapResult = JSON.stringify({ d: {}, e: {} });
           });
-        })()`);
-        // Wait briefly for the promise to resolve
-        await new Promise((r) => setTimeout(r, 200));
-        const mapRaw = await evalCmd(`(function() {
-          var dm = window.__spawriter_defaultMap;
-          var cm = window.__spawriter_currentPageMap;
-          delete window.__spawriter_defaultMap;
-          delete window.__spawriter_currentPageMap;
-          return JSON.stringify({
-            defaultImports: (dm && dm.imports) || {},
-            effectiveImports: (cm && cm.imports) || {}
-          });
-        })()`);
+        })()`, { retries: 0 });
+
+        // Poll for the result string (retries: 0 to keep each poll fast)
+        const maxWait = 5000;
+        const interval = 80;
+        const start = Date.now();
+        let mapRaw = null;
+        while (Date.now() - start < maxWait) {
+          const raw = await evalCmd(`window.__spawriter_mapResult || ""`, { retries: 0 });
+          if (raw) {
+            mapRaw = raw;
+            evalCmd(`delete window.__spawriter_mapResult`, { retries: 0 }).catch(() => {});
+            break;
+          }
+          await new Promise((r) => setTimeout(r, interval));
+        }
+
         if (mapRaw) {
           const maps = typeof mapRaw === "string" ? JSON.parse(mapRaw) : mapRaw;
-          defaultImports = maps.defaultImports || {};
-          effectiveImports = maps.effectiveImports || {};
+          defaultImports = maps.d || {};
+          effectiveImports = maps.e || {};
         }
       } catch {
         // Fall through with empty defaults
