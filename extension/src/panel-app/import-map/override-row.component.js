@@ -7,7 +7,7 @@ import Button from "../button";
  * Displays import name, status badge, lifecycle actions (if registered),
  * toggle, URL editor, and save/edit buttons.
  */
-export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pending, error, registeredAppComponent, onHover, onLeave }) {
+export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pending, error, registeredAppComponent, showActions = true, onHover, onLeave }) {
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState("");
   const inputRef = useRef(null);
@@ -60,6 +60,9 @@ export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pend
   } else if (entry.registered && entry.lifecycleStatus) {
     statusText = entry.lifecycleStatus.replace(/_/g, " ");
     statusClass = `status-lifecycle status-${entry.lifecycleStatus.toLowerCase().replace(/_/g, "-")}`;
+  } else if (!entry.registered && entry.actualEnabled) {
+    statusText = "OVERRIDDEN";
+    statusClass = "status-overridden";
   }
 
   return (
@@ -69,9 +72,11 @@ export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pend
       <div role="cell" className="cell-status">
         {statusText ? <span className={`status-badge ${statusClass}`}>{statusText}</span> : null}
       </div>
-      <div role="cell" className="cell-actions">
-        {registeredAppComponent || <span className="no-actions">—</span>}
-      </div>
+      {showActions && (
+        <div role="cell" className="cell-actions">
+          {registeredAppComponent || <span className="no-actions">—</span>}
+        </div>
+      )}
       <div role="cell" className="cell-override">
         <div className="toggle-wrapper">
           <ToggleSwitch

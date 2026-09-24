@@ -217,6 +217,7 @@ export default function OverrideManager({ apps: registeredApps, theme }) {
           pendingByName={pendingByName}
           errorByName={errorByName}
           renderAppActions={null}
+          showActions={false}
           onRowHover={null}
           onRowLeave={null}
         />

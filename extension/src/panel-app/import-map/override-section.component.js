@@ -18,6 +18,7 @@ export default function OverrideSection({
   pendingByName,
   errorByName,
   renderAppActions,
+  showActions = true,
   onRowHover,
   onRowLeave,
 }) {
@@ -58,7 +59,7 @@ export default function OverrideSection({
           <div role="row" className="override-table-header">
             <span role="columnheader">Name</span>
             <span role="columnheader">Status</span>
-            <span role="columnheader">Actions</span>
+            {showActions && <span role="columnheader">Actions</span>}
             <span role="columnheader">Override</span>
           </div>
           {entries.map((entry) => (
@@ -70,6 +71,7 @@ export default function OverrideSection({
               onDelete={onDelete}
               pending={pendingByName[entry.name]}
               error={errorByName[entry.name]}
+              showActions={showActions}
               registeredAppComponent={
                 entry.registered && renderAppActions
                   ? renderAppActions(entry)
