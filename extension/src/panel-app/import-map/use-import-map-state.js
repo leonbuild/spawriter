@@ -109,9 +109,11 @@ export default function useImportMapState() {
     // Discard if a newer refresh started (prevents stale Phase 2 from overwriting fresher data)
     if (refreshVersionRef.current !== version) return snap;
     if (snap) {
-      // Preserve defaultImports when Phase 2 (getDefaultMap) returned empty during reload
+      // Preserve defaultImports when Phase 2 (getDefaultMap) returned empty (same origin only)
       const prev = snapshotRef.current;
-      if (prev && Object.keys(snap.defaultImports).length === 0 && Object.keys(prev.defaultImports || {}).length > 0) {
+      if (prev && snap.origin === prev.origin
+          && Object.keys(snap.defaultImports).length === 0
+          && Object.keys(prev.defaultImports || {}).length > 0) {
         snap.defaultImports = prev.defaultImports;
         snap.effectiveImports = prev.effectiveImports || {};
       }
@@ -278,9 +280,18 @@ export default function useImportMapState() {
     const onPanelShown = () => { refreshSnapshot(); };
 
     async function handleNavigationOrRefresh() {
-      // Check if origin changed
       const snap = await readImportMapSnapshot();
       if (!snap) return;
+
+      // Preserve defaultImports when Phase 2 returned empty (same origin only)
+      const prev = snapshotRef.current;
+      if (prev && snap.origin === prev.origin
+          && Object.keys(snap.defaultImports).length === 0
+          && Object.keys(prev.defaultImports || {}).length > 0) {
+        snap.defaultImports = prev.defaultImports;
+        snap.effectiveImports = prev.effectiveImports || {};
+      }
+
       setSnapshot(snap);
       snapshotRef.current = snap;
 
