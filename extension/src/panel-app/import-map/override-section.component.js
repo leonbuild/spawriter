@@ -34,7 +34,7 @@ export default function OverrideSection({
   }, [activeCount, collapsible]);
 
   const headerLabel = activeCount > 0
-    ? `${title} (${entries.length}) · ${activeCount} active`
+    ? `${title} (${entries.length}) · ${activeCount} override active`
     : `${title} (${entries.length})`;
 
   return (
