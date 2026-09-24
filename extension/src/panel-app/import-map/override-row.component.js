@@ -67,7 +67,7 @@ export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pend
       onMouseEnter={onHover} onMouseLeave={onLeave}>
       <div role="cell" className="cell-name" title={entry.name}>{entry.name}</div>
       <div role="cell" className="cell-status">
-        <span className={`status-badge ${statusClass}`}>{statusText}</span>
+        {statusText ? <span className={`status-badge ${statusClass}`}>{statusText}</span> : null}
       </div>
       <div role="cell" className="cell-actions">
         {registeredAppComponent || <span className="no-actions">—</span>}
