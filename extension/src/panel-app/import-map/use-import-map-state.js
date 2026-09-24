@@ -83,6 +83,7 @@ export default function useImportMapState() {
   phaseRef.current = phase;
   const pendingRef = useRef(pendingByName);
   pendingRef.current = pendingByName;
+  const refreshVersionRef = useRef(0);
 
   if (fatalError) throw fatalError;
 
@@ -103,8 +104,17 @@ export default function useImportMapState() {
   }, []);
 
   const refreshSnapshot = useCallback(async () => {
+    const version = ++refreshVersionRef.current;
     const snap = await readImportMapSnapshot();
+    // Discard if a newer refresh started (prevents stale Phase 2 from overwriting fresher data)
+    if (refreshVersionRef.current !== version) return snap;
     if (snap) {
+      // Preserve defaultImports when Phase 2 (getDefaultMap) returned empty during reload
+      const prev = snapshotRef.current;
+      if (prev && Object.keys(snap.defaultImports).length === 0 && Object.keys(prev.defaultImports || {}).length > 0) {
+        snap.defaultImports = prev.defaultImports;
+        snap.effectiveImports = prev.effectiveImports || {};
+      }
       setSnapshot(snap);
       snapshotRef.current = snap;
       originRef.current = snap.origin || originRef.current;
@@ -327,11 +337,11 @@ export default function useImportMapState() {
 
       // Optimistic snapshot: update activeOverrides so count reflects immediately
       // (refreshSnapshot Phase 2 can take up to 5s polling getDefaultMap)
-      if (snapshotRef.current) {
-        const optimistic = { ...snapshotRef.current, activeOverrides: { ...snapshotRef.current.activeOverrides, [name]: url } };
-        setSnapshot(optimistic);
-        snapshotRef.current = optimistic;
-      }
+      // Functional update ensures concurrent toggles compose correctly
+      setSnapshot(prev => {
+        if (!prev) return prev;
+        return { ...prev, activeOverrides: { ...prev.activeOverrides, [name]: url } };
+      });
 
       await delay(300);
       const snap = await refreshSnapshot();
@@ -368,13 +378,13 @@ export default function useImportMapState() {
       setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
 
       // Optimistic snapshot: remove from activeOverrides so count reflects immediately
-      if (snapshotRef.current) {
-        const ao = { ...snapshotRef.current.activeOverrides };
+      // Functional update ensures concurrent toggles compose correctly
+      setSnapshot(prev => {
+        if (!prev) return prev;
+        const ao = { ...prev.activeOverrides };
         delete ao[name];
-        const optimistic = { ...snapshotRef.current, activeOverrides: ao };
-        setSnapshot(optimistic);
-        snapshotRef.current = optimistic;
-      }
+        return { ...prev, activeOverrides: ao };
+      });
 
       await delay(300);
       await refreshSnapshot();
