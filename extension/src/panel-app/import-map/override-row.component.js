@@ -63,6 +63,9 @@ export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pend
   } else if (!entry.registered && entry.actualEnabled) {
     statusText = "OVERRIDDEN";
     statusClass = "status-overridden";
+  } else if (!entry.registered) {
+    statusText = "DEFAULT";
+    statusClass = "status-default";
   }
 
   return (
