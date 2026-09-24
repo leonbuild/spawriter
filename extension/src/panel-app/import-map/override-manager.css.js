@@ -251,7 +251,7 @@ body.dark & .cell-name { color: #ffffff; }
 }
 
 & .cell-actions { white-space: nowrap; }
-& .cell-actions .button { min-width: 64px; text-align: center; box-sizing: border-box; }
+& .cell-actions .button { min-width: 72px; text-align: center; box-sizing: border-box; }
 & .no-actions { color: var(--gray); }
 
 /* ---- Status badges ---- */
