@@ -407,14 +407,9 @@ export default function useImportMapState() {
     const urlCheck = validateOverrideUrl(trimmed, originRef.current);
     if (!urlCheck.valid) return { ok: false, error: urlCheck.error };
 
-    const wasEnabled = savedRef.current[name]?.enabled || false;
-    const next = { ...savedRef.current, [name]: { url: trimmed, enabled: wasEnabled } };
+    const next = { ...savedRef.current, [name]: { url: trimmed, enabled: true } };
     await persistSaved(next);
-
-    if (wasEnabled) {
-      return enableOverride(name, trimmed);
-    }
-    return { ok: true };
+    return enableOverride(name, trimmed);
   }, [persistSaved, enableOverride, refreshSnapshot]);
 
   const clearAllOverrides = useCallback(async () => {

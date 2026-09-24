@@ -44,33 +44,22 @@ export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pend
   const hasSavedUrl = !!entry.savedUrl;
   const displayUrl = editing ? editValue : (entry.savedUrl || "");
 
-  // Status badge: lifecycle status takes priority when available;
-  // override state is already visible from the toggle + URL color.
-  let statusText, statusClass;
-  if (entry.syncStatus === "drift") {
-    statusText = "DRIFT";
-    statusClass = "status-drift";
-  } else if (entry.syncStatus === "error" || error) {
+  // Status badge: classic lifecycle statuses + ORPHAN for deletable entries.
+  // Override state is already visible from the toggle + URL color.
+  // Drift is resolved silently by background sync — not shown.
+  let statusText = "", statusClass = "status-default";
+  if (error) {
     statusText = "ERROR";
     statusClass = "status-error";
-  } else if (isOrphan) {
-    statusText = "ORPHAN";
-    statusClass = "status-orphan";
   } else if (isPending) {
     statusText = "SYNCING";
     statusClass = "status-syncing";
+  } else if (isOrphan) {
+    statusText = "ORPHAN";
+    statusClass = "status-orphan";
   } else if (entry.registered && entry.lifecycleStatus) {
     statusText = entry.lifecycleStatus.replace(/_/g, " ");
     statusClass = `status-lifecycle status-${entry.lifecycleStatus.toLowerCase().replace(/_/g, "-")}`;
-  } else if (entry.actualEnabled) {
-    statusText = "OVERRIDDEN";
-    statusClass = "status-overridden";
-  } else if (entry.registered) {
-    statusText = "REGISTERED";
-    statusClass = "status-default";
-  } else {
-    statusText = "DEFAULT";
-    statusClass = "status-default";
   }
 
   return (
@@ -114,11 +103,6 @@ export default function OverrideRow({ entry, onToggle, onSaveUrl, onDelete, pend
               >×</button>
             )}
           </div>
-          {entry.syncStatus === "drift" && entry.activeOverrideUrl && (
-            <span className="drift-info" title={`Active: ${entry.activeOverrideUrl}`}>
-              Active: {entry.activeOverrideUrl}
-            </span>
-          )}
           {error && <span className="row-error">{error}</span>}
         </div>
         <div className="override-buttons">
