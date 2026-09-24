@@ -189,13 +189,6 @@ export default function OverrideManager({ apps: registeredApps, theme }) {
           </div>
         )}
 
-        {/* Phase indicator */}
-        {(phase === "restoring" || phase === "applying") && (
-          <div className="om-phase">
-            {phase === "restoring" ? "Restoring saved overrides…" : "Applying…"}
-          </div>
-        )}
-
         {/* Applications section — always expanded */}
         <OverrideSection
           title="Applications"
