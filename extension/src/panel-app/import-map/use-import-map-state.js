@@ -325,6 +325,14 @@ export default function useImportMapState() {
       // Clear SYNCING immediately after page load; verification runs in background
       setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
 
+      // Optimistic snapshot: update activeOverrides so count reflects immediately
+      // (refreshSnapshot Phase 2 can take up to 5s polling getDefaultMap)
+      if (snapshotRef.current) {
+        const optimistic = { ...snapshotRef.current, activeOverrides: { ...snapshotRef.current.activeOverrides, [name]: url } };
+        setSnapshot(optimistic);
+        snapshotRef.current = optimistic;
+      }
+
       await delay(300);
       const snap = await refreshSnapshot();
 
@@ -358,6 +366,15 @@ export default function useImportMapState() {
 
       // Clear SYNCING immediately after page load
       setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
+
+      // Optimistic snapshot: remove from activeOverrides so count reflects immediately
+      if (snapshotRef.current) {
+        const ao = { ...snapshotRef.current.activeOverrides };
+        delete ao[name];
+        const optimistic = { ...snapshotRef.current, activeOverrides: ao };
+        setSnapshot(optimistic);
+        snapshotRef.current = optimistic;
+      }
 
       await delay(300);
       await refreshSnapshot();
