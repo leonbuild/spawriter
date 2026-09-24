@@ -311,7 +311,6 @@ export default function useImportMapState() {
 
     const opId = ++operationSeq;
     setPendingByName((p) => ({ ...p, [name]: { id: opId, expectedEnabled: true, expectedUrl: url, startedAt: Date.now() } }));
-    setPhase("applying");
 
     try {
       const next = { ...savedRef.current, [name]: { url, enabled: true } };
@@ -322,10 +321,13 @@ export default function useImportMapState() {
 
       await reloadPage();
       await waitForPageLoad();
+
+      // Clear SYNCING immediately after page load; verification runs in background
+      setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
+
       await delay(300);
       const snap = await refreshSnapshot();
 
-      // Verify
       if (snap && !Object.prototype.hasOwnProperty.call(snap.activeOverrides, name)) {
         setErrorByName((e) => ({ ...e, [name]: "Override not active after reload" }));
       } else {
@@ -333,18 +335,15 @@ export default function useImportMapState() {
       }
       return { ok: true };
     } catch (err) {
+      setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
       setErrorByName((e) => ({ ...e, [name]: err.message }));
       return { ok: false, error: err.message };
-    } finally {
-      setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
-      setPhase("ready");
     }
   }, [persistSaved, refreshSnapshot]);
 
   const disableOverride = useCallback(async (name) => {
     const opId = ++operationSeq;
     setPendingByName((p) => ({ ...p, [name]: { id: opId, expectedEnabled: false, startedAt: Date.now() } }));
-    setPhase("applying");
 
     try {
       const saved = savedRef.current[name];
@@ -356,16 +355,18 @@ export default function useImportMapState() {
 
       await reloadPage();
       await waitForPageLoad();
+
+      // Clear SYNCING immediately after page load
+      setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
+
       await delay(300);
       await refreshSnapshot();
       setErrorByName((e) => { const n = { ...e }; delete n[name]; return n; });
       return { ok: true };
     } catch (err) {
+      setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
       setErrorByName((e) => ({ ...e, [name]: err.message }));
       return { ok: false, error: err.message };
-    } finally {
-      setPendingByName((p) => { const n = { ...p }; delete n[name]; return n; });
-      setPhase("ready");
     }
   }, [persistSaved, refreshSnapshot]);
 
