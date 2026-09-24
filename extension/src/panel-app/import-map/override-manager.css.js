@@ -251,11 +251,15 @@ body.dark & .cell-name { color: #ffffff; }
 }
 
 & .cell-actions { white-space: nowrap; }
+& .cell-actions .button { min-width: 64px; text-align: center; box-sizing: border-box; }
 & .no-actions { color: var(--gray); }
 
 /* ---- Status badges ---- */
 
 & .status-badge {
+  display: inline-block;
+  min-width: 88px;
+  text-align: center;
   border-radius: 1rem;
   color: #fff;
   font-size: .75rem;
@@ -263,6 +267,7 @@ body.dark & .cell-name { color: #ffffff; }
   text-shadow: 0px 2px 4px rgba(0,0,0,.15);
   text-transform: capitalize;
   white-space: nowrap;
+  box-sizing: border-box;
 }
 & .status-overridden { background-color: var(--green); }
 & .status-default { background-color: var(--gray); }
