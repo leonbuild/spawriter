@@ -38,11 +38,7 @@ const ClearCacheButton = React.forwardRef(({ sharedState, setSharedState }, ref)
       const tabId = browser.devtools.inspectedWindow.tabId;
       const response = await browser.runtime.sendMessage({
         type: "clear-cache",
-        tabId,
-        dataTypes: {
-          cache: true,
-          serviceWorkers: true
-        }
+        tabId
       });
 
       if (response?.success) {
@@ -84,7 +80,7 @@ const ClearCacheButton = React.forwardRef(({ sharedState, setSharedState }, ref)
         .maybe("error", status === "error")}
       onClick={handleClearCache}
       disabled={isClearing}
-      title="Clear browser cache (HTTP cache, Service Workers) and refresh the page"
+      title="Refresh the inspected tab with fresh HTTP resources"
     >
       {getButtonText()}
     </button>

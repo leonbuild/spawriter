@@ -14,10 +14,10 @@ import "./ai_bridge/bridge.js";
 let portsToPanel = new Map();
 
 // Handle clear cache request. Clearing is always scoped to the tab's origin —
-// an unscoped browsingData.remove would wipe cache/service workers for every
+// an unscoped browsingData.remove would wipe cache for every
 // site in the profile (see ai_bridge/clear-policy.js).
 async function handleClearCache(msg) {
-  const { tabId, dataTypes } = msg;
+  const { tabId } = msg;
 
   try {
     if (tabId == null) {
@@ -27,7 +27,7 @@ async function handleClearCache(msg) {
     const isFirefox = browser.runtime.getURL("").startsWith("moz-extension:");
     const scoped = buildScopedBrowsingDataArgs(
       tab?.url || "",
-      dataTypes || { cache: true, serviceWorkers: true },
+      { cache: true },
       isFirefox
     );
     if (scoped.error) {

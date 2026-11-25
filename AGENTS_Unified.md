@@ -119,7 +119,7 @@ Do not tell the user to check the browser without checking it yourself first.
 
 After every UI code change:
 
-1. Call `ensureFreshRender()`, or `clearCacheAndReload()` when stale cache is possible.
+1. Call `ensureFreshRender()`, or `clearCacheAndReload({ clear: "cache" })` when stale cache is possible.
 2. Call `screenshotWithLabels()` to capture the result.
 3. Compare the visible result with the expected behavior.
 4. If it is wrong, inspect `consoleLogs({ level: "error" })` and `networkLog({ status_filter: "error" })`.
@@ -172,7 +172,7 @@ The following globals are available in MCP `execute` and CLI `spawriter -e`:
 | `getReactSource(target)` | React component name + source file:line for a snapshot ref or CSS selector |
 | `getReactComponentInfo(target)` | React component props + component hierarchy for a snapshot ref or CSS selector |
 | `singleSpa` | Manage single-spa applications and overrides |
-| `clearCacheAndReload(opts?)` | Clear origin-scoped data and reload |
+| `clearCacheAndReload(opts?)` | Reload the tab (use `{ clear: "cache" }` for HTTP cache bypass) |
 | `getCDPSession()` | Access the raw CDP session when supported |
 | `resetPlaywright()` | Reset the Playwright connection |
 | `require(module)` | Import an allowlisted sandbox module |
@@ -219,14 +219,13 @@ Use overrides to replace one microfrontend's module URL while keeping it inside 
 ```javascript
 await singleSpa.status()
 await singleSpa.override("set", "@org/navbar", "http://localhost:8080/main.js")
-await ensureFreshRender()
 await singleSpa.override("remove", "@org/navbar")
-await singleSpa.override("reset_all")
+await ensureFreshRender()
 await singleSpa.mount("@org/settings")
 await singleSpa.unmount("@org/settings")
 ```
 
-After changing an override, always refresh and verify the rendered page.
+Use `singleSpa.override("remove", appName)` to remove one override, then call `ensureFreshRender()`. Use `reset_all` only when every override should be removed. The set and enable actions already reload on success.
 
 ### Network Mocking
 
@@ -245,11 +244,12 @@ Mock rules persist. Always call `networkIntercept.disable()` when finished.
 
 ### Storage and Cache
 
+The no-argument `clearCacheAndReload()` performs an ordinary reload. Only `clear: "cache"` requests HTTP cache bypass. Legacy storage lists and `all` raise an error before reload. Use `storage("clear_storage", { storage_types })` only to intentionally erase whole stores, which may sign users out.
+
 ```javascript
 await storage("get_cookies")
 await storage("get_local_storage")
-await storage("clear_storage", { storage_types: "local_storage" })
-await clearCacheAndReload({ clear: "cache,local_storage,session_storage" })
+await clearCacheAndReload({ clear: "cache" })
 ```
 
 All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension, and `origin` overrides are rejected — clearing always targets the current page origin.

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "spawriter",
   "short_name": "spawriter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "LeonBuild",
   "homepage_url": "https://github.com/leonbuild/spawriter",
   "description": "spawriter devtools panel with MCP support (Manifest V3)",
@@ -22,19 +22,37 @@
   },
   "devtools_page": "./build/main.html",
   "minimum_chrome_version": "116",
-  "permissions": ["storage", "scripting", "browsingData", "tabs", "debugger", "offscreen", "webNavigation"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": [
+    "storage",
+    "scripting",
+    "browsingData",
+    "tabs",
+    "debugger",
+    "offscreen",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "run_at": "document_start",
-      "js": ["./build/contentScriptMain.js"],
+      "js": [
+        "./build/contentScriptMain.js"
+      ],
       "world": "MAIN"
     },
     {
-      "matches": ["<all_urls>"],
+      "matches": [
+        "<all_urls>"
+      ],
       "run_at": "document_start",
-      "js": ["./build/contentScript.js"],
+      "js": [
+        "./build/contentScript.js"
+      ],
       "world": "ISOLATED"
     }
   ],

@@ -482,7 +482,7 @@ const tools = [
       properties: {
         code: {
           type: 'string',
-          description: 'Playwright JS code. Globals: {page, context, browser, state, navigate, ensureFreshRender, screenshot, screenshotWithLabels, snapshot/accessibilitySnapshot, interact, refToLocator, consoleLogs, getLatestLogs, clearAllLogs, networkLog, networkDetail, clearNetworkLog, networkIntercept, dbg, editor, browserFetch, storage, emulation, performance, cssInspect, pageContent, getPageMarkdown, getCleanHTML, waitForPageLoad, getReactSource, getReactComponentInfo, singleSpa, clearCacheAndReload, getCDPSession, resetPlaywright, require, import}. Use ; for multiple statements.',
+          description: 'Playwright JS code. Globals: {page, context, browser, state, navigate, ensureFreshRender, screenshot, screenshotWithLabels, snapshot/accessibilitySnapshot, interact, refToLocator, consoleLogs, getLatestLogs, clearAllLogs, networkLog, networkDetail, clearNetworkLog, networkIntercept, dbg, editor, browserFetch, storage, emulation, performance, cssInspect, pageContent, getPageMarkdown, getCleanHTML, waitForPageLoad, getReactSource, getReactComponentInfo, singleSpa, clearCacheAndReload, getCDPSession, resetPlaywright, require, import}. clearCacheAndReload accepts only HTTP cache bypass. To remove one override, use single_spa override_remove and refresh. Use ; for multiple statements.',
         },
         timeout: {
           type: 'number',

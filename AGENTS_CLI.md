@@ -112,7 +112,7 @@ All globals are injected into the Playwright VM sandbox, and native Playwright A
 | `getReactSource(target)` | React component name + source file:line for a snapshot ref or CSS selector |
 | `getReactComponentInfo(target)` | React component props + hierarchy for a snapshot ref or CSS selector |
 | `singleSpa` | Single-spa management (`.status()`, `.override()`, `.mount()`, `.unmount()`, `.unload()`) |
-| `clearCacheAndReload(opts?)` | Origin-scoped cache/storage clear + reload |
+| `clearCacheAndReload(opts?)` | Reload the tab (use `{ clear: "cache" }` for HTTP cache bypass) |
 | `getCDPSession()` | Raw CDP session accessor (normally returns a live session, including through the relay; null only if creation failed) |
 | `resetPlaywright()` | Reset Playwright connection |
 | `require(module)` | Sandboxed module import (allowlisted: `path`, `url`, `crypto`, `fs` → ScopedFS, etc.) |
@@ -152,9 +152,8 @@ Use single-spa overrides to replace one microfrontend's module URL while keeping
 ```bash
 spawriter -s sw-1 -e 'await singleSpa.status()'
 spawriter -s sw-1 -e 'await singleSpa.override("set", "@org/navbar", "http://localhost:8080/main.js")'
-spawriter -s sw-1 -e 'await ensureFreshRender()'  # reload to see changes
 spawriter -s sw-1 -e 'await singleSpa.override("remove", "@org/navbar")'
-spawriter -s sw-1 -e 'await singleSpa.override("reset_all")'
+spawriter -s sw-1 -e 'await ensureFreshRender()'
 spawriter -s sw-1 -e 'await singleSpa.mount("@org/settings")'
 spawriter -s sw-1 -e 'await singleSpa.unmount("@org/settings")'
 ```
@@ -273,9 +272,10 @@ spawriter -s sw-1 -e 'await getReactComponentInfo(5)'                   # + prop
 
 ### Cache & Reload
 
+The no-argument `clearCacheAndReload()` performs an ordinary reload. Only `clear: "cache"` requests HTTP cache bypass. Legacy storage lists and `all` raise an error before reload. Use `storage("clear_storage", { storage_types })` only to intentionally erase whole stores, which may sign users out.
+
 ```bash
-spawriter -s sw-1 -e 'await clearCacheAndReload({ clear: "local_storage", reload: true })'
-spawriter -s sw-1 -e 'await clearCacheAndReload({ clear: "cache,local_storage,session_storage" })'
+spawriter -s sw-1 -e 'await clearCacheAndReload({ clear: "cache" })'
 ```
 
 ### Sandboxed Module Import
@@ -303,7 +303,7 @@ spawriter -s sw-1 -e 'page.url()'
 
 1. Only operate on normal web pages — never `chrome://` or extension pages
 2. Never use `/connect-active-tab` or bind arbitrary active/existing Chrome tabs. Only use your owned tab, a blue-dot idle spawriter tab, or a newly created tab.
-3. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("delete_cookie"/"clear_storage")` or `clearCacheAndReload({ clear })` — they always target the current tab's origin; origin overrides are rejected.**
+3. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("clear_storage", { storage_types })` for deliberate site-data deletion or `clearCacheAndReload({ clear: "cache" })` for refresh — they always target the current tab's origin; origin overrides are rejected.**
 4. Verify major state transitions; prefer `snapshot()` for structural checks and use `screenshot()` when visual confirmation matters
 5. Don't assume code changes are live — verify with `screenshot()` or `snapshot()`
 6. Mock rules persist until disabled — always clean up with `networkIntercept.disable()`

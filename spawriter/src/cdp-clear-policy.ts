@@ -19,7 +19,7 @@ export const GLOBAL_CLEAR_CDP_METHODS: ReadonlySet<string> = new Set([
 
 const SCOPED_ALTERNATIVES =
   'Use origin-scoped alternatives instead: storage("delete_cookie", {name, domain}), ' +
-  'storage("clear_storage", {storage_types}), or clearCacheAndReload({clear}).';
+  'storage("clear_storage", {storage_types}), or clearCacheAndReload({clear: "cache"}) for a cache bypass.';
 
 /**
  * Returns a denial reason when the CDP command would clear data beyond the

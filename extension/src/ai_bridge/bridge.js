@@ -927,7 +927,7 @@ import { decidePopupRelocation, POPUP_SOURCE_TTL_MS } from "./popup-relocation.m
       const isFirefox = browser.runtime.getURL("").startsWith("moz-extension:");
       const scoped = buildScopedBrowsingDataArgs(
         tab?.url || "",
-        { cache: true, serviceWorkers: true },
+        { cache: true },
         isFirefox
       );
       if (scoped.error) {

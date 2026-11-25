@@ -49,7 +49,7 @@ Never use the user's active/current tab, `/connect-active-tab`, unmanaged existi
 ### Verification-After-Changes Protocol
 
 After any UI code change, automatically:
-1. `execute` → `ensureFreshRender()` (or `clearCacheAndReload()` if cache may be stale)
+1. `execute` → `ensureFreshRender()` (or `clearCacheAndReload({ clear: "cache" })` if cache may be stale)
 2. `execute` → `screenshotWithLabels()` — capture result
 3. Compare with expectations
 4. If wrong: `execute` → `consoleLogs({ level: "error" })` + `networkLog({ status_filter: "error" })`
@@ -74,7 +74,8 @@ After any UI code change, automatically:
 
 - Use overrides to replace one microfrontend's module URL while keeping it inside the real host application
 - After setting an override, verify the complete integrated experience, including layout, navigation, shared dependencies, and interactions with surrounding microfrontends
-- After `override_set`, call `execute` → `ensureFreshRender()` to reload with the override
+- Use `singleSpa.override("remove", appName)` to remove one override, then call `ensureFreshRender()`. Use `reset_all` only when every override should be removed. The set and enable actions already reload on success.
+- The no-argument `clearCacheAndReload()` performs an ordinary reload. Only `clear: "cache"` requests HTTP cache bypass. Legacy storage lists and `all` raise an error before reload. Use `storage("clear_storage", { storage_types })` only to intentionally erase whole stores, which may sign users out.
 - `status` returns app list, statuses, and active import-map-overrides
 - Extension panel auto-syncs within ~3s
 
@@ -93,7 +94,7 @@ After any UI code change, automatically:
 3. Verify state via `single_spa { action: "status" }` / `execute`, not static assumptions
 4. Verify major state transitions; prefer `snapshot()` for structural checks and use screenshots when visual confirmation matters
 5. Don't assume code changes are live — confirm visually
-6. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("delete_cookie"/"clear_storage")` or `clearCacheAndReload({ clear })` — they always target the current page origin; origin overrides are rejected.**
+6. **All clearing is origin-scoped and enforced: browser-wide clears (`context.clearCookies()`, CDP `Network.clearBrowserCookies`/`Network.clearBrowserCache`/`Storage.clearCookies`, cross-origin `Storage.clearDataForOrigin`) are blocked by the relay and extension. Use `storage("clear_storage", { storage_types })` for deliberate site-data deletion or `clearCacheAndReload({ clear: "cache" })` for refresh — they always target the current page origin; origin overrides are rejected.**
 7. Mock rules persist until disabled — always clean up
 
 ## Troubleshooting

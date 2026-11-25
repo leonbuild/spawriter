@@ -1910,3 +1910,81 @@ describe('buildVmGlobals structural verification', () => {
     assert.equal(getCDPSession(), null);
   });
 });
+
+describe('VM refresh helpers', () => {
+  function fixture(cdp = true, readyState = 'complete') {
+    const commands: unknown[] = [];
+    const expressions: string[] = [];
+    const page = { evaluate: async (expression: string) => {
+      expressions.push(expression);
+      return readyState;
+    }};
+    const send = async (method: string, params: unknown) => { commands.push([method, params]); };
+    const globals = (new PlaywrightExecutor() as any).buildVmGlobals(page, cdp, send, [], [], Infinity);
+    return { globals, commands, expressions };
+  }
+
+  it('rejects destructive, mixed and malformed requests before any browser action', async () => {
+    const { globals, commands, expressions } = fixture();
+    for (const clear of ['all', 'cookies', 'local_storage', 'session_storage', 'cache_storage',
+      'indexeddb', 'service_workers', 'cache,local_storage,session_storage', 'unknown', '', null]) {
+      await assert.rejects(globals.clearCacheAndReload({ clear }), /Only clear/);
+    }
+    for (const options of [{ mode: 'aggressive' }, { origin: 'https://example.org' },
+      { clear: 'cache', reload: false }, { reload: 'false' }]) {
+      await assert.rejects(globals.clearCacheAndReload(options));
+    }
+    assert.equal(await globals.clearCacheAndReload({ reload: false }), 'No storage cleared');
+    assert.deepEqual(commands, []);
+    assert.deepEqual(expressions, []);
+  });
+
+  for (const [label, options, ignoreCache] of [
+    ['ordinary', undefined, false], ['cache bypass', { clear: ' CACHE ' }, true],
+  ] as const) {
+    it(label + ' sends only a tab reload', async () => {
+      const { globals, commands, expressions } = fixture();
+      await globals.clearCacheAndReload(options);
+      assert.deepEqual(commands, [['Page.reload', { ignoreCache }]]);
+      assert.deepEqual(expressions, []);
+    });
+  }
+
+  it('reports a slow render without removing overrides or reloading again', async () => {
+    const { globals, commands, expressions } = fixture(true, 'loading');
+    assert.match(await globals.ensureFreshRender(), /may not have stabilized/);
+    assert.deepEqual(commands, [['Page.reload', { ignoreCache: true }]]);
+    assert.deepEqual(expressions, ['document.readyState']);
+  });
+
+  it('clears session storage only when explicitly requested through storage()', async () => {
+    const commands: [string, any][] = [];
+    const send = async (method: string, params: any) => {
+      commands.push([method, params]);
+      return { result: { value: 'https://example.org' } };
+    };
+    const globals = (new PlaywrightExecutor() as any).buildVmGlobals({}, true, send, [], [], Infinity);
+    await globals.storage('clear_storage', { storage_types: 'local_storage,session_storage' });
+    assert.deepEqual(commands.map(([method, params]) => [method, params.expression ?? params]), [
+      ['Runtime.evaluate', 'window.location.origin'],
+      ['Storage.clearDataForOrigin', { origin: 'https://example.org', storageTypes: 'local_storage' }],
+      ['Runtime.evaluate', 'sessionStorage.clear()'],
+    ]);
+  });
+
+  it('reports the ordinary reload fallback accurately', async () => {
+    const { globals, commands, expressions } = fixture(false);
+    assert.match(await globals.clearCacheAndReload({ clear: 'cache' }), /cache bypass unavailable/);
+    assert.deepEqual(commands, []);
+    assert.deepEqual(expressions, ['window.location.reload()']);
+  });
+
+  it('uses relay CDP for cache bypass when a direct CDP session is unavailable', async () => {
+    const executor = new PlaywrightExecutor();
+    const commands: unknown[] = [];
+    executor.relaySendCdp = async (method, params) => { commands.push([method, params]); };
+    const globals = (executor as any).buildVmGlobals({}, null, assert.fail, [], [], Infinity);
+    assert.match(await globals.clearCacheAndReload({ clear: 'cache' }), /cache bypassed/);
+    assert.deepEqual(commands, [['Page.reload', { ignoreCache: true }]]);
+  });
+});

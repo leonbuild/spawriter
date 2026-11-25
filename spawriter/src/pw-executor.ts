@@ -962,6 +962,15 @@ export class PlaywrightExecutor {
       throw new Error(`CDP session not available (required for ${method}). Try: session reset or relay --replace`);
     };
 
+    const reloadPage = async (ignoreCache: boolean) => {
+      if (cdpSession || self.relaySendCdp) {
+        await relayCdp('Page.reload', { ignoreCache }, getCommandTimeout('Page.reload'));
+        return ignoreCache ? 'Page reloaded with cache bypassed' : 'Page reloaded';
+      }
+      await page.evaluate('window.location.reload()');
+      return ignoreCache ? 'Page reloaded (cache bypass unavailable without CDP)' : 'Page reloaded';
+    };
+
     const globals: Record<string, unknown> = {
       // --- Accessibility snapshot ---
       snapshot: async (options?: { search?: string; diff?: boolean; interactive_only?: boolean }) => {
@@ -1792,29 +1801,29 @@ export class PlaywrightExecutor {
               return `Error: clear_storage requires an http(s) page (current origin: ${origin || 'unknown'}).`;
             }
             const types = opts.storage_types as string;
-            if (!types) return 'Error: clear_storage requires storage_types parameter';
-            if (cdpSession) {
-              await sendCdpCmd('Storage.clearDataForOrigin', { origin, storageTypes: types });
-              return `Storage cleared for ${origin} (types: ${types}).`;
+            if (typeof types !== 'string' || !types.trim()) return 'Error: clear_storage requires storage_types parameter';
+            const requested = types.split(',').map(type => type.trim().toLowerCase()).filter(Boolean);
+            if (!requested.length) return 'Error: specify at least one storage type';
+            const clearSession = requested.includes('session_storage');
+            const persisted = requested.filter(type => type !== 'session_storage');
+            if (persisted.length) {
+              if (cdpSession || self.relaySendCdp) {
+                await relayCdp('Storage.clearDataForOrigin', { origin, storageTypes: persisted.join(',') });
+              } else {
+                if (persisted.some(type => !['local_storage', 'cache_storage', 'service_workers'].includes(type))) {
+                  return 'Error: clearing these storage types requires CDP.';
+                }
+                if (persisted.includes('local_storage')) await evaluateJs('localStorage.clear()');
+                if (persisted.includes('cache_storage')) {
+                  await evaluateJs('caches.keys().then(keys => Promise.all(keys.map(key => caches.delete(key))))');
+                }
+                if (persisted.includes('service_workers')) {
+                  await evaluateJs('navigator.serviceWorker.getRegistrations().then(regs => Promise.all(regs.map(reg => reg.unregister())))');
+                }
+              }
             }
-            const cleared: string[] = [];
-            if (types.includes('local_storage')) { await evaluateJs('localStorage.clear()'); cleared.push('localStorage'); }
-            if (types.includes('session_storage')) { await evaluateJs('sessionStorage.clear()'); cleared.push('sessionStorage'); }
-            if (types.includes('cookies')) {
-              const originUrl = new URL(origin);
-              const allCookies = await page.context().cookies();
-              const originCookies = allCookies.filter((c: any) => {
-                const cd = c.domain.startsWith('.') ? c.domain.slice(1) : c.domain;
-                return originUrl.hostname === cd || originUrl.hostname.endsWith('.' + cd);
-              });
-              // Per-cookie CDP deletion — Playwright's clearCookies() is
-              // globally destructive under the hood and blocked by policy.
-              for (const c of originCookies) await relayCdp('Network.deleteCookies', { name: c.name, domain: c.domain });
-              cleared.push(`cookies (${originCookies.length} for ${origin})`);
-            }
-            return cleared.length > 0
-              ? `Storage cleared for ${origin}: ${cleared.join(', ')}. (Some storage types require CDP for full clearing.)`
-              : `Cannot clear "${types}" without CDP session.`;
+            if (clearSession) await evaluateJs('sessionStorage.clear()');
+            return `Storage cleared for ${origin} (types: ${requested.join(', ')}).`;
           }
           case 'get_storage_usage': {
             const origin = (opts.origin as string) || await evaluateJs('window.location.origin') as string;
@@ -2247,82 +2256,27 @@ export class PlaywrightExecutor {
 
       // --- Clear cache and reload ---
       clearCacheAndReload: async (options?: { clear?: string; reload?: boolean }) => {
-        if ((options as Record<string, unknown> | undefined)?.origin) {
-          return 'Error: origin override is not supported — clearCacheAndReload always targets the current page origin.';
+        if (options !== undefined && (!options || typeof options !== 'object' || Array.isArray(options))) {
+          throw new Error('Expected an options object with clear or reload.');
         }
-        const clearArg = options?.clear;
-        const shouldReload = options?.reload !== false;
-        let clearTypes: Set<string>;
-        if (clearArg) {
-          const raw = clearArg.toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-          clearTypes = new Set(raw.includes('all')
-            ? ['cache', 'cookies', 'local_storage', 'session_storage', 'cache_storage', 'indexeddb', 'service_workers']
-            : raw);
-        } else {
-          clearTypes = new Set<string>();
+        for (const key of Object.keys(options ?? {})) {
+          if (key === 'origin') throw new Error('origin override is not supported');
+          if (key !== 'clear' && key !== 'reload') throw new Error(`Unknown reload option: ${key}`);
         }
-        const origin = await evaluateJs('window.location.origin') as string;
-        if (clearTypes.size > 0 && (!origin || !origin.startsWith('http'))) {
-          return `Error: clearing requires an http(s) page (current origin: ${origin || 'unknown'}).`;
+        const clear = options?.clear;
+        if (clear !== undefined && (typeof clear !== 'string' || clear.trim().toLowerCase() !== 'cache')) {
+          throw new Error('Only clear: "cache" is supported. To remove one override, use singleSpa.override("remove", appName). Use storage("clear_storage", { storage_types }) for deliberate site-data deletion.');
         }
-        const cleared: string[] = [];
-        let needsIgnoreCache = false;
-
-        if (clearTypes.has('cache')) { needsIgnoreCache = true; cleared.push('cache (per-tab bypass via ignoreCache reload)'); }
-
-        if (clearTypes.has('cookies')) {
-          // Per-cookie CDP deletion — Playwright's clearCookies() is globally
-          // destructive under the hood and blocked by policy.
-          const cookieResult = await relayCdp('Network.getCookies') as any;
-          const originHost = new URL(origin).hostname;
-          const matching = (cookieResult?.cookies || []).filter((c: any) => {
-            const isDotPrefixed = c.domain.startsWith('.');
-            const cd = isDotPrefixed ? c.domain.slice(1) : c.domain;
-            if (isDotPrefixed && !originHost.includes('.')) return false;
-            return originHost === cd || originHost.endsWith('.' + cd);
-          });
-          for (const c of matching) await relayCdp('Network.deleteCookies', { name: c.name, domain: c.domain });
-          cleared.push(`cookies (${origin}, ${matching.length} removed)`);
+        if (options?.reload !== undefined && typeof options.reload !== 'boolean') {
+          throw new Error('reload must be a boolean.');
         }
-
-        if (cdpSession) {
-          const cdpStorageParts: string[] = [];
-          if (clearTypes.has('local_storage')) cdpStorageParts.push('local_storage');
-          if (clearTypes.has('cache_storage')) cdpStorageParts.push('cache_storage');
-          if (clearTypes.has('indexeddb')) cdpStorageParts.push('indexeddb');
-          if (clearTypes.has('service_workers')) cdpStorageParts.push('service_workers');
-          if (cdpStorageParts.length > 0) {
-            await sendCdpCmd('Storage.clearDataForOrigin', { origin, storageTypes: cdpStorageParts.join(',') });
-            cleared.push(`${cdpStorageParts.join(', ')} (${origin})`);
-          }
-          if (clearTypes.has('session_storage')) {
-            await evaluateJs('sessionStorage.clear()');
-            cleared.push('session_storage');
-          }
-        } else {
-          if (clearTypes.has('local_storage')) { await evaluateJs('localStorage.clear()'); cleared.push('local_storage'); }
-          if (clearTypes.has('session_storage')) { await evaluateJs('sessionStorage.clear()'); cleared.push('session_storage'); }
-          if (clearTypes.has('cache_storage')) {
-            await evaluateJs('caches.keys().then(k => Promise.all(k.map(c => caches.delete(c))))');
-            cleared.push('cache_storage');
-          }
-          if (clearTypes.has('indexeddb')) cleared.push('indexeddb (requires CDP)');
-          if (clearTypes.has('service_workers')) {
-            await evaluateJs("navigator.serviceWorker.getRegistrations().then(regs => Promise.all(regs.map(r => r.unregister())))");
-            cleared.push('service_workers');
-          }
+        if (options?.reload === false) {
+          if (clear) throw new Error('A cache bypass requires a reload. Omit reload: false.');
+          return 'No storage cleared';
         }
-
-        if (shouldReload || needsIgnoreCache) {
-          if (cdpSession) {
-            await sendCdpCmd('Page.reload', { ignoreCache: needsIgnoreCache }, getCommandTimeout('Page.reload'));
-          } else {
-            await page.evaluate('window.location.reload()');
-          }
-          await new Promise(r => setTimeout(r, 2000));
-          cleared.push(needsIgnoreCache ? 'page reloaded (cache bypassed)' : 'page reloaded');
-        }
-        return cleared.length > 0 ? `Cleared: ${cleared.join('; ')}` : 'No storage cleared';
+        const result = await reloadPage(clear !== undefined);
+        await new Promise(r => setTimeout(r, 2000));
+        return result;
       },
 
       // --- Navigate ---
@@ -2352,21 +2306,7 @@ export class PlaywrightExecutor {
       },
 
       ensureFreshRender: async () => {
-        let hasOverrides = false;
-        try {
-          hasOverrides = await page.evaluate(`(function() {
-            var imo = window.importMapOverrides;
-            if (!imo || typeof imo.getOverrideMap !== 'function') return false;
-            var m = imo.getOverrideMap();
-            return m && m.imports ? Object.keys(m.imports).length > 0 : false;
-          })()`);
-        } catch { /* ignore */ }
-
-        if (cdpSession) {
-          await sendCdpCmd('Page.reload', { ignoreCache: true }, getCommandTimeout('Page.reload'));
-        } else {
-          await page.evaluate('window.location.reload()');
-        }
+        const result = await reloadPage(true);
         await new Promise(r => setTimeout(r, 3000));
 
         try {
@@ -2375,33 +2315,11 @@ export class PlaywrightExecutor {
             new Promise<string>((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
           ]);
           if (readyState === 'complete' || readyState === 'interactive') {
-            const note = hasOverrides ? ' (import-map overrides are active)' : '';
-            return `Page reloaded with fresh cache${note}`;
+            return result;
           }
         } catch { /* page didn't stabilize */ }
 
-        if (hasOverrides) {
-          try {
-            if (cdpSession) {
-              await sendCdpCmd('Runtime.evaluate', {
-                expression: `(function() {
-                  var keys = [];
-                  for (var i = 0; i < localStorage.length; i++) {
-                    var k = localStorage.key(i);
-                    if (k && k.indexOf('import-map-override:') === 0) keys.push(k);
-                  }
-                  keys.forEach(function(k) { localStorage.removeItem(k); });
-                  return keys.length;
-                })()`,
-              }, 3000);
-              await sendCdpCmd('Page.reload', { ignoreCache: true }, 3000);
-            }
-          } catch { /* best-effort */ }
-          return 'WARNING: Page failed to stabilize after reload — active import-map overrides may have caused a reload loop. ' +
-            'Emergency cleanup attempted: all import-map-override entries removed from localStorage.';
-        }
-
-        return 'Page reloaded but may not have fully stabilized — verify with screenshot() or snapshot()';
+        return result + ' but the page may not have stabilized. Verify with snapshot().';
       },
 
       // --- Smart page-load wait (readyState + pending-request settling) ---

@@ -1,6 +1,6 @@
 {
   "name": "spawriter",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "spawriter MCP server + CDP relay — AI-assisted browser automation for single-spa micro-frontends with 4 core MCP tools and CLI code execution",
   "main": "dist/cli.js",

@@ -224,7 +224,9 @@ describe('clear-policy wiring', () => {
 
   it('background clear-cache handler uses scoped browsingData', () => {
     const backgroundSrc = src('../../extension/src/background_script.js');
-    assert.ok(backgroundSrc.includes('buildScopedBrowsingDataArgs('));
+    assert.match(backgroundSrc, /buildScopedBrowsingDataArgs\(\s*tab\?\.url \|\| "",\s*\{ cache: true \},/);
+    const bridgeSrc = src('../../extension/src/ai_bridge/bridge.js');
+    assert.match(bridgeSrc, /buildScopedBrowsingDataArgs\(\s*tab\?\.url \|\| "",\s*\{ cache: true \},/);
     assert.ok(!/browsingData\.remove\(\s*\{\s*since:\s*0\s*\}/.test(backgroundSrc), 'no unscoped browsingData.remove');
   });
 });
