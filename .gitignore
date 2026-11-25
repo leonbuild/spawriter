@@ -18,3 +18,4 @@ spawriter/package-lock.json
 # "Keep it secret. Keep it safe." - Gandalf the Grey
 .env
 .env.local
+docs/evidence/baseline-20261125-161706/cdp.jsonl.bak
