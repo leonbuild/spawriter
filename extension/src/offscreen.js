@@ -18,6 +18,39 @@
  *     { type: "ws-state-change", state: "open"|"closed" }
  */
 
+// TransportV2 is available but not yet the default transport.
+// Set USE_TRANSPORT_V2=true to enable V2 wire protocol framing.
+// When disabled, the existing raw JSON protocol is used (backward compatible).
+let USE_TRANSPORT_V2 = false;
+let transportV2 = null;
+
+try {
+  // Dynamic import — the webpack build includes transport.js.
+  // If unavailable, fall back to v1 silently.
+  const { TransportV2: TV2 } = await import("../ai_bridge/transport.js");
+  transportV2 = new TV2({
+    keepaliveMs: 20000,
+    keepaliveTimeoutMs: 5000,
+    maxReconnectDelayMs: 30000,
+    baseReconnectDelayMs: 5000,
+  });
+  transportV2.onSend = (data) => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(data);
+  };
+  transportV2.onMessage = (envelope) => {
+    notifyServiceWorker({ type: "ws-message", payload: envelope.p });
+  };
+  transportV2.onReady = (gen) => {
+    log(`TransportV2 ready, generation ${gen}`);
+    notifyServiceWorker({ type: "ws-state-change", state: "open" });
+  };
+  transportV2.onDisconnect = (reason) => {
+    log(`TransportV2 disconnected: ${reason}`);
+  };
+} catch {
+  // TransportV2 not bundled — continue with v1.
+}
+
 const RELAY_PORT = "19989";
 const RELAY_URL = `ws://localhost:${RELAY_PORT}/extension`;
 const KEEPALIVE_MS = 20000;
@@ -78,14 +111,23 @@ async function connectWebSocket() {
       ws.onopen = () => {
         clearTimeout(timeout);
         log("WebSocket connected");
-        notifyServiceWorker({ type: "ws-state-change", state: "open" });
 
-        if (keepaliveTimer) clearInterval(keepaliveTimer);
-        keepaliveTimer = setInterval(() => {
-          if (ws?.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ method: "keepalive" }));
-          }
-        }, KEEPALIVE_MS);
+        if (USE_TRANSPORT_V2 && transportV2) {
+          // V2: let the transport handle keepalive and handshake.
+          transportV2.connectionOpened();
+          // The relay will respond with a hello-ack; handshake completes
+          // asynchronously via onmessage → transportV2.receive().
+        } else {
+          // V1: raw JSON protocol with manual keepalive.
+          notifyServiceWorker({ type: "ws-state-change", state: "open" });
+
+          if (keepaliveTimer) clearInterval(keepaliveTimer);
+          keepaliveTimer = setInterval(() => {
+            if (ws?.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ method: "keepalive" }));
+            }
+          }, KEEPALIVE_MS);
+        }
 
         resolve();
       };
@@ -97,6 +139,12 @@ async function connectWebSocket() {
     });
 
     ws.onmessage = (event) => {
+      if (USE_TRANSPORT_V2 && transportV2) {
+        // V2: let the transport decode, validate, and deliver.
+        transportV2.receive(event.data);
+        return;
+      }
+      // V1: raw JSON forwarding.
       try {
         const data = JSON.parse(event.data);
         notifyServiceWorker({ type: "ws-message", payload: data });
@@ -107,6 +155,9 @@ async function connectWebSocket() {
 
     ws.onclose = () => {
       log("WebSocket closed");
+      if (USE_TRANSPORT_V2 && transportV2) {
+        transportV2.connectionClosed("ws-close");
+      }
       if (keepaliveTimer) {
         clearInterval(keepaliveTimer);
         keepaliveTimer = null;
@@ -133,6 +184,9 @@ function scheduleReconnect() {
 }
 
 function sendToRelay(payload) {
+  if (USE_TRANSPORT_V2 && transportV2) {
+    return transportV2.send("event", payload);
+  }
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
     return true;
@@ -153,6 +207,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     sendResponse({
       state: ws?.readyState === WebSocket.OPEN ? "open" : "closed",
       connecting,
+    });
+    return;
+  }
+
+  if (message.type === "ws-transport-status") {
+    sendResponse({
+      v2Enabled: USE_TRANSPORT_V2,
+      v2Available: transportV2 !== null,
+      v2Metrics: transportV2?.metrics?.() ?? null,
     });
     return;
   }

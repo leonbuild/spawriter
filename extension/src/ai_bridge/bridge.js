@@ -5,6 +5,10 @@ import {
   buildScopedBrowsingDataArgs,
 } from "./clear-policy.js";
 import { decidePopupRelocation, POPUP_SOURCE_TTL_MS } from "./popup-relocation.mjs";
+import { TrafficGovernor } from "./traffic-governor.js";
+import { TabUIState } from "./tab-ui-state.js";
+import { DebuggerLifecycle } from "./debugger-lifecycle.js";
+import { TransportV2 } from "./transport.js";
 
 (function () {
   "use strict";
@@ -14,6 +18,47 @@ import { decidePopupRelocation, POPUP_SOURCE_TTL_MS } from "./popup-relocation.m
   let tabOwnership = new Map();
   let debuggerEventListenerRegistered = false;
   let offscreenReady = false;
+
+  // Traffic governor — rate limits, deduplicates, and trims console events at source.
+  // Prevents console storms from flooding the offscreen/relay IPC.
+  const trafficGovernor = new TrafficGovernor();
+
+  // Tab UI state manager — coalesced icon/title updates, dirty-diff tracking.
+  const tabUIStates = new Map();
+
+  function getTabUI(tabId) {
+    let ui = tabUIStates.get(tabId);
+    if (!ui) {
+      ui = new TabUIState(tabId, {
+        onIconUpdate: (icon) => {
+          chrome.action.setIcon({ tabId, path: icon }).catch(() => {});
+        },
+        onTitleUpdate: (markers) => {
+          const suffix = markers.length > 0 ? ` [${markers.join(",")}]` : "";
+          chrome.action.setTitle({ tabId, title: `spawriter${suffix}` }).catch(() => {});
+        },
+      });
+      tabUIStates.set(tabId, ui);
+    }
+    return ui;
+  }
+
+  // Debugger lifecycle — single-flight attach/detach with CDP domain init.
+  const debuggerLifecycles = new Map();
+
+  function getDebuggerLC(tabId) {
+    let lc = debuggerLifecycles.get(tabId);
+    if (!lc) {
+      lc = new DebuggerLifecycle(tabId, {
+        doAttach: (tid) => chrome.debugger.attach({ tabId: tid }, "1.3"),
+        doDetach: (tid) => chrome.debugger.detach({ tabId: tid }),
+        sendCommand: (tid, method, params) =>
+          chrome.debugger.sendCommand({ tabId: tid }, method, params || {}),
+      });
+      debuggerLifecycles.set(tabId, lc);
+    }
+    return lc;
+  }
 
   // Trace recording state
   const TRACE_MAX_EVENTS = 10000;
@@ -313,9 +358,14 @@ import { decidePopupRelocation, POPUP_SOURCE_TTL_MS } from "./popup-relocation.m
       const tabInfo = attachedTabs.get(tabId);
       if (!tabInfo) return;
 
+      // Apply traffic governance — rate limit, dedup, and trim console events;
+      // drop known noisy events at source; always forward protocol-critical.
+      const decision = trafficGovernor.evaluate(method, params, tabId);
+      if (!decision.forward) return;
+
       sendMessage({
         method: "forwardCDPEvent",
-        params: { method, sessionId: tabInfo.sessionId, params },
+        params: { method, sessionId: tabInfo.sessionId, params: decision.params },
       });
     });
 
@@ -329,6 +379,10 @@ import { decidePopupRelocation, POPUP_SOURCE_TTL_MS } from "./popup-relocation.m
 
     browser.tabs.onRemoved.addListener((tabId) => {
       popupSourceTabMap.delete(tabId);
+      trafficGovernor.removeTab(tabId);
+      tabUIStates.get(tabId)?.dispose?.();
+      tabUIStates.delete(tabId);
+      debuggerLifecycles.delete(tabId);
       emitDetachedFromTarget(tabId, "tab-removed");
       setTabState(tabId, "idle");
       updateIcons();

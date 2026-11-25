@@ -24,6 +24,7 @@ import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 import { ExecutorManager } from './pw-executor.js';
 import { getCdpClearDenial } from './cdp-clear-policy.js';
 import { createCdpLogger, DROPPED_CDP_EVENTS, NOISY_LOG_EVENTS, type CdpLogger, type CdpLogDirection } from './cdp-log.js';
+import { RelayRuntime, RelayBridge, type BridgeCallbacks } from './runtime/index.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -264,6 +265,8 @@ function claimTab(tabId: number, sessionId: string, force?: boolean): { ok: bool
   }
   tabOwners.set(tabId, { sessionId, claimedAt: Date.now() });
   sessionActivity.set(sessionId, Date.now());
+  // Dual-write: also record in the stability registry for diagnostics parity.
+  try { relayBridge?.claimTab(tabId, sessionId, force); } catch { /* registry may lack the session during migration */ }
   broadcastOwnershipEvent('Target.tabClaimed', { tabId, sessionId, claimedAt: Date.now() });
   sendOwnershipSnapshotToExtension('claim');
   return { ok: true };
@@ -279,6 +282,7 @@ function releaseTab(tabId: number, sessionId: string): boolean {
   const existing = tabOwners.get(tabId);
   if (!existing || existing.sessionId !== sessionId) return false;
   tabOwners.delete(tabId);
+  try { relayBridge?.releaseTab(tabId, sessionId); } catch { /* migration guard */ }
   broadcastOwnershipEvent('Target.tabReleased', { tabId, reason: 'explicit-release' });
   sendOwnershipSnapshotToExtension('release');
   return true;
@@ -664,9 +668,32 @@ app.get('/version', (c) => {
   return c.json({ version: VERSION });
 });
 
+app.get('/diagnostics', (c) => {
+  const rt = getOrCreateRuntime();
+  return c.json({
+    version: VERSION,
+    runtime: rt.diagnostics(),
+    legacy: {
+      tabOwners: tabOwners.size,
+      sessions: sessionActivity.size,
+      attachedTargets: attachedTargets.size,
+      cdpClients: cdpClients.size,
+      pendingRequests: pendingRequests.size,
+      virtualSessions: virtualBrowserSessions.size,
+      extensionConnected: extensionWs !== null,
+    },
+  });
+});
+
 app.post('/shutdown', (c) => {
   log('Shutdown requested via /shutdown endpoint');
-  setTimeout(() => process.exit(0), 100);
+  if (relayRuntime) {
+    relayRuntime.startDrain();
+  }
+  setTimeout(() => {
+    if (relayRuntime) relayRuntime.close();
+    process.exit(0);
+  }, 100);
   return c.json({ ok: true });
 });
 
@@ -910,6 +937,25 @@ function addPendingRequest(
     ...pending,
     timeoutId,
   });
+
+  // Dual-write to stability ledger for diagnostics parity.
+  try {
+    relayRuntime?.pending.register(
+      {
+        requestId: String(relayId),
+        clientId: pending.clientId,
+        clientMessageId: pending.clientMessageId,
+        realSessionId: pending.sessionId ?? '',
+        sessionId: pending.sessionId ?? '',
+        method: pending.method ?? 'unknown',
+        leaseEpoch: 0,
+        connectionEpoch: 0,
+        transportEpoch: 0,
+        executeEpoch: 0,
+      },
+      RELAY_REQUEST_TIMEOUT_MS,
+    );
+  } catch { /* migration guard */ }
 }
 
 // Forget a session's announce bookkeeping once a detach for it has been
@@ -1240,9 +1286,11 @@ function handleExtensionMessage(data: Buffer) {
     // on realtime/large pages — drop them before any forwarding or logging.
     const cdpMethod = cdpMethodOf(message);
     if (cdpMethod && DROPPED_CDP_EVENTS.has(cdpMethod)) {
+      relayBridge?.recordCdpDrop();
       return;
     }
     logCdp('from-extension', message);
+    relayBridge?.recordCdpForward();
 
     if (message.method === 'requestOwnershipSnapshot') {
       sendOwnershipSnapshotToExtension('requested');
@@ -1504,6 +1552,16 @@ function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: 
     if (boundSession === undefined) return true;
   }
 
+  // Dual-read: verify bridge registry agrees with legacy Maps.
+  try {
+    const callerSession = pwClientToSession.get(clientId);
+    const bridgeResult = getBridge()?.checkOwnership(tabId, callerSession);
+    if (bridgeResult && bridgeResult.allowed !== false && !bridgeResult.owner) {
+      // Bridge says allowed but legacy says blocked — log drift for diagnostics.
+      log(`OWNERSHIP DRIFT: legacy blocked but bridge allowed, client=${clientId}, tabId=${tabId}, legacyOwner=${owner.sessionId}, bridgeOwner=${bridgeResult.owner}`);
+    }
+  } catch { /* migration guard */ }
+
   // Target-announce fan-out can trigger this check ~10×/ms for the same
   // (client, tab); collapse repeats within a short window so one real conflict
   // is one log line, not a burst.
@@ -1524,6 +1582,25 @@ function checkOwnership(clientId: string, cdpSessionId: string | undefined, id: 
 }
 
 function routeCdpEvent(method: string, params: unknown, sessionId?: string): void {
+  // Record event in health metrics.
+  relayBridge?.recordCdpForward();
+
+  // Dual-read: check event attribution via bridge for diagnostics.
+  // The bridge's epoch-based fencing can detect stale events that the legacy
+  // Maps cannot. During migration this is observe-only; the legacy path
+  // remains authoritative.
+  if (sessionId && relayBridge) {
+    try {
+      const tabId = resolveTabIdFromSession(sessionId);
+      if (tabId != null) {
+        const attribution = relayBridge.shouldDeliverEvent(tabId, 0, 0);
+        if (!attribution.deliver && attribution.reason !== 'no_owner') {
+          relayBridge.recordCdpDrop();
+        }
+      }
+    } catch { /* migration guard */ }
+  }
+
   if (!sessionId) {
     broadcastToCDPClients({ method, params, sessionId });
     return;
@@ -1834,6 +1911,32 @@ export function relaySendCdp(method: string, params?: Record<string, unknown>, t
 
 const relayExecutorManager = new ExecutorManager({ maxSessions: 10, relaySendCdp });
 startStaleSweep();
+
+// ---------------------------------------------------------------------------
+// Stability module layer — RelayRuntime + Bridge
+// Instantiated at module load; relay.ts functions delegate to bridge methods
+// alongside existing logic during the incremental migration.
+// ---------------------------------------------------------------------------
+let relayRuntime: RelayRuntime | null = null;
+let relayBridge: RelayBridge | null = null;
+
+function getOrCreateRuntime(): RelayRuntime {
+  if (!relayRuntime) {
+    relayRuntime = new RelayRuntime();
+    const callbacks: BridgeCallbacks = {
+      broadcastCdpEvent: (method, params) => broadcastOwnershipEvent(method, params),
+      sendOwnershipSnapshot: (reason) => sendOwnershipSnapshotToExtension(reason),
+      log: (msg) => log(msg),
+      error: (msg) => error(msg),
+    };
+    relayBridge = new RelayBridge(relayRuntime, callbacks);
+  }
+  return relayRuntime;
+}
+
+function getBridge(): RelayBridge | null {
+  return relayBridge;
+}
 
 // ---------------------------------------------------------------------------
 // CLI control routes (inlined from former control-routes.ts)
@@ -2149,6 +2252,7 @@ export async function startRelayServer(options?: { host?: string }): Promise<htt
 
       log('Extension WebSocket connected');
       extensionWs = ws as WebSocket;
+      getOrCreateRuntime().health.setExtensionConnected(true);
       sendOwnershipSnapshotToExtension('extension-connected');
 
       ws.on('message', (data) => {
@@ -2159,6 +2263,7 @@ export async function startRelayServer(options?: { host?: string }): Promise<htt
         log('Extension WebSocket disconnected');
         if (extensionWs === ws) {
           extensionWs = null;
+          if (relayRuntime) relayRuntime.health.setExtensionConnected(false);
         }
 
         resetBridgeState('extension-disconnected');
