@@ -32,7 +32,7 @@
 | W08 | MODULE_DONE | `runtime/wire-protocol.ts`, `ext/ai_bridge/transport.js` | T18–19/T42/T45/T54/T65 partial | 18+23=41 | Envelope codec, flow control, credit backpressure, extension transport V2 |
 | W09 | MODULE_DONE | `runtime/navigation.ts` | T08/T14/T20–21 partial | 18/18 | Navigation state machine, timeout, network idle tracking |
 | W10 | MODULE_DONE | `runtime/health.ts`, `runtime/instance-lock.ts` | T22/T56 partial | 15+11=26 | Health monitor, circuit breaker, watchdog, single-instance lock |
-| W11 | DONE | `runtime/process-guard.ts`, `runtime/resource-budget.ts`, `runtime/worker-ipc.ts`, `runtime/executor-supervisor.ts`, `runtime/executor-worker.ts` | T24/T25/T57/T66/T73 partial + supervisor/worker tests | 19+15+13+10=57 | Process lifecycle + resource budget + IPC + supervisor + worker + relay wiring |
+| W11 | DONE | `runtime/process-guard.ts`, `runtime/resource-budget.ts`, `runtime/worker-ipc.ts`, `runtime/executor-supervisor.ts`, `runtime/executor-worker.ts`, `runtime/executor-e2e.test.ts` | T24/T25/T57/T66/T73 + E2E | 19+15+13+18=65 | Full Worker isolation: process lifecycle + budget + IPC + Playwright supervisor/worker + E2E IPC pipeline + relay wiring |
 | W12 | OPTIONAL | ADR | — | — | — |
 | W13 | MODULE_DONE | `ext/panel-app/import-map/refresh-coordinator.js` | T34–36 partial | 14/14 | Single-flight eval, debounce, document epoch, degraded state |
 
@@ -78,17 +78,18 @@
 | Barrel Export | `src/runtime/index.ts` | — | ~230 |
 | Config Freeze | `src/runtime/config-freeze.ts` | 10 | ~160 |
 | Gate Runner | `src/runtime/gate-runner.ts` | 10 | ~400 |
-| Executor Worker | `src/runtime/executor-worker.ts` | 4 | ~200 |
-| Executor Supervisor | `src/runtime/executor-supervisor.ts` | 6 | ~280 |
-| **Total new** | **41 modules** | **678+101=779** | **~9,650** |
+| Executor Worker | `src/runtime/executor-worker.ts` | 5 | ~260 |
+| Executor Supervisor | `src/runtime/executor-supervisor.ts` | 8 | ~320 |
+| Executor E2E | `src/runtime/executor-e2e.test.ts` | 5 | ~100 |
+| **Total new** | **42 modules** | **686+101=787** | **~10,100** |
 
 ## Test Totals
 
 | Scope | Pass | Fail |
 |---|---|---|
-| spawriter (all `src/**/*.test.ts`) | 678 | 0 |
+| spawriter (all `src/**/*.test.ts`) | 686 | 0 |
 | extension (all `src/**/*.test.js` incl. panel-app) | 101 | 0 |
-| **Total** | **779** | **0** |
+| **Total** | **787** | **0** |
 
 ## Wiring Status
 
@@ -156,11 +157,19 @@
 | G8 | ✅ PASS | Real Chrome: 23/23 regression tests — MCP core, state, navigation, content, storage, single-spa, error handling |
 
 ### Worker Isolation (§9.1) ✅ COMPLETE
-- **executor-worker.ts** — Per-execute child process entry point: IPC handling, sandboxed execution, state transfer, heartbeat, shutdown
-- **executor-supervisor.ts** — Spawns/supervises worker processes, budget enforcement, timeout management, IPC encoding, diagnostics
-- **relay.ts** — `USE_WORKER_ISOLATION=true` env var routes `/cli/execute` through ExecutorSupervisor; state round-trips via getUserState/setUserState
-- **pw-executor.ts** — Added `getUserState()`/`setUserState()` for Worker isolation state handoff
-- 10 tests (6 supervisor + 4 worker) all pass
+- **executor-worker.ts** — Per-execute child process: dual-mode execution
+  - **Playwright mode** (when `SSPA_MCP_PORT` set): imports PlaywrightExecutor, connects to Chrome via CDP, full VM globals, screenshots, snapshots, etc.
+  - **Sandbox fallback** (testing): vm.createContext with basic state/console
+  - IPC size enforcement: result 64KiB, state 256KiB, total message 16MiB
+- **executor-supervisor.ts** — Spawns/supervises worker processes:
+  - Passes relayPort/tabInfo to Worker via env vars and init payload
+  - tsx loader for TypeScript dev, stores code for deferred execute after ready
+  - Tracks resolved state to prevent duplicate resolve on normal post-execute exit
+- **relay.ts** — `USE_WORKER_ISOLATION=true` routes `/cli/execute` through ExecutorSupervisor
+  - Passes tab targetId/url from attachedTargets
+  - Extracts full Playwright result format (text/images/screenshots/isError)
+- **E2E verified**: real child processes, IPC pipeline, state transfer, concurrent PIDs, Playwright CDP connection
+- 18 tests (8 supervisor + 5 worker + 5 E2E child process) all pass
 
 ### TransportV2 Default ✅ ENABLED
 - **offscreen.js** — `USE_TRANSPORT_V2 = true` (was `false`); V2 is now the default wire protocol
