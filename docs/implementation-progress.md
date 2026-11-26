@@ -32,7 +32,7 @@
 | W08 | MODULE_DONE | `runtime/wire-protocol.ts`, `ext/ai_bridge/transport.js` | T18–19/T42/T45/T54/T65 partial | 18+23=41 | Envelope codec, flow control, credit backpressure, extension transport V2 |
 | W09 | MODULE_DONE | `runtime/navigation.ts` | T08/T14/T20–21 partial | 18/18 | Navigation state machine, timeout, network idle tracking |
 | W10 | MODULE_DONE | `runtime/health.ts`, `runtime/instance-lock.ts` | T22/T56 partial | 15+11=26 | Health monitor, circuit breaker, watchdog, single-instance lock |
-| W11 | MODULE_DONE | `runtime/process-guard.ts`, `runtime/resource-budget.ts`, `runtime/worker-ipc.ts` | T24/T25/T57/T66/T73 partial | 19+15+13=47 | Process lifecycle + resource budget + IPC message protocol |
+| W11 | DONE | `runtime/process-guard.ts`, `runtime/resource-budget.ts`, `runtime/worker-ipc.ts`, `runtime/executor-supervisor.ts`, `runtime/executor-worker.ts` | T24/T25/T57/T66/T73 partial + supervisor/worker tests | 19+15+13+10=57 | Process lifecycle + resource budget + IPC + supervisor + worker + relay wiring |
 | W12 | OPTIONAL | ADR | — | — | — |
 | W13 | MODULE_DONE | `ext/panel-app/import-map/refresh-coordinator.js` | T34–36 partial | 14/14 | Single-flight eval, debounce, document epoch, degraded state |
 
@@ -78,15 +78,17 @@
 | Barrel Export | `src/runtime/index.ts` | — | ~230 |
 | Config Freeze | `src/runtime/config-freeze.ts` | 10 | ~160 |
 | Gate Runner | `src/runtime/gate-runner.ts` | 10 | ~400 |
-| **Total new** | **39 modules** | **668+101=769** | **~9,170** |
+| Executor Worker | `src/runtime/executor-worker.ts` | 4 | ~200 |
+| Executor Supervisor | `src/runtime/executor-supervisor.ts` | 6 | ~280 |
+| **Total new** | **41 modules** | **678+101=779** | **~9,650** |
 
 ## Test Totals
 
 | Scope | Pass | Fail |
 |---|---|---|
-| spawriter (all `src/**/*.test.ts`) | 668 | 0 |
+| spawriter (all `src/**/*.test.ts`) | 678 | 0 |
 | extension (all `src/**/*.test.js` incl. panel-app) | 101 | 0 |
-| **Total** | **769** | **0** |
+| **Total** | **779** | **0** |
 
 ## Wiring Status
 
@@ -153,9 +155,23 @@
 | G7 | ✅ PASS | Real Chrome: 100/100 navigations, 0 failures, 0 timeouts, avg 1876ms, p95 3580ms |
 | G8 | ✅ PASS | Real Chrome: 23/23 regression tests — MCP core, state, navigation, content, storage, single-spa, error handling |
 
+### Worker Isolation (§9.1) ✅ COMPLETE
+- **executor-worker.ts** — Per-execute child process entry point: IPC handling, sandboxed execution, state transfer, heartbeat, shutdown
+- **executor-supervisor.ts** — Spawns/supervises worker processes, budget enforcement, timeout management, IPC encoding, diagnostics
+- **relay.ts** — `USE_WORKER_ISOLATION=true` env var routes `/cli/execute` through ExecutorSupervisor; state round-trips via getUserState/setUserState
+- **pw-executor.ts** — Added `getUserState()`/`setUserState()` for Worker isolation state handoff
+- 10 tests (6 supervisor + 4 worker) all pass
+
+### TransportV2 Default ✅ ENABLED
+- **offscreen.js** — `USE_TRANSPORT_V2 = true` (was `false`); V2 is now the default wire protocol
+- V2 provides credit-based flow control, envelope fencing, and backpressure
+- Set `USE_TRANSPORT_V2=false` only for diagnostic fallback
+
 ### Remaining Work
 
-✅ **ALL GATES PASS** — Implementation complete.
+✅ **ALL GATES PASS** — Core implementation complete.
+✅ **Worker isolation** — executor-supervisor + executor-worker ready, relay wired.
+✅ **TransportV2** — enabled as default.
 
 Evidence files:
 - `docs/evidence/g1-chrome-experiments-20261126.json` — F01-F07 + T01-T03

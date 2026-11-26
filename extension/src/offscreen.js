@@ -18,10 +18,10 @@
  *     { type: "ws-state-change", state: "open"|"closed" }
  */
 
-// TransportV2 is available but not yet the default transport.
-// Set USE_TRANSPORT_V2=true to enable V2 wire protocol framing.
-// When disabled, the existing raw JSON protocol is used (backward compatible).
-let USE_TRANSPORT_V2 = false;
+// TransportV2 is now the default transport (per stability plan §16.7).
+// V2 provides credit-based flow control, envelope fencing, and backpressure.
+// Set USE_TRANSPORT_V2=false only for diagnostic fallback to raw JSON protocol.
+let USE_TRANSPORT_V2 = true;
 let transportV2 = null;
 
 try {

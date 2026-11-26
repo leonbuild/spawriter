@@ -2444,6 +2444,16 @@ export class PlaywrightExecutor {
     };
   }
 
+  /** Get the current user state (for Worker isolation handoff). */
+  getUserState(): Record<string, unknown> {
+    return { ...this.userState };
+  }
+
+  /** Replace the user state (for Worker isolation state commit). */
+  setUserState(state: Record<string, unknown>): void {
+    this.userState = { ...state };
+  }
+
   getNetworkMonitor(): NetworkMonitor {
     return this.networkMonitor;
   }

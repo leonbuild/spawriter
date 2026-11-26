@@ -24,7 +24,7 @@ import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 import { ExecutorManager } from './pw-executor.js';
 import { getCdpClearDenial } from './cdp-clear-policy.js';
 import { createCdpLogger, DROPPED_CDP_EVENTS, NOISY_LOG_EVENTS, type CdpLogger, type CdpLogDirection } from './cdp-log.js';
-import { RelayRuntime, RelayBridge, type BridgeCallbacks } from './runtime/index.js';
+import { RelayRuntime, RelayBridge, type BridgeCallbacks, ExecutorSupervisor, type SupervisorExecuteRequest } from './runtime/index.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -1912,6 +1912,18 @@ export function relaySendCdp(method: string, params?: Record<string, unknown>, t
 const relayExecutorManager = new ExecutorManager({ maxSessions: 10, relaySendCdp });
 startStaleSweep();
 
+// ─── Worker Isolation (§9.1) ─────────────────────────────────────────────────
+// When USE_WORKER_ISOLATION=true, each execute runs in a separate child process
+// managed by ExecutorSupervisor, providing crash isolation and resource limits.
+const USE_WORKER_ISOLATION = getEnv('USE_WORKER_ISOLATION', 'false') === 'true';
+const executorSupervisor = USE_WORKER_ISOLATION ? new ExecutorSupervisor() : null;
+if (executorSupervisor) {
+  executorSupervisor.on('workerLog', (_id: string, _level: string, msg: string) => log(`[worker] ${msg}`));
+  executorSupervisor.on('workerKill', (id: string, reason: string) => error(`[worker] killed ${id}: ${reason}`));
+  log('Worker isolation enabled — each execute runs in a child process');
+}
+let workerEpochCounter = 0;
+
 // ---------------------------------------------------------------------------
 // Stability module layer — RelayRuntime + Bridge
 // Instantiated at module load; relay.ts functions delegate to bridge methods
@@ -2053,6 +2065,32 @@ app.post('/cli/execute', async (c) => {
       sessionToClientId.set(body.sessionId, newClientId);
     };
 
+    // §9.1: Worker isolation path — each execute in a child process.
+    if (executorSupervisor) {
+      const epoch = ++workerEpochCounter;
+      const workerRequest: SupervisorExecuteRequest = {
+        sessionId: body.sessionId,
+        code: body.code,
+        timeoutMs: body.timeout || 10000,
+        requestId: `r-${epoch}`,
+        executeEpoch: epoch,
+        state: executor.getUserState(),
+        stateRevision: epoch,
+      };
+      const workerResult = await executorSupervisor.execute(workerRequest);
+      if (workerResult.success && workerResult.stateCandidate) {
+        executor.setUserState(workerResult.stateCandidate);
+      }
+      if (activeTabId != null) touchClaim(activeTabId, body.sessionId);
+      return c.json({
+        text: workerResult.success ? String(workerResult.value ?? '') : (workerResult.error?.message ?? 'Worker error'),
+        images: [],
+        screenshots: [],
+        isError: !workerResult.success,
+      });
+    }
+
+    // In-process execution (default path).
     const result = await executor.execute(body.code, body.timeout || 10000);
 
     const latestPwClientId = executor.getLastCdpClientId?.();

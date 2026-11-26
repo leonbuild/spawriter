@@ -241,6 +241,13 @@ export {
 } from './relay-bridge.js';
 
 export {
+  ExecutorSupervisor,
+  type SupervisorConfig,
+  type ExecuteRequest as SupervisorExecuteRequest,
+  type ExecuteResponse as SupervisorExecuteResponse,
+} from './executor-supervisor.js';
+
+export {
   runGates,
   runG0S,
   runG0,
