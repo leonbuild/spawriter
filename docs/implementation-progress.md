@@ -79,17 +79,17 @@
 | Config Freeze | `src/runtime/config-freeze.ts` | 10 | ~160 |
 | Gate Runner | `src/runtime/gate-runner.ts` | 10 | ~400 |
 | Executor Worker | `src/runtime/executor-worker.ts` | 5 | ~260 |
-| Executor Supervisor | `src/runtime/executor-supervisor.ts` | 8 | ~320 |
+| Executor Supervisor | `src/runtime/executor-supervisor.ts` | 11 | ~400 |
 | Executor E2E | `src/runtime/executor-e2e.test.ts` | 5 | ~100 |
-| **Total new** | **42 modules** | **686+101=787** | **~10,100** |
+| **Total new** | **42 modules** | **712+101=813** | **~11,000** |
 
 ## Test Totals
 
 | Scope | Pass | Fail |
 |---|---|---|
-| spawriter (all `src/**/*.test.ts`) | 686 | 0 |
+| spawriter (all `src/**/*.test.ts`) | 712 | 0 |
 | extension (all `src/**/*.test.js` incl. panel-app) | 101 | 0 |
-| **Total** | **787** | **0** |
+| **Total** | **813** | **0** |
 
 ## Wiring Status
 
@@ -175,6 +175,25 @@
 - **offscreen.js** — `USE_TRANSPORT_V2 = true` (was `false`); V2 is now the default wire protocol
 - V2 provides credit-based flow control, envelope fencing, and backpressure
 - Set `USE_TRANSPORT_V2=false` only for diagnostic fallback
+
+### V2 Handshake (§16.7.5) ✅ COMPLETE
+- **HandshakeManager** — HELLO/WELCOME/REJECT state machine
+- Server validates version, creates proof from challenge
+- Client validates proof before establishing connection
+- 10 golden test vectors for interoperability: validHello, wrongVersion, validEnvelope, invalidVersion, seqGap, duplicateAck, oversizedFrame, oldGeneration, fenceWithRetire, cancelFence
+
+### Resource Monitoring (§16.6) ✅ COMPLETE
+- **ExecutorSupervisor.startMonitoring(500ms)** — periodic sampling of Worker resources
+- Time-based kill for Workers exceeding timeout + grace
+- `resourceViolation` events, `getResourceSamples()`, diagnostics integration
+
+### Request Dedup + Drain (D03/C11) ✅ COMPLETE
+- **RelayRuntime.registerRequest()** — code hash dedup with REQUEST_IN_PROGRESS, REQUEST_CONFLICT, ALREADY_FINISHED
+- Terminal record TTL (60s), `sweepTerminal()` cleanup
+- **startDrainWithId()** — idempotent drain with operation ID
+- **relay.ts** — `/cli/execute` checks drain + dedup before admission
+- **POST /drain**, **GET /drain/status** endpoints
+- **/diagnostics** — exposes dedup stats, drain status, supervisor state
 
 ### Remaining Work
 
