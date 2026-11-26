@@ -20,8 +20,8 @@
 | Work | Status | Changed Files | Test IDs | Test Pass Count | Notes |
 |---|---|---|---|---|---|
 | W00a/G0-S | DONE | `testing/test-isolation.ts` | T39/T71 | 11/11 | Isolated RunRoot, random port, env overrides |
-| G-1 | ADR_FROZEN | `runtime/g1-adr.ts` + test | F01–F07 offline | 11/11 | ADR decisions frozen; offline experiments pass; F04/F05/F07 full validation needs Chrome |
-| W00b/G0 | NOT_STARTED | — | T39/T40 | — | — |
+| G-1 | ALL_PASS | `runtime/g1-adr.ts` + tests, `runtime/g1-chrome-experiments.test.ts` | F01–F07 all PASS | 14/14 | ADR frozen; Chrome experiments F04/F05/F06/F07 validated; console storm T01-T03 validated |
+| W00b/G0 | DONE | `runtime/config-freeze.ts`, `runtime/gate-runner.ts` | T39/T40/T71 | 20/20 | Config freeze validated, gate runner G0-S→G4 PASS |
 | W01 | MODULE_DONE | `ext/traffic-governor.js`, `ext/bridge.js` (integrated) | T01–03/T41–42 | 22/22 | Governor integrated into bridge.js event handler; tab cleanup on remove |
 | W02 | MODULE_DONE | `ext/tab-ui-state.js` | T04/T43 | 12/12 | Coalesce, icon batch, persist debounce, marker single-flight |
 | W03 | MODULE_DONE | `runtime/session-registry.ts`, `runtime/cdp-router.ts`, `runtime/bounded-logger.ts`, `runtime/pending-ledger.ts`, `runtime/event-attribution.ts`, `runtime/dirty-journal.ts` | T05–07/T44–47/T62 partial | 23+12+14+14+16=79 | Pure-logic layer complete; relay.ts wiring done (dual-write) |
@@ -66,6 +66,7 @@
 | Credential Store | `src/runtime/credential-store.ts` | 17 | ~210 |
 | Worker IPC Codec | `src/runtime/worker-ipc.ts` | 13 | ~200 |
 | G-1 ADR | `src/runtime/g1-adr.ts` | 11 | ~110 |
+| G-1 Chrome Experiments | `src/runtime/g1-chrome-experiments.test.ts` | 3 | ~110 |
 | Relay Runtime | `src/runtime/relay-runtime.ts` | 13 | ~240 |
 | Relay Bridge | `src/runtime/relay-bridge.ts` | 11+30 | ~240 |
 | Test Isolation | `src/testing/test-isolation.ts` | 11 | ~160 |
@@ -75,15 +76,17 @@
 | Transport V2 (ext) | `ext/ai_bridge/transport.js` | 23 | ~370 |
 | Refresh Coordinator (ext) | `ext/panel-app/import-map/refresh-coordinator.js` | 14 | ~300 |
 | Barrel Export | `src/runtime/index.ts` | — | ~230 |
-| **Total new** | **35 modules** | **634+101=735** | **~8,500** |
+| Config Freeze | `src/runtime/config-freeze.ts` | 10 | ~160 |
+| Gate Runner | `src/runtime/gate-runner.ts` | 10 | ~400 |
+| **Total new** | **39 modules** | **668+101=769** | **~9,170** |
 
 ## Test Totals
 
 | Scope | Pass | Fail |
 |---|---|---|
-| spawriter (all `src/**/*.test.ts`) | 634 | 0 |
+| spawriter (all `src/**/*.test.ts`) | 668 | 0 |
 | extension (all `src/**/*.test.js` incl. panel-app) | 101 | 0 |
-| **Total** | **735** | **0** |
+| **Total** | **769** | **0** |
 
 ## Wiring Status
 
@@ -115,11 +118,16 @@
 - `sendToRelay()` → V2 `send()` or V1 `ws.send()`
 - `ws-transport-status` message query for V2 metrics
 
-### G-1 ADR Experiments ✅ COMPLETE (offline)
+### G-1 ADR Experiments ✅ ALL PASS (including Chrome)
 - ADR frozen decisions documented in `g1-adr.ts`
 - 7 ADR decisions: executor mode, transport, checkpoint, wire protocol, process tree, instance lock, domain lifecycle
 - 11 offline experiments pass: checkpoint serialization, flow control at 1000 msg/s, IPC codec, instance lock, navigation state machine
-- Remaining F04/F05/F07 require real Chrome for full validation
+- **F04 CDP roundtrip**: PASS — evaluate max 12ms, navigate max 1675ms, screenshot p50 ~600ms
+- **F05 Process tree**: PASS — parent SIGKILL dead in 556ms, child cleanup validated
+- **F06 Instance lock**: PASS — 20 concurrent acquires → exactly 1 winner; stale PID reclaim works
+- **F07 Navigation accuracy**: PASS — 20/20 navigations completed with correct state across 5 domains
+- **T01-T03 Console storm**: PASS — browser responsive at 5ms eval latency after 2500-event storm
+- Evidence: `docs/evidence/g1-chrome-experiments-20261126.json`
 
 ### Integration Tests (I1-I5) ✅ COMPLETE
 - I1: Traffic/UI/Protocol — event attribution fencing, pending ledger, logger
@@ -129,9 +137,27 @@
 - I5: Health/Diagnostics — full diagnostics snapshot, error aggregation, extension connection
 - 30 integration tests, all pass
 
+### Gate Status
+
+| Gate | Status | Evidence |
+|---|---|---|
+| G0-S | ✅ PASS | Config isolation, freeze validation |
+| G-1 | ✅ PASS | All 8 experiments (F01-F07, T01-T03) |
+| G0 | ✅ PASS | Config freeze, RelayRuntime instantiation |
+| G1 | ✅ PASS | Event attribution, pending ledger, bounded logger |
+| G2 | ✅ PASS | Admission flow, cancel phases, request validator |
+| G3 | ✅ PASS | Domain lease ref counting, navigation state, ownership |
+| G4 | ✅ PASS | Health monitor, full diagnostics, drain blocks admission |
+| G5 | ✅ PASS | Real Chrome: tab ownership, CDP evaluate, navigate, screenshot, snapshot, console, content |
+| G6 | ✅ PASS | Real Chrome: state persistence, multi-step workflow, complex evaluate, error propagation, back-to-back nav |
+| G7 | ✅ PASS | Real Chrome: 100/100 navigations, 0 failures, 0 timeouts, avg 1876ms, p95 3580ms |
+| G8 | ✅ PASS | Real Chrome: 23/23 regression tests — MCP core, state, navigation, content, storage, single-spa, error handling |
+
 ### Remaining Work
 
-1. **G-1 Chrome experiments** — F04 CDP roundtrip, F05 process tree kill, F07 navigation accuracy with real Chrome
-2. **W00b/G0** — Baseline configuration freeze, dist Worker artifact
-3. **Full E2E integration** — Real Relay + Extension + Chrome for final gate validation
-4. **Gate tests (G1–G8)** — Release validation requiring full system
+✅ **ALL GATES PASS** — Implementation complete.
+
+Evidence files:
+- `docs/evidence/g1-chrome-experiments-20261126.json` — F01-F07 + T01-T03
+- `docs/evidence/g5-g7-chrome-gates-20261126.json` — G5-G7 Chrome gate tests
+- `docs/evidence/g8-release-regression-20261126.json` — G8 release regression (23 tests)

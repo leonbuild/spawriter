@@ -1,0 +1,61 @@
+{
+  "experiment": "G5-G7 Chrome Gate Tests",
+  "timestamp": "2026-11-26T01:30:00.000Z",
+  "environment": {
+    "node": "v26.3.0",
+    "os": "Windows 10.0.26300",
+    "spawriter": "1.1.0",
+    "transport": "spawriter MCP (WebSocket via offscreen)"
+  },
+  "gates": {
+    "G5": {
+      "status": "PASS",
+      "tests": 7,
+      "passed": 7,
+      "failed": 0,
+      "details": [
+        "G5-T1: Tab claimed and accessible",
+        "G5-T2: CDP evaluate through relay",
+        "G5-T3: Navigate through relay",
+        "G5-T4: Screenshot through relay (688ms)",
+        "G5-T5: A11y snapshot through relay",
+        "G5-T6: Console event capture (marker found)",
+        "G5-T7: Page content extraction (3595 chars)"
+      ]
+    },
+    "G6": {
+      "status": "PASS",
+      "tests": 6,
+      "passed": 6,
+      "failed": 0,
+      "details": [
+        "G6-T1: State persists across execute calls",
+        "G6-T2: Multi-step workflow (navigate + evaluate + extract)",
+        "G6-T3: Snapshot for interact",
+        "G6-T4: Complex evaluate with nested return values",
+        "G6-T5: Error propagation (intentional throw caught)",
+        "G6-T6: Back-to-back navigations"
+      ]
+    },
+    "G7": {
+      "status": "PASS",
+      "tests": 100,
+      "passed": 100,
+      "failed": 0,
+      "timeouts": 0,
+      "successRate": "100.0%",
+      "totalDurationMs": 202681,
+      "stats": {
+        "min_ms": 741,
+        "max_ms": 8728,
+        "p50_ms": 1738,
+        "p95_ms": 3580,
+        "p99_ms": 8728,
+        "avg_ms": 1876
+      },
+      "browserHealthyAfter": true,
+      "domains": ["example.com", "google.com", "httpbin.org", "example.org", "wikipedia.org"],
+      "notes": "100 navigations across 5 domains, 0 failures, 0 timeouts, browser remained healthy"
+    }
+  }
+}

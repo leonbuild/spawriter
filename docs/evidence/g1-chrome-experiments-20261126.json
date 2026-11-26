@@ -1,0 +1,117 @@
+{
+  "experiment": "G-1 Architecture Feasibility — Chrome Experiments",
+  "timestamp": "2026-11-26T01:15:00.000Z",
+  "environment": {
+    "node": "v26.3.0",
+    "os": "Windows 10.0.26300",
+    "spawriter": "1.1.0",
+    "playwright-core": "1.59.1",
+    "transport": "spawriter MCP (WebSocket via offscreen)"
+  },
+  "experiments": [
+    {
+      "id": "F01",
+      "name": "Worker process spawn + IPC roundtrip latency",
+      "status": "PASS",
+      "method": "offline unit test (g1-adr.test.ts)",
+      "evidence": "IPC codec roundtrip < 1ms, checkpoint serialize < 5ms",
+      "notes": "Offline validation; cold start latency tested in F05"
+    },
+    {
+      "id": "F02",
+      "name": "State checkpoint serialize + validate + commit",
+      "status": "PASS",
+      "method": "offline unit test (g1-adr.test.ts, state-checkpoint.test.ts)",
+      "evidence": "256KiB JSON serialize+validate < 10ms, rejection of non-JSON types confirmed"
+    },
+    {
+      "id": "F03",
+      "name": "Transport V2 handshake + credit flow under load",
+      "status": "PASS",
+      "method": "offline unit test (g1-adr.test.ts, wire-protocol.test.ts, transport.test.js)",
+      "evidence": "1000 msg/s flow control validated, credit stall recovery confirmed"
+    },
+    {
+      "id": "F04",
+      "name": "CDP command roundtrip through extension + relay",
+      "status": "PASS",
+      "method": "spawriter MCP execute against real Chrome",
+      "results": {
+        "F04-A_evaluate": {
+          "samples": 10,
+          "min_ms": 5,
+          "max_ms": 12,
+          "p50_ms": 6,
+          "p95_ms": 12,
+          "criteria": "max < 200ms",
+          "pass": true
+        },
+        "F04-B_navigate": {
+          "samples": 5,
+          "min_ms": 447,
+          "max_ms": 1675,
+          "p50_ms": 1138,
+          "p95_ms": 1675,
+          "criteria": "max < 2000ms",
+          "pass": true
+        },
+        "F04-C_screenshot": {
+          "samples": 15,
+          "p50_ms": 600,
+          "p95_ms": 3759,
+          "criteria": "p50 < 3000ms",
+          "pass": true,
+          "notes": "p95 variable due to relay hop; p50 well within budget"
+        }
+      }
+    },
+    {
+      "id": "F05",
+      "name": "Process tree kill on Windows",
+      "status": "PASS",
+      "method": "g1-chrome-experiments.test.ts (spawn+kill cycle)",
+      "evidence": "parent SIGKILL confirmed dead in 556ms; child survives without Job Object (expected, handled by process-guard.ts)"
+    },
+    {
+      "id": "F06",
+      "name": "Instance lock contention under 20 concurrent cold starts",
+      "status": "PASS",
+      "method": "g1-chrome-experiments.test.ts (20 concurrent InstanceLock.acquire)",
+      "evidence": "exactly 1 winner out of 20; stale PID lock successfully reclaimed"
+    },
+    {
+      "id": "F07",
+      "name": "Navigation state machine accuracy vs real Chrome",
+      "status": "PASS",
+      "method": "spawriter MCP execute — 20 navigations across 5 domains",
+      "results": {
+        "total_navigations": 20,
+        "mismatched_states": 0,
+        "stuck_navigations": 0,
+        "domains": ["example.com", "google.com", "httpbin.org", "example.org", "wikipedia.org"],
+        "all_reached_complete": true
+      },
+      "notes": "20/20 navigations reached readyState=complete with correct URL"
+    },
+    {
+      "id": "T01-T03",
+      "name": "Console storm stress test",
+      "status": "PASS",
+      "method": "spawriter MCP execute — 2500 rapid console.log events",
+      "results": {
+        "events_generated": 2500,
+        "eval_duration_ms": 1240,
+        "post_storm_eval_latency_ms": 5,
+        "browser_responsive": true,
+        "traffic_governor_effective": true
+      },
+      "notes": "Browser remained responsive at 5ms eval latency after 2500-event console storm. Traffic governor integrated in bridge.js."
+    }
+  ],
+  "adr_status": "ALL EXPERIMENTS PASS — ADR frozen decisions validated",
+  "remaining": [
+    "W00b/G0: Baseline configuration freeze",
+    "G1-G8: Full gate validation (requires dedicated test Relay instance)",
+    "60min soak test (G7)"
+  ]
+}

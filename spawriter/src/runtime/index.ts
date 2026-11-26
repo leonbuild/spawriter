@@ -104,6 +104,14 @@ export {
 } from './config.js';
 
 export {
+  FROZEN_DEFAULTS,
+  FREEZE_DATE,
+  FREEZE_BUILD_SHA,
+  validateAgainstFreeze,
+  loadAndValidateConfig,
+} from './config-freeze.js';
+
+export {
   InstanceLock,
   type LockInfo,
   type LockResult,
@@ -231,3 +239,16 @@ export {
   type ClaimResult,
   type AdmitResult,
 } from './relay-bridge.js';
+
+export {
+  runGates,
+  runG0S,
+  runG0,
+  runG1,
+  runG2,
+  runG3,
+  runG4,
+  type GateResult,
+  type GateReport,
+  type GateStatus,
+} from './gate-runner.js';

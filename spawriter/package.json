@@ -16,6 +16,11 @@
     "build:assets": "node scripts/build-client-bundles.mjs",
     "watch": "tsc -w",
     "test": "node scripts/build-client-bundles.mjs && tsx --test \"src/**/*.test.ts\"",
+    "test:unit": "tsx --test \"src/runtime/*.test.ts\" \"src/testing/*.test.ts\"",
+    "test:integration": "tsx --test \"src/runtime/integration.test.ts\" \"src/runtime/g1-chrome-experiments.test.ts\"",
+    "test:stability": "tsx --test \"src/runtime/*.test.ts\" \"src/testing/*.test.ts\" \"src/runtime/integration.test.ts\"",
+    "test:all": "node scripts/build-client-bundles.mjs && tsx --test \"src/**/*.test.ts\"",
+    "test:gates": "tsx src/runtime/gate-runner.ts --gate all",
     "typecheck": "tsc --noEmit",
     "start:relay": "tsx src/relay.ts",
     "start:mcp": "tsx src/mcp.ts"

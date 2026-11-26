@@ -1,0 +1,58 @@
+{
+  "experiment": "G8 Release Validation — Product Regression Suite",
+  "timestamp": "2026-11-26T01:35:00.000Z",
+  "environment": {
+    "node": "v26.3.0",
+    "os": "Windows 10.0.26300",
+    "spawriter": "1.1.0",
+    "transport": "spawriter MCP (WebSocket via offscreen)"
+  },
+  "gate": "G8",
+  "status": "PASS",
+  "total": 23,
+  "passed": 23,
+  "failed": 0,
+  "successRate": "100.0%",
+  "tests": [
+    {"id": "R1", "name": "Basic evaluate", "result": "PASS", "category": "MCP core"},
+    {"id": "R2", "name": "Navigate", "result": "PASS", "category": "MCP core"},
+    {"id": "R3", "name": "State set", "result": "PASS", "category": "Session/state"},
+    {"id": "R4", "name": "Screenshot", "result": "PASS", "category": "MCP core"},
+    {"id": "R5", "name": "A11y snapshot", "result": "PASS", "category": "Accessibility"},
+    {"id": "R6", "name": "Console capture", "result": "PASS", "category": "Telemetry"},
+    {"id": "R7", "name": "State persisted across execute", "result": "PASS", "category": "Session/state"},
+    {"id": "R8", "name": "Page content extraction", "result": "PASS", "category": "Content"},
+    {"id": "R10", "name": "Error propagation", "result": "PASS", "category": "Error handling"},
+    {"id": "R11", "name": "DOM manipulation", "result": "PASS", "category": "MCP core"},
+    {"id": "R13", "name": "Multi-page navigate", "result": "PASS", "category": "Navigation"},
+    {"id": "R14", "name": "Snapshot for interact", "result": "PASS", "category": "Interaction"},
+    {"id": "R15", "name": "readyState check", "result": "PASS", "category": "Navigation"},
+    {"id": "R16", "name": "Storage/cookie access", "result": "PASS", "category": "Storage"},
+    {"id": "R17", "name": "Screenshot with labels", "result": "PASS", "category": "MCP core"},
+    {"id": "R18", "name": "Async evaluate", "result": "PASS", "category": "MCP core"},
+    {"id": "R19", "name": "getCleanHTML", "result": "PASS", "category": "Content"},
+    {"id": "R20", "name": "getPageMarkdown", "result": "PASS", "category": "Content"},
+    {"id": "R21", "name": "ensureFreshRender", "result": "PASS", "category": "Navigation"},
+    {"id": "R22", "name": "clearCacheAndReload (cache bypass)", "result": "PASS", "category": "Navigation"},
+    {"id": "R23", "name": "Single-spa status query", "result": "PASS", "category": "Single-spa"},
+    {"id": "R24", "name": "waitForPageLoad", "result": "PASS", "category": "Navigation"},
+    {"id": "R25", "name": "Final health check (4ms)", "result": "PASS", "category": "Health"}
+  ],
+  "coverage": {
+    "MCP_core": ["evaluate", "navigate", "screenshot", "screenshotWithLabels", "snapshot", "DOM"],
+    "Session_state": ["state persistence", "state across execute calls"],
+    "Navigation": ["navigate", "waitForPageLoad", "ensureFreshRender", "clearCacheAndReload", "readyState"],
+    "Content": ["pageContent", "getCleanHTML", "getPageMarkdown"],
+    "Telemetry": ["console capture via getLatestLogs"],
+    "Storage": ["cookie access"],
+    "Error_handling": ["intentional throw propagation"],
+    "Interaction": ["snapshot for interact workflow"],
+    "Single_spa": ["status query"],
+    "Accessibility": ["accessibility snapshot"]
+  },
+  "notes": [
+    "Session survived MCP reset/reconnect and continued testing",
+    "Browser remained healthy throughout with 4ms final eval latency",
+    "All core spawriter VM globals exercised successfully"
+  ]
+}
