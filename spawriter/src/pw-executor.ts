@@ -3,7 +3,7 @@ import * as vm from 'node:vm';
 import * as util from 'node:util';
 import * as crypto from 'node:crypto';
 import * as acorn from 'acorn';
-import { getCdpUrl, getRelayPort, getRelayToken, log, error } from './utils.js';
+import { getCdpUrl, getRelayPort, getRelayToken, getEnv, log, error } from './utils.js';
 import {
   type AXNode,
   type RefInfo,
@@ -572,7 +572,10 @@ export class PlaywrightExecutor {
     const clientId = `pw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.lastCdpClientId = clientId;
     this.onCdpClientCreated?.(clientId);
-    const cdpUrl = getCdpUrl(port, clientId);
+    // Worker processes set WORKER_SESSION to bind the CDP client to their session
+    // at connect time, ensuring the relay's target visibility routes events correctly.
+    const workerSession = getEnv('WORKER_SESSION');
+    const cdpUrl = getCdpUrl(port, clientId, workerSession || undefined);
 
     this.logger.log('Connecting Playwright over CDP:', cdpUrl);
 

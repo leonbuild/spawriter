@@ -1915,7 +1915,9 @@ startStaleSweep();
 // ─── Worker Isolation (§9.1) ─────────────────────────────────────────────────
 // When USE_WORKER_ISOLATION=true, each execute runs in a separate child process
 // managed by ExecutorSupervisor, providing crash isolation and resource limits.
-const USE_WORKER_ISOLATION = getEnv('USE_WORKER_ISOLATION', 'false') === 'true';
+// §9.1: "独立进程是必做交付" — Worker isolation is the production default.
+// Set USE_WORKER_ISOLATION=false only for diagnostic/development fallback.
+const USE_WORKER_ISOLATION = getEnv('USE_WORKER_ISOLATION', 'true') !== 'false';
 const executorSupervisor = USE_WORKER_ISOLATION
   ? new ExecutorSupervisor({ relayPort: getRelayPort() })
   : null;

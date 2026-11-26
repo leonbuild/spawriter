@@ -33,9 +33,10 @@ export function getAllowedExtensionIds(): string[] {
     .filter((id) => id.length > 0);
 }
 
-export function getCdpUrl(port: number, clientId?: string): string {
+export function getCdpUrl(port: number, clientId?: string, sessionId?: string): string {
   const id = clientId ?? "default";
-  return `ws://127.0.0.1:${port}/cdp/${id}`;
+  const base = `ws://127.0.0.1:${port}/cdp/${id}`;
+  return sessionId ? `${base}?session=${encodeURIComponent(sessionId)}` : base;
 }
 
 export function isLocalhost(address: string): boolean {
