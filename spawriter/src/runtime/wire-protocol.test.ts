@@ -6,7 +6,12 @@ import {
   decodeEnvelope,
   validateEnvelope,
   FlowControl,
+  HandshakeManager,
+  GOLDEN_VECTORS,
   type WireEnvelope,
+  type HelloMessage,
+  type WelcomeMessage,
+  type RejectMessage,
 } from './wire-protocol.js';
 
 describe('WireProtocol', () => {
@@ -142,5 +147,125 @@ describe('FlowControl', () => {
       assert.equal(diag.sendCredit, 4);
       assert.equal(diag.outstanding, 0);
     });
+  });
+});
+
+describe('HandshakeManager', () => {
+  it('creates HELLO message', () => {
+    const mgr = new HandshakeManager();
+    const hello = mgr.createHello();
+    assert.equal(hello.type, 'hello');
+    assert.equal(hello.version, 2);
+    assert(hello.challenge.startsWith('ch-'));
+    assert(hello.capabilities.includes('v2-flow'));
+    assert.equal(mgr.getState(), 'hello_sent');
+  });
+
+  it('server processes HELLO and returns WELCOME', () => {
+    const server = new HandshakeManager({ instanceId: 'srv-1' });
+    const hello: HelloMessage = {
+      type: 'hello', version: 2,
+      challenge: 'test-ch', capabilities: ['v2-flow', 'v2-fence'],
+    };
+    const response = server.processHello(hello);
+    assert.equal(response.type, 'welcome');
+    assert.equal(server.getState(), 'established');
+    const welcome = response as WelcomeMessage;
+    assert.equal(welcome.proof, 'proof-test-ch');
+    assert(welcome.features.includes('v2-flow'));
+    assert.equal(welcome.instanceId, 'srv-1');
+  });
+
+  it('server rejects wrong version HELLO', () => {
+    const server = new HandshakeManager();
+    const hello: HelloMessage = {
+      type: 'hello', version: 99,
+      challenge: 'ch-wrong', capabilities: [],
+    };
+    const response = server.processHello(hello);
+    assert.equal(response.type, 'reject');
+    assert.equal(server.getState(), 'rejected');
+    assert.equal((response as RejectMessage).code, 'VERSION_MISMATCH');
+  });
+
+  it('client validates WELCOME proof', () => {
+    const client = new HandshakeManager();
+    const hello = client.createHello();
+
+    const server = new HandshakeManager();
+    const welcome = server.processHello(hello) as WelcomeMessage;
+
+    const accepted = client.processWelcome(welcome);
+    assert.equal(accepted, true);
+    assert.equal(client.getState(), 'established');
+  });
+
+  it('client rejects bad proof', () => {
+    const client = new HandshakeManager();
+    client.createHello();
+
+    const fakeWelcome: WelcomeMessage = {
+      type: 'welcome', version: 2, proof: 'wrong-proof',
+      telemetryCredit: 256000, criticalCredit: 512000, features: [],
+    };
+    const accepted = client.processWelcome(fakeWelcome);
+    assert.equal(accepted, false);
+  });
+
+  it('reset returns to idle', () => {
+    const mgr = new HandshakeManager();
+    mgr.createHello();
+    assert.equal(mgr.getState(), 'hello_sent');
+    mgr.reset();
+    assert.equal(mgr.getState(), 'idle');
+  });
+
+  it('diagnostics returns config', () => {
+    const mgr = new HandshakeManager({ buildId: 'test-123' });
+    const diag = mgr.diagnostics();
+    assert.equal(diag.state, 'idle');
+    assert.equal(diag.buildId, 'test-123');
+    assert.equal(diag.version, 2);
+  });
+});
+
+describe('Golden Vectors (§16.7.5)', () => {
+  it('validHello produces WELCOME', () => {
+    const server = new HandshakeManager();
+    const result = server.processHello(GOLDEN_VECTORS.validHello.input);
+    assert.equal(result.type, 'welcome');
+  });
+
+  it('wrongVersion produces REJECT', () => {
+    const server = new HandshakeManager();
+    const result = server.processHello(GOLDEN_VECTORS.wrongVersion.input);
+    assert.equal(result.type, 'reject');
+    assert.equal((result as RejectMessage).code, 'VERSION_MISMATCH');
+  });
+
+  it('validEnvelope decodes successfully', () => {
+    const decoded = decodeEnvelope(GOLDEN_VECTORS.validEnvelope.input);
+    assert.notEqual(decoded, null);
+    assert.equal(decoded!.v, 2);
+    assert.equal(decoded!.k, 'control');
+  });
+
+  it('invalidVersion fails to decode', () => {
+    const decoded = decodeEnvelope(GOLDEN_VECTORS.invalidVersion.input);
+    assert.equal(decoded, null);
+  });
+
+  it('seqGap is detectable', () => {
+    const frames = GOLDEN_VECTORS.seqGap.frames;
+    assert.equal(frames[0].seq, 1);
+    assert.equal(frames[1].seq, 5);
+    assert(frames[1].seq - frames[0].seq > 1, 'Gap should be detectable');
+  });
+
+  it('fenceWithRetire has correct structure', () => {
+    const fence = GOLDEN_VECTORS.fenceWithRetire.input;
+    assert.equal(fence.type, 'fence');
+    assert.equal(fence.generation, 5);
+    assert.equal(fence.retireGen, 4);
   });
 });

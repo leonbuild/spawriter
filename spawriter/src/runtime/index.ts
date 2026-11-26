@@ -150,6 +150,13 @@ export {
   type MessageKind,
   type ControlPayload,
   type FlowControlConfig,
+  HandshakeManager,
+  type HandshakeState,
+  type HandshakeConfig,
+  type HelloMessage,
+  type WelcomeMessage,
+  type RejectMessage,
+  GOLDEN_VECTORS,
 } from './wire-protocol.js';
 
 export {

@@ -247,6 +247,107 @@ export class RelayRuntime {
     }
   }
 
+  // ─── Request Dedup (D03/§16.5) ──────────────────────────────────────
+
+  private readonly activeRequests = new Map<string, { sessionId: string; startMono: number; codeHash: string }>();
+  private readonly terminalRequests = new Map<string, { sessionId: string; outcome: string; completedMono: number }>();
+  private readonly TERMINAL_TTL_MS = 60_000;
+
+  /**
+   * Register a new execute request. Returns null if accepted, or an error string if rejected.
+   */
+  registerRequest(requestId: string, sessionId: string, codeHash: string): string | null {
+    if (this._draining) return 'DRAINING';
+
+    // Check active — same ID already running.
+    const active = this.activeRequests.get(requestId);
+    if (active) {
+      if (active.codeHash !== codeHash) return 'REQUEST_CONFLICT';
+      return 'REQUEST_IN_PROGRESS';
+    }
+
+    // Check terminal — recently completed.
+    const terminal = this.terminalRequests.get(requestId);
+    if (terminal) return 'ALREADY_FINISHED';
+
+    this.activeRequests.set(requestId, { sessionId, startMono: monoNowMs(), codeHash });
+    return null;
+  }
+
+  /**
+   * Complete a request and move it to terminal state.
+   */
+  completeRequest(requestId: string, outcome: string): void {
+    const active = this.activeRequests.get(requestId);
+    if (!active) return;
+    this.activeRequests.delete(requestId);
+    this.terminalRequests.set(requestId, {
+      sessionId: active.sessionId,
+      outcome,
+      completedMono: monoNowMs(),
+    });
+  }
+
+  /**
+   * Sweep expired terminal records.
+   */
+  sweepTerminal(): number {
+    const now = monoNowMs();
+    let swept = 0;
+    for (const [id, rec] of this.terminalRequests) {
+      if (now - rec.completedMono > this.TERMINAL_TTL_MS) {
+        this.terminalRequests.delete(id);
+        swept++;
+      }
+    }
+    return swept;
+  }
+
+  /**
+   * Get dedup stats.
+   */
+  dedupStats(): { active: number; terminal: number } {
+    return { active: this.activeRequests.size, terminal: this.terminalRequests.size };
+  }
+
+  // ─── Drain (C11/§16.5) ────────────────────────────────────────────
+
+  private drainId: string | null = null;
+  private drainStartMono = 0;
+  private readonly drainDeadlineMs: number = 30_000;
+
+  /**
+   * Start drain with a unique drain ID.
+   * Returns the drain ID or null if already draining.
+   */
+  startDrainWithId(operationId: string): string | null {
+    if (this.drainId) return this.drainId; // idempotent
+    this.drainId = operationId;
+    this.drainStartMono = monoNowMs();
+    this._draining = true;
+    this.coordinator.startDrain();
+    return this.drainId;
+  }
+
+  /**
+   * Check drain status.
+   */
+  drainStatus(): { draining: boolean; drainId: string | null; activeRequests: number; elapsedMs: number } {
+    return {
+      draining: this._draining,
+      drainId: this.drainId,
+      activeRequests: this.activeRequests.size,
+      elapsedMs: this.drainId ? monoNowMs() - this.drainStartMono : 0,
+    };
+  }
+
+  /**
+   * Check if drain is complete (no active requests).
+   */
+  isDrainComplete(): boolean {
+    return this._draining && this.activeRequests.size === 0;
+  }
+
   // ─── Diagnostics ───────────────────────────────────────────────────
 
   diagnostics(): RuntimeDiagnostics {

@@ -184,4 +184,73 @@ describe('RelayRuntime — composition root', () => {
       assert.equal(m.eventsDropped, 2);
     });
   });
+
+  describe('request dedup (D03)', () => {
+    it('accepts a new request', () => {
+      const result = runtime.registerRequest('r-100', 'sw-test1', 'hash-abc');
+      assert.equal(result, null);
+    });
+
+    it('rejects duplicate active request', () => {
+      runtime.registerRequest('r-200', 'sw-test1', 'hash-xyz');
+      const result = runtime.registerRequest('r-200', 'sw-test1', 'hash-xyz');
+      assert.equal(result, 'REQUEST_IN_PROGRESS');
+    });
+
+    it('detects code hash conflict', () => {
+      runtime.registerRequest('r-300', 'sw-test1', 'hash-aaa');
+      const result = runtime.registerRequest('r-300', 'sw-test1', 'hash-bbb');
+      assert.equal(result, 'REQUEST_CONFLICT');
+    });
+
+    it('moves to terminal on complete', () => {
+      runtime.registerRequest('r-400', 'sw-test1', 'hash-ccc');
+      runtime.completeRequest('r-400', 'succeeded');
+      const result = runtime.registerRequest('r-400', 'sw-test1', 'hash-ccc');
+      assert.equal(result, 'ALREADY_FINISHED');
+    });
+
+    it('reports dedup stats', () => {
+      const stats = runtime.dedupStats();
+      assert(typeof stats.active === 'number');
+      assert(typeof stats.terminal === 'number');
+    });
+  });
+
+  describe('drain (C11)', () => {
+    it('starts drain with ID', () => {
+      const freshRuntime = new RelayRuntime();
+      const drainId = freshRuntime.startDrainWithId('drain-001');
+      assert.equal(drainId, 'drain-001');
+      assert.equal(freshRuntime.isDraining, true);
+    });
+
+    it('returns same ID on duplicate drain', () => {
+      const freshRuntime = new RelayRuntime();
+      freshRuntime.startDrainWithId('drain-002');
+      const id2 = freshRuntime.startDrainWithId('drain-003');
+      assert.equal(id2, 'drain-002');
+    });
+
+    it('rejects requests during drain', () => {
+      const freshRuntime = new RelayRuntime();
+      freshRuntime.startDrainWithId('drain-004');
+      const result = freshRuntime.registerRequest('r-500', 'sw-test1', 'hash-ddd');
+      assert.equal(result, 'DRAINING');
+    });
+
+    it('reports drain status', () => {
+      const freshRuntime = new RelayRuntime();
+      freshRuntime.startDrainWithId('drain-005');
+      const status = freshRuntime.drainStatus();
+      assert.equal(status.draining, true);
+      assert.equal(status.drainId, 'drain-005');
+    });
+
+    it('drain is complete when no active requests', () => {
+      const freshRuntime = new RelayRuntime();
+      freshRuntime.startDrainWithId('drain-006');
+      assert.equal(freshRuntime.isDrainComplete(), true);
+    });
+  });
 });

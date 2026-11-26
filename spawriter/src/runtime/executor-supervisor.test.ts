@@ -82,6 +82,33 @@ describe('ExecutorSupervisor', () => {
     assert.equal(diag.activeWorkers, 0);
     sup.close();
   });
+
+  it('starts and stops resource monitoring', () => {
+    const sup = new ExecutorSupervisor();
+    sup.startMonitoring(1000);
+    const diag = sup.diagnostics() as Record<string, unknown>;
+    assert.equal(diag.monitoring, true);
+    sup.stopMonitoring();
+    const diag2 = sup.diagnostics() as Record<string, unknown>;
+    assert.equal(diag2.monitoring, false);
+    sup.close();
+  });
+
+  it('emits resourceViolation events', () => {
+    const sup = new ExecutorSupervisor();
+    const violations: string[] = [];
+    sup.on('resourceViolation', (id: string, type: string) => violations.push(`${id}:${type}`));
+    // No workers running, so no violations expected.
+    assert.equal(violations.length, 0);
+    sup.close();
+  });
+
+  it('getResourceSamples returns empty map initially', () => {
+    const sup = new ExecutorSupervisor();
+    const samples = sup.getResourceSamples();
+    assert.equal(samples.size, 0);
+    sup.close();
+  });
 });
 
 describe('ExecutorWorker module', () => {

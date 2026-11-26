@@ -673,6 +673,10 @@ app.get('/diagnostics', (c) => {
   return c.json({
     version: VERSION,
     runtime: rt.diagnostics(),
+    dedup: rt.dedupStats(),
+    drain: rt.drainStatus(),
+    workerIsolation: USE_WORKER_ISOLATION,
+    supervisor: executorSupervisor?.diagnostics() ?? null,
     legacy: {
       tabOwners: tabOwners.size,
       sessions: sessionActivity.size,
@@ -685,13 +689,28 @@ app.get('/diagnostics', (c) => {
   });
 });
 
+app.post('/drain', async (c) => {
+  const { operationId } = await c.req.json<{ operationId?: string }>().catch(() => ({} as { operationId?: string }));
+  const opId = operationId ?? `drain-${Date.now()}`;
+  const rt = getOrCreateRuntime();
+  const drainId = rt.startDrainWithId(opId);
+  log(`Drain started: ${drainId}`);
+  return c.json({ drainId, status: rt.drainStatus() });
+});
+
+app.get('/drain/status', (c) => {
+  const rt = getOrCreateRuntime();
+  return c.json(rt.drainStatus());
+});
+
 app.post('/shutdown', (c) => {
   log('Shutdown requested via /shutdown endpoint');
-  if (relayRuntime) {
-    relayRuntime.startDrain();
+  const rt = getOrCreateRuntime();
+  if (!rt.isDraining) {
+    rt.startDrainWithId(`shutdown-${Date.now()}`);
   }
   setTimeout(() => {
-    if (relayRuntime) relayRuntime.close();
+    rt.close();
     process.exit(0);
   }, 100);
   return c.json({ ok: true });
@@ -1979,6 +1998,25 @@ app.use('/cli/*', async (c, next) => {
 app.post('/cli/execute', async (c) => {
   try {
     const body = await c.req.json() as { sessionId: string; code: string; timeout?: number; cwd?: string };
+
+    // §16.5 Drain and dedup: check admission before proceeding.
+    const rt = getOrCreateRuntime();
+    if (rt.isDraining) {
+      return c.json({ text: 'Server is draining — not accepting new execute requests.', images: [], screenshots: [], isError: true }, 503);
+    }
+
+    // Request dedup: generate a request ID from session + code hash.
+    const crypto = await import('node:crypto');
+    const codeHash = crypto.createHash('sha256').update(body.code).digest('hex').slice(0, 16);
+    const requestId = `${body.sessionId}-${codeHash}-${Date.now()}`;
+    const dedupResult = rt.registerRequest(requestId, body.sessionId, codeHash);
+    if (dedupResult === 'REQUEST_IN_PROGRESS') {
+      return c.json({ text: 'A request with the same code is already in progress.', images: [], screenshots: [], isError: true }, 409);
+    }
+    if (dedupResult === 'ALREADY_FINISHED') {
+      return c.json({ text: 'This request was already completed.', images: [], screenshots: [], isError: true }, 409);
+    }
+
     const executor = relayExecutorManager.getOrCreate(body.sessionId, body.cwd);
     sessionActivity.set(body.sessionId, Date.now());
 
@@ -2099,6 +2137,7 @@ app.post('/cli/execute', async (c) => {
         executor.setUserState(workerResult.stateCandidate);
       }
       if (activeTabId != null) touchClaim(activeTabId, body.sessionId);
+      rt.completeRequest(requestId, workerResult.success ? 'succeeded' : 'failed');
 
       // Extract Playwright result format when available.
       const val = workerResult.value as Record<string, unknown> | undefined;
@@ -2128,8 +2167,11 @@ app.post('/cli/execute', async (c) => {
 
     if (activeTabId != null) touchClaim(activeTabId, body.sessionId);
 
+    rt.completeRequest(requestId, result.isError ? 'failed' : 'succeeded');
     return c.json({ text: result.text, images: result.images, screenshots: result.screenshots, isError: result.isError });
   } catch (err: any) {
+    // Best-effort dedup cleanup; rt/requestId may not be defined if error was in body parsing.
+    try { getOrCreateRuntime().sweepTerminal(); } catch { /* ok */ }
     return c.json({ text: err.message, images: [], screenshots: [], isError: true }, 500);
   }
 });

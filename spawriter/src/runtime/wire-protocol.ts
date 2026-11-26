@@ -71,7 +71,46 @@ export interface CreditMessage {
   amount: number;
 }
 
-export type ControlPayload = PingMessage | PongMessage | FenceMessage | CreditMessage;
+// ─── V2 Handshake (§16.7) ────────────────────────────────────────────────────
+
+export interface HelloMessage {
+  type: 'hello';
+  version: number;
+  /** Client-generated challenge nonce. */
+  challenge: string;
+  /** Client capabilities. */
+  capabilities: string[];
+  /** Client build SHA or version identifier. */
+  buildId?: string;
+}
+
+export interface WelcomeMessage {
+  type: 'welcome';
+  version: number;
+  /** Server's proof: HMAC(challenge, sharedSecret) or echo for initial pairing. */
+  proof: string;
+  /** Initial telemetry credit. */
+  telemetryCredit: number;
+  /** Initial critical-data credit. */
+  criticalCredit: number;
+  /** Server's negotiated features. */
+  features: string[];
+  /** Server build SHA. */
+  buildId?: string;
+  /** Instance ID. */
+  instanceId?: string;
+}
+
+export interface RejectMessage {
+  type: 'reject';
+  version: number;
+  code: 'VERSION_MISMATCH' | 'AUTH_FAILED' | 'UPGRADE_REQUIRED' | 'BUSY';
+  message: string;
+}
+
+export type HandshakePayload = HelloMessage | WelcomeMessage | RejectMessage;
+
+export type ControlPayload = PingMessage | PongMessage | FenceMessage | CreditMessage | HandshakePayload;
 
 // ─── Codec ───────────────────────────────────────────────────────────────────
 
@@ -230,3 +269,159 @@ export class FlowControl {
     };
   }
 }
+
+// ─── V2 Handshake State Machine (§16.7.5) ────────────────────────────────────
+
+export type HandshakeState = 'idle' | 'hello_sent' | 'established' | 'rejected';
+
+export interface HandshakeConfig {
+  /** Protocol version to negotiate. */
+  version?: number;
+  /** Supported capabilities. */
+  capabilities?: string[];
+  /** Build ID for version tracking. */
+  buildId?: string;
+  /** Initial telemetry credit to offer. */
+  telemetryCredit?: number;
+  /** Initial critical-data credit to offer. */
+  criticalCredit?: number;
+  /** Instance ID for the server. */
+  instanceId?: string;
+}
+
+export class HandshakeManager {
+  private state: HandshakeState = 'idle';
+  private challenge: string = '';
+  private readonly config: Required<Omit<HandshakeConfig, 'instanceId'>> & { instanceId?: string };
+
+  constructor(config: HandshakeConfig = {}) {
+    this.config = {
+      version: config.version ?? WIRE_VERSION,
+      capabilities: config.capabilities ?? ['v2-flow', 'v2-fence', 'v2-chunk'],
+      buildId: config.buildId ?? 'unknown',
+      telemetryCredit: config.telemetryCredit ?? 256 * 1024,
+      criticalCredit: config.criticalCredit ?? 512 * 1024,
+      instanceId: config.instanceId,
+    };
+  }
+
+  /** Create a HELLO message (client side). */
+  createHello(): HelloMessage {
+    this.challenge = `ch-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    this.state = 'hello_sent';
+    return {
+      type: 'hello',
+      version: this.config.version,
+      challenge: this.challenge,
+      capabilities: this.config.capabilities,
+      buildId: this.config.buildId,
+    };
+  }
+
+  /** Process a HELLO and create a WELCOME (server side). */
+  processHello(hello: HelloMessage): WelcomeMessage | RejectMessage {
+    if (hello.version !== this.config.version) {
+      this.state = 'rejected';
+      return {
+        type: 'reject',
+        version: this.config.version,
+        code: 'VERSION_MISMATCH',
+        message: `Expected version ${this.config.version}, got ${hello.version}`,
+      };
+    }
+
+    this.state = 'established';
+    return {
+      type: 'welcome',
+      version: this.config.version,
+      proof: `proof-${hello.challenge}`,
+      telemetryCredit: this.config.telemetryCredit,
+      criticalCredit: this.config.criticalCredit,
+      features: this.config.capabilities.filter(c => hello.capabilities.includes(c)),
+      buildId: this.config.buildId,
+      instanceId: this.config.instanceId,
+    };
+  }
+
+  /** Process a WELCOME response (client side). */
+  processWelcome(welcome: WelcomeMessage): boolean {
+    if (this.state !== 'hello_sent') return false;
+    if (welcome.version !== this.config.version) return false;
+    if (welcome.proof !== `proof-${this.challenge}`) return false;
+    this.state = 'established';
+    return true;
+  }
+
+  /** Process a REJECT response (client side). */
+  processReject(_reject: RejectMessage): void {
+    this.state = 'rejected';
+  }
+
+  getState(): HandshakeState { return this.state; }
+
+  reset(): void {
+    this.state = 'idle';
+    this.challenge = '';
+  }
+
+  diagnostics(): Record<string, unknown> {
+    return {
+      state: this.state,
+      version: this.config.version,
+      capabilities: this.config.capabilities,
+      buildId: this.config.buildId,
+    };
+  }
+}
+
+// ─── Golden Test Vectors (§16.7.5) ───────────────────────────────────────────
+// Canonical test vectors for interoperability testing between Relay and Extension.
+
+export const GOLDEN_VECTORS = {
+  validHello: {
+    input: { type: 'hello', version: 2, challenge: 'test-ch-001', capabilities: ['v2-flow', 'v2-fence'], buildId: 'test-build' } satisfies HelloMessage,
+    expectWelcome: true,
+  },
+  wrongVersion: {
+    input: { type: 'hello', version: 99, challenge: 'test-ch-002', capabilities: ['v2-flow'], buildId: 'test-build' } satisfies HelloMessage,
+    expectReject: 'VERSION_MISMATCH',
+  },
+  validEnvelope: {
+    input: '{"v":2,"k":"control","seq":1,"gen":1,"p":{"type":"ping","id":1,"sentAt":1000}}',
+    expectDecoded: true,
+  },
+  invalidVersion: {
+    input: '{"v":1,"k":"event","seq":1,"gen":1,"p":{}}',
+    expectDecoded: false,
+  },
+  seqGap: {
+    description: 'seq jumps from 1 to 5 — receiver should detect gap',
+    frames: [
+      { v: 2, k: 'event' as MessageKind, seq: 1, gen: 1, p: {} },
+      { v: 2, k: 'event' as MessageKind, seq: 5, gen: 1, p: {} },
+    ],
+  },
+  duplicateAck: {
+    description: 'Same ack value sent twice — should be idempotent',
+    frames: [
+      { v: 2, k: 'ack' as MessageKind, seq: 1, gen: 1, ack: 3, p: {} },
+      { v: 2, k: 'ack' as MessageKind, seq: 2, gen: 1, ack: 3, p: {} },
+    ],
+  },
+  oversizedFrame: {
+    description: 'Frame exceeding MAX_FRAME_SIZE should be rejected',
+    payloadSize: MAX_FRAME_SIZE + 1,
+  },
+  oldGeneration: {
+    description: 'Message with old generation epoch should be dropped',
+    currentGen: 5,
+    frame: { v: 2, k: 'event' as MessageKind, seq: 1, gen: 3, p: {} },
+  },
+  fenceWithRetire: {
+    input: { type: 'fence', generation: 5, reason: 'reconnect' as const, retireGen: 4 } satisfies FenceMessage,
+  },
+  cancelFence: {
+    description: 'Cancel fence should stop active execution',
+    input: { type: 'fence', generation: 6, reason: 'drain' as const, retireGen: 5 } satisfies FenceMessage,
+  },
+} as const;
