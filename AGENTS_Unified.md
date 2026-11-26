@@ -314,7 +314,7 @@ await getReactComponentInfo(5)               // + props and component hierarchy
 
 ## Key Usage Notes
 
-- `state` persists across execute calls and tab switches.
+- `state` persists across execute calls and tab switches. Each execute runs in an isolated Worker process; state is checkpointed on success. Only JSON-serializable data survives (no Page/Locator handles) — save selectors/data, re-query on the next call.
 - Prefer separate execute calls for complex workflows so intermediate results can be inspected.
 - Prefer `snapshot()` before screenshots when text and semantics are sufficient.
 - Use `screenshotWithLabels()` when visual position or element labeling matters.
@@ -340,7 +340,7 @@ Attempt recovery before asking the user. Ask for user action only when authentic
 | Symptom | MCP recovery | CLI recovery |
 |---------|--------------|--------------|
 | No tab connected | `tab connect` with `create: true`, then retry | `spawriter session reset <id>`, then `spawriter tabs connect <url> --create -s <id>` |
-| Tool timeout or connection error | Retry, call `reset`, then retry; fall back to CLI if still broken | Reset the session and retry |
+| Tool timeout or connection error | First check the current page and committed side effects. Then retry, call `reset`, retry; fall back to CLI if still broken. Do NOT use reset+retry as universal first response. | First check page state; then reset the session and retry |
 | Relay unavailable | Fall back to CLI and run relay recovery | `spawriter relay --replace`, then retry |
 | Override not reflected | `ensureFreshRender()` or `clearCacheAndReload({ clear: "cache" })` | Same execute code through CLI |
 | App not mounting | Navigate to the application's route first | Navigate to the application's route first |

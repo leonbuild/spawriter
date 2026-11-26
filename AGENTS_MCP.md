@@ -9,7 +9,7 @@ Use these tools proactively when browser context materially improves inspection,
 ## Tool Catalog (4 tools)
 
 - **`execute`** — Playwright JS code with spawriter extensions. Globals: `page`, `context`, `browser`, `state`, `navigate`, `ensureFreshRender`, `screenshot`, `screenshotWithLabels`, `snapshot`/`accessibilitySnapshot`, `interact`, `refToLocator`, `consoleLogs`, `getLatestLogs`, `clearAllLogs`, `networkLog`, `networkDetail`, `clearNetworkLog`, `networkIntercept`, `dbg`, `editor`, `browserFetch`, `storage`, `emulation`, `performance`, `cssInspect`, `pageContent`, `getPageMarkdown`, `getCleanHTML`, `waitForPageLoad`, `getReactSource`, `getReactComponentInfo`, `singleSpa`, `clearCacheAndReload`, `getCDPSession`, `resetPlaywright`, `require`, `import`
-- **`reset`** — Reconnect + clear all state, releasing every tab owned by this MCP server
+- **`reset`** — Reconnect + clear the current session's state; releases tabs owned by this MCP session, not other sessions
 - **`single_spa`** — Override management, app lifecycle (status/override_set/override_remove/override_enable/override_disable/override_reset_all/mount/unmount/unload)
 - **`tab`** — Tab management (connect/list/switch/release) with ownership isolation
 
@@ -66,7 +66,7 @@ After any UI code change, automatically:
 ### execute
 
 - `snapshot()` populates the ref cache — always call it before `interact(ref, action)`
-- `state` persists across `execute` calls AND tab switches — use it to store data between calls
+- `state` persists across `execute` calls AND tab switches — use it to store JSON-serializable data between calls. Each execute runs in an isolated Worker process; state is checkpointed on success. Page/Locator handles do NOT survive between calls — save selectors or data, then re-query on the next call.
 - Playwright locators (`page.getByRole()` etc.) may timeout through the relay — prefer `page.evaluate()`, `interact()`, `snapshot()`
 - `networkIntercept.disable()` when done — rules persist until explicitly removed
 
@@ -104,7 +104,7 @@ Attempt these recovery steps before asking the user. Ask for user action only wh
 | Symptom | Recovery |
 |---------|----------|
 | `No tab connected` on execute | `tab { action: "connect", url: "about:blank", create: true, session_id: "..." }` then retry execute |
-| Tool timeout / connection error | `reset` then retry |
+| Tool timeout / connection error | First check the current page and any committed side effects before retrying. If the page is in an unknown state, `reset` then retry. Do NOT use `reset + retry` as a universal first response to timeouts. |
 | Override not reflected | `execute` → `ensureFreshRender()` or `clearCacheAndReload({ clear: "cache" })` |
 | App not mounting after override | Navigate to the app's route first |
 | Debugger not pausing | `execute` → `dbg.enable()` first |

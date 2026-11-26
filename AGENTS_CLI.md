@@ -83,7 +83,7 @@ All globals are injected into the Playwright VM sandbox, and native Playwright A
 | Global | Description |
 |--------|-------------|
 | `page`, `context`, `browser` | Playwright core objects |
-| `state` | Persistent state object (survives across `execute` calls and tab switches) |
+| `state` | Persistent state object (survives across `execute` calls and tab switches). Each execute runs in an isolated Worker process; state is checkpointed on success. Only JSON-serializable data (no Page/Locator handles) — save selectors/data, re-query next call. |
 | `navigate(url)` | Navigate to URL |
 | `ensureFreshRender()` | Reload page with fresh cache |
 | `screenshot()` | Capture page screenshot |
@@ -322,7 +322,7 @@ Attempt these recovery steps before asking the user. Ask for user action only wh
 | Symptom | Recovery |
 |---------|----------|
 | `No tab connected to this session` | `spawriter session reset <id>` → if still fails: `spawriter tabs connect <url> --force-create -s <id>` |
-| Tool timeout / connection error | `spawriter session reset <id>` then retry |
+| Tool timeout / connection error | First check the current page state and any committed side effects. Only then `spawriter session reset <id>` and retry. Do NOT use reset+retry as the first response to timeouts. |
 | Relay not running | `spawriter relay --replace` then retry |
 | Override not reflected | `await ensureFreshRender()` |
 | App not mounting | Navigate to the app's route first |
