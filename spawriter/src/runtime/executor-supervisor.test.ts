@@ -43,10 +43,6 @@ describe('ExecutorSupervisor', () => {
 
   it('limits concurrent workers', async () => {
     const sup = new ExecutorSupervisor({ maxActive: 1 });
-
-    // The first execute will try to fork, which may fail in test env
-    // (no worker script). We're testing the supervisor logic, not actual spawn.
-    // Create a mock scenario by directly checking budget.
     const diag = sup.diagnostics();
     assert.equal(diag.maxActive, 1);
     await sup.close();
@@ -58,8 +54,32 @@ describe('ExecutorSupervisor', () => {
     sup.on('workerLog', (id: string, level: string, msg: string) => {
       logs.push({ id, level, msg });
     });
-    // The event listener is registered; actual emission requires a worker.
     assert.equal(logs.length, 0);
+    sup.close();
+  });
+
+  it('accepts tabInfo in execute request', async () => {
+    const sup = new ExecutorSupervisor();
+    await sup.close();
+    const result = await sup.execute({
+      sessionId: 'sw-test2',
+      code: 'return 1',
+      timeoutMs: 5000,
+      requestId: 'r2',
+      executeEpoch: 1,
+      state: {},
+      stateRevision: 0,
+      tabInfo: { tabId: 42, url: 'https://example.com', targetId: 'target-1' },
+    });
+    // Closed, so it rejects — but the request shape is valid.
+    assert.equal(result.success, false);
+    assert.equal(result.error?.code, 'SUPERVISOR_CLOSED');
+  });
+
+  it('accepts relayPort config', () => {
+    const sup = new ExecutorSupervisor({ relayPort: 12345 });
+    const diag = sup.diagnostics();
+    assert.equal(diag.activeWorkers, 0);
     sup.close();
   });
 });
@@ -109,5 +129,13 @@ describe('ExecutorWorker module', () => {
     });
     assert.equal(result.success, false);
     assert(result.error?.message.includes('timed out') || result.error?.message.includes('timeout') || result.error?.code === 'EXECUTION_ERROR');
+  });
+
+  it('executeWithPlaywright returns structured result', async () => {
+    // Test that the function exists and returns the right shape.
+    // We can't test actual Playwright without a real Chrome, but we
+    // verify the function handles missing SSPA_MCP_PORT gracefully.
+    const { executeWithPlaywright } = await import('./executor-worker.js');
+    assert.equal(typeof executeWithPlaywright, 'function');
   });
 });

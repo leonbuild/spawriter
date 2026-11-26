@@ -245,6 +245,7 @@ export {
   type SupervisorConfig,
   type ExecuteRequest as SupervisorExecuteRequest,
   type ExecuteResponse as SupervisorExecuteResponse,
+  type TabInfo,
 } from './executor-supervisor.js';
 
 export {

@@ -1,35 +1,51 @@
 /**
  * Executor Worker — per-execute child process (W11 §9.1/§16.6).
  *
- * This is spawned by ExecutorSupervisor for each user code execution.
- * It receives IPC messages from the Relay, connects to Chrome via CDP,
- * runs user code, and sends results back. The process exits after
- * one execution (per-execute model per ADR-001).
- *
- * Not imported by relay.ts directly — spawned as a child process via
- * executor-supervisor.ts.
+ * Spawned by ExecutorSupervisor for each user code execution.
+ * Connects to Chrome via CDP (through the relay's /cdp proxy),
+ * runs user code with full Playwright + VM globals, and returns
+ * results via IPC. Exits after one execution (per-execute model).
  */
 
 import { WorkerIpcCodec, type WorkerMessage, type InitPayload, type ExecutePayload, type ResultPayload } from './worker-ipc.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export interface WorkerConfig {
-  /** CDP WebSocket endpoint to connect to. */
-  cdpEndpoint: string;
-  /** Max execution timeout in ms. */
-  maxTimeoutMs: number;
-  /** Max heap size (MiB). */
-  maxHeapMib: number;
+export interface WorkerExecuteResult {
+  requestId: string;
+  success: boolean;
+  value?: {
+    text: string;
+    images: Array<{ data: string; mimeType: string }>;
+    screenshots: Array<{ path: string; base64: string; mimeType: string; snapshot: string; labelCount: number }>;
+    isError: boolean;
+  };
+  error?: { code: string; message: string; stack?: string };
+  stateCandidate?: Record<string, unknown>;
+  stateRevision?: number;
 }
 
-// ─── Worker Process ──────────────────────────────────────────────────────────
+// ─── Worker State ────────────────────────────────────────────────────────────
 
 const codec = new WorkerIpcCodec();
 let initPayload: InitPayload | null = null;
 let currentState: Record<string, unknown> = {};
 let stateRevision = 0;
 let executing = false;
+
+// Lazily loaded PlaywrightExecutor — only imported when actually executing.
+// This avoids the import overhead when the worker module is loaded for testing.
+let PlaywrightExecutorClass: any = null;
+
+async function getPlaywrightExecutor(): Promise<any> {
+  if (!PlaywrightExecutorClass) {
+    const mod = await import('../pw-executor.js');
+    PlaywrightExecutorClass = mod.PlaywrightExecutor;
+  }
+  return PlaywrightExecutorClass;
+}
+
+// ─── IPC Helpers ─────────────────────────────────────────────────────────────
 
 function sendToRelay(msg: WorkerMessage): void {
   if (process.send) {
@@ -48,13 +64,59 @@ function sendReady(): void {
 }
 
 function sendResult(requestId: string, result: ResultPayload): void {
-  sendToRelay({
+  // Enforce IPC size limits (§16.6): validate result and state before sending.
+  const validation = codec.validateResult(result);
+  if (!validation.valid) {
+    sendToRelay({
+      kind: 'result',
+      id: requestId,
+      sessionId: initPayload?.sessionId ?? '',
+      executeEpoch: initPayload?.executeEpoch ?? 0,
+      payload: {
+        requestId,
+        success: false,
+        error: { code: 'RESULT_LIMIT', message: validation.error ?? 'Result exceeds IPC size limit' },
+      } satisfies ResultPayload,
+    });
+    return;
+  }
+
+  if (result.stateCandidate && !codec.validateStateSize(result.stateCandidate)) {
+    result = {
+      ...result,
+      stateCandidate: undefined,
+      error: { code: 'STATE_LIMIT', message: 'State exceeds 256 KiB IPC limit; previous checkpoint preserved' },
+    };
+  }
+
+  const msg: WorkerMessage = {
     kind: 'result',
     id: requestId,
     sessionId: initPayload?.sessionId ?? '',
     executeEpoch: initPayload?.executeEpoch ?? 0,
     payload: result,
-  });
+  };
+
+  const encoded = codec.encode(msg);
+  if (!encoded) {
+    // Entire message too large — send error without payload.
+    sendToRelay({
+      kind: 'result',
+      id: requestId,
+      sessionId: initPayload?.sessionId ?? '',
+      executeEpoch: initPayload?.executeEpoch ?? 0,
+      payload: {
+        requestId,
+        success: false,
+        error: { code: 'RESULT_LIMIT', message: 'Full result exceeds 16 MiB IPC wire limit' },
+      } satisfies ResultPayload,
+    });
+    return;
+  }
+
+  if (process.send) {
+    process.send(encoded);
+  }
 }
 
 function sendLog(message: string): void {
@@ -77,17 +139,71 @@ function sendError(code: string, message: string): void {
   });
 }
 
-// ─── Execution ───────────────────────────────────────────────────────────────
+// ─── Execution via PlaywrightExecutor ────────────────────────────────────────
+
+async function executeWithPlaywright(payload: ExecutePayload): Promise<WorkerExecuteResult> {
+  const { code, timeoutMs, requestId } = payload;
+
+  try {
+    const PwExecutor = await getPlaywrightExecutor();
+    const executor = new PwExecutor(
+      { log: (...a: unknown[]) => sendLog(a.map(String).join(' ')),
+        error: (...a: unknown[]) => sendLog('[ERROR] ' + a.map(String).join(' ')) },
+    );
+
+    // Inject user state.
+    executor.setUserState({ ...currentState });
+
+    // Claim the tab so ensureConnection finds the right page.
+    if (initPayload?.targetInfo?.tabId) {
+      executor.claimTab(
+        initPayload.targetInfo.tabId,
+        initPayload.targetInfo.url || undefined,
+        initPayload.targetInfo.targetId || undefined,
+      );
+    }
+
+    // Run the user code — PlaywrightExecutor handles CDP connection,
+    // VM sandbox with all globals, screenshots, snapshots, etc.
+    const result = await executor.execute(code, timeoutMs);
+
+    // Read updated state.
+    const newState = executor.getUserState();
+
+    // Disconnect from Chrome (best-effort cleanup).
+    try { await executor.reset(); } catch { /* ok */ }
+
+    return {
+      requestId,
+      success: !result.isError,
+      value: {
+        text: result.text,
+        images: result.images,
+        screenshots: result.screenshots,
+        isError: result.isError,
+      },
+      stateCandidate: newState,
+      stateRevision: stateRevision + 1,
+    };
+  } catch (err: any) {
+    return {
+      requestId,
+      success: false,
+      error: {
+        code: err.code ?? 'EXECUTION_ERROR',
+        message: err.message,
+        stack: err.stack,
+      },
+    };
+  }
+}
+
+// ─── Fallback sandbox execution (no Playwright) ─────────────────────────────
 
 async function executeCode(payload: ExecutePayload): Promise<ResultPayload> {
   const { code, timeoutMs, requestId } = payload;
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
 
   try {
-    // Build a minimal sandbox with the state.
-    // In the full implementation, this would set up Playwright connection
-    // and all VM globals. For now, we execute in a basic Node.js context.
     const vm = await import('node:vm');
 
     const sandbox: Record<string, unknown> = {
@@ -103,7 +219,6 @@ async function executeCode(payload: ExecutePayload): Promise<ResultPayload> {
       Date,
       JSON,
       Math,
-      AbortSignal: ac.signal,
     };
 
     const context = vm.createContext(sandbox);
@@ -112,8 +227,6 @@ async function executeCode(payload: ExecutePayload): Promise<ResultPayload> {
     });
 
     const result = await script.runInContext(context, { timeout: timeoutMs });
-
-    // Extract state candidate.
     const stateCandidate = sandbox.state as Record<string, unknown>;
 
     return {
@@ -133,8 +246,6 @@ async function executeCode(payload: ExecutePayload): Promise<ResultPayload> {
         stack: err.stack,
       },
     };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -161,9 +272,25 @@ function handleMessage(raw: unknown): void {
         }
         executing = true;
         const payload = msg.payload as ExecutePayload;
-        executeCode(payload)
+
+        // Use Playwright mode when CDP is reachable (env var set by supervisor),
+        // fall back to basic sandbox for testing.
+        const usePlaywright = !!process.env.SSPA_MCP_PORT;
+
+        const run = usePlaywright
+          ? executeWithPlaywright(payload).then(r => ({
+              requestId: r.requestId,
+              success: r.success,
+              value: r.value,
+              error: r.error,
+              stateCandidate: r.stateCandidate,
+              stateRevision: r.stateRevision,
+            }))
+          : executeCode(payload);
+
+        run
           .then(result => {
-            sendResult(payload.requestId, result);
+            sendResult(payload.requestId, result as ResultPayload);
             if (result.success && result.stateCandidate) {
               currentState = result.stateCandidate;
               stateRevision = result.stateRevision ?? stateRevision + 1;
@@ -185,7 +312,6 @@ function handleMessage(raw: unknown): void {
       }
 
       case 'cancel': {
-        // In full implementation, would abort the running execution.
         sendLog('Cancel received');
         process.exit(1);
         break;
@@ -221,12 +347,10 @@ function handleMessage(raw: unknown): void {
 if (process.send) {
   process.on('message', handleMessage);
 
-  // Safety: exit if parent dies (no IPC).
   process.on('disconnect', () => {
     process.exit(1);
   });
 
-  // Uncaught errors → report and exit.
   process.on('uncaughtException', (err) => {
     sendError('UNCAUGHT', err.message);
     process.exit(1);
@@ -238,4 +362,4 @@ if (process.send) {
   });
 }
 
-export { executeCode, handleMessage };
+export { executeCode, executeWithPlaywright, handleMessage };

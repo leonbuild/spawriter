@@ -24,7 +24,7 @@ import { OWNERSHIP_ERROR_CODE } from './protocol.js';
 import { ExecutorManager } from './pw-executor.js';
 import { getCdpClearDenial } from './cdp-clear-policy.js';
 import { createCdpLogger, DROPPED_CDP_EVENTS, NOISY_LOG_EVENTS, type CdpLogger, type CdpLogDirection } from './cdp-log.js';
-import { RelayRuntime, RelayBridge, type BridgeCallbacks, ExecutorSupervisor, type SupervisorExecuteRequest } from './runtime/index.js';
+import { RelayRuntime, RelayBridge, type BridgeCallbacks, ExecutorSupervisor, type SupervisorExecuteRequest, type SupervisorExecuteResponse } from './runtime/index.js';
 
 interface CDPClient {
   ws: WebSocket;
@@ -1916,7 +1916,9 @@ startStaleSweep();
 // When USE_WORKER_ISOLATION=true, each execute runs in a separate child process
 // managed by ExecutorSupervisor, providing crash isolation and resource limits.
 const USE_WORKER_ISOLATION = getEnv('USE_WORKER_ISOLATION', 'false') === 'true';
-const executorSupervisor = USE_WORKER_ISOLATION ? new ExecutorSupervisor() : null;
+const executorSupervisor = USE_WORKER_ISOLATION
+  ? new ExecutorSupervisor({ relayPort: getRelayPort() })
+  : null;
 if (executorSupervisor) {
   executorSupervisor.on('workerLog', (_id: string, _level: string, msg: string) => log(`[worker] ${msg}`));
   executorSupervisor.on('workerKill', (id: string, reason: string) => error(`[worker] killed ${id}: ${reason}`));
@@ -2068,6 +2070,15 @@ app.post('/cli/execute', async (c) => {
     // §9.1: Worker isolation path — each execute in a child process.
     if (executorSupervisor) {
       const epoch = ++workerEpochCounter;
+
+      // Build tab info for the Worker to find the right page.
+      const tabTargetId = activeTabId != null
+        ? ([...attachedTargets.values()].find(t => t.tabId === activeTabId)?.targetInfo?.targetId)
+        : undefined;
+      const tabUrl = activeTabId != null
+        ? ([...attachedTargets.values()].find(t => t.tabId === activeTabId)?.targetInfo?.url)
+        : undefined;
+
       const workerRequest: SupervisorExecuteRequest = {
         sessionId: body.sessionId,
         code: body.code,
@@ -2076,12 +2087,27 @@ app.post('/cli/execute', async (c) => {
         executeEpoch: epoch,
         state: executor.getUserState(),
         stateRevision: epoch,
+        tabInfo: activeTabId != null
+          ? { tabId: activeTabId, url: tabUrl, targetId: tabTargetId }
+          : undefined,
+        cwd: body.cwd,
       };
       const workerResult = await executorSupervisor.execute(workerRequest);
       if (workerResult.success && workerResult.stateCandidate) {
         executor.setUserState(workerResult.stateCandidate);
       }
       if (activeTabId != null) touchClaim(activeTabId, body.sessionId);
+
+      // Extract Playwright result format when available.
+      const val = workerResult.value as Record<string, unknown> | undefined;
+      if (val && typeof val === 'object' && 'text' in val) {
+        return c.json({
+          text: val.text as string,
+          images: (val.images as unknown[]) ?? [],
+          screenshots: (val.screenshots as unknown[]) ?? [],
+          isError: (val.isError as boolean) ?? !workerResult.success,
+        });
+      }
       return c.json({
         text: workerResult.success ? String(workerResult.value ?? '') : (workerResult.error?.message ?? 'Worker error'),
         images: [],

@@ -11,7 +11,7 @@ import { EventEmitter } from 'node:events';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkerIpcCodec, type WorkerMessage, type InitPayload, type ExecutePayload, type ResultPayload } from './worker-ipc.js';
-import { ProcessGuard, type ManagedProcess } from './process-guard.js';
+import { ProcessGuard } from './process-guard.js';
 import { ResourceBudget } from './resource-budget.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -30,6 +30,14 @@ export interface SupervisorConfig {
   maxHeapMib?: number;
   /** Worker script path. Auto-detected if omitted. */
   workerScript?: string;
+  /** Relay port for CDP connections. Auto-detected if omitted. */
+  relayPort?: number;
+}
+
+export interface TabInfo {
+  tabId: number;
+  url?: string;
+  targetId?: string;
 }
 
 export interface ExecuteRequest {
@@ -40,11 +48,16 @@ export interface ExecuteRequest {
   executeEpoch: number;
   state: Record<string, unknown>;
   stateRevision: number;
+  /** Tab info for Playwright to find the right page. */
+  tabInfo?: TabInfo;
+  /** Working directory for the execution. */
+  cwd?: string;
 }
 
 export interface ExecuteResponse {
   requestId: string;
   success: boolean;
+  /** For Playwright mode: { text, images, screenshots, isError } */
   value?: unknown;
   error?: { code: string; message: string; stack?: string };
   stateCandidate?: Record<string, unknown>;
@@ -59,9 +72,12 @@ interface ActiveWorker {
   sessionId: string;
   requestId: string;
   executeEpoch: number;
+  code: string;
+  timeoutMs: number;
   startTime: number;
   timeoutTimer: NodeJS.Timeout | null;
   resolve: (response: ExecuteResponse) => void;
+  resolved: boolean;
 }
 
 // ─── Supervisor ──────────────────────────────────────────────────────────────
@@ -73,6 +89,7 @@ export class ExecutorSupervisor extends EventEmitter {
   private readonly workerScript: string;
   private readonly maxHeapMib: number;
   private readonly maxActive: number;
+  private readonly relayPort: number | undefined;
 
   private workers = new Map<string, ActiveWorker>();
   private workerCounter = 0;
@@ -82,15 +99,16 @@ export class ExecutorSupervisor extends EventEmitter {
     super();
     this.maxActive = config.maxActive ?? 4;
     this.maxHeapMib = config.maxHeapMib ?? 384;
+    this.relayPort = config.relayPort;
     this.budget = new ResourceBudget({
       maxWorkers: config.maxWorkers ?? 10,
       maxActiveWorkers: config.maxActive ?? 4,
       globalQueueLimit: 16,
     });
 
-    // Worker script path — resolve from current directory.
+    // Worker script path — resolve .ts for dev, .js for prod.
     this.workerScript = config.workerScript ??
-      path.resolve(__dirname, 'executor-worker.js');
+      path.resolve(__dirname, 'executor-worker.ts');
   }
 
   /**
@@ -117,7 +135,6 @@ export class ExecutorSupervisor extends EventEmitter {
     const workerId = `w-${++this.workerCounter}`;
     const startTime = Date.now();
 
-    // Allocate budget.
     const allocated = this.budget.allocateWorker(workerId, request.sessionId);
     if (!allocated) {
       return {
@@ -128,16 +145,32 @@ export class ExecutorSupervisor extends EventEmitter {
     }
 
     return new Promise<ExecuteResponse>((resolve) => {
-      // Spawn worker process.
+      // Build env vars for the Worker.
+      const workerEnv: Record<string, string> = {
+        ...process.env as Record<string, string>,
+        WORKER_ID: workerId,
+        WORKER_SESSION: request.sessionId,
+        WORKER_EPOCH: String(request.executeEpoch),
+      };
+
+      // Set relay port so Worker can connect to CDP.
+      if (this.relayPort) {
+        workerEnv.SSPA_MCP_PORT = String(this.relayPort);
+      } else if (process.env.SSPA_MCP_PORT) {
+        workerEnv.SSPA_MCP_PORT = process.env.SSPA_MCP_PORT;
+      }
+
+      // TypeScript support: add tsx loader for .ts files.
+      const isTs = this.workerScript.endsWith('.ts');
+      const execArgv = [`--max-old-space-size=${this.maxHeapMib}`];
+      if (isTs) {
+        execArgv.unshift('--import', 'tsx/esm');
+      }
+
       const child = fork(this.workerScript, [], {
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-        execArgv: [`--max-old-space-size=${this.maxHeapMib}`],
-        env: {
-          ...process.env,
-          WORKER_ID: workerId,
-          WORKER_SESSION: request.sessionId,
-          WORKER_EPOCH: String(request.executeEpoch),
-        },
+        execArgv,
+        env: workerEnv,
       });
 
       if (!child.pid) {
@@ -150,14 +183,12 @@ export class ExecutorSupervisor extends EventEmitter {
         return;
       }
 
-      // Register with process guard.
       this.guard.register(workerId, child.pid);
       this.guard.markRunning(workerId);
 
-      // Set up timeout.
       const timeoutTimer = setTimeout(() => {
         this.killWorker(workerId, 'timeout');
-      }, request.timeoutMs + 5000); // Grace period beyond user timeout.
+      }, request.timeoutMs + 5000);
 
       const worker: ActiveWorker = {
         id: workerId,
@@ -165,14 +196,16 @@ export class ExecutorSupervisor extends EventEmitter {
         sessionId: request.sessionId,
         requestId: request.requestId,
         executeEpoch: request.executeEpoch,
+        code: request.code,
+        timeoutMs: request.timeoutMs,
         startTime,
         timeoutTimer,
         resolve,
+        resolved: false,
       };
 
       this.workers.set(workerId, worker);
 
-      // Handle IPC messages from worker.
       child.on('message', (raw) => {
         try {
           const msg = this.codec.decode(raw as string);
@@ -181,17 +214,15 @@ export class ExecutorSupervisor extends EventEmitter {
         } catch { /* ignore malformed messages */ }
       });
 
-      // Handle worker exit.
       child.on('exit', (code, signal) => {
         this.handleWorkerExit(workerId, code, signal);
       });
 
-      // Handle worker errors.
       child.on('error', (err) => {
         this.handleWorkerError(workerId, err);
       });
 
-      // Send init message.
+      // Send init message with tab info.
       const initMsg: WorkerMessage = {
         kind: 'init',
         id: `init-${workerId}`,
@@ -203,14 +234,13 @@ export class ExecutorSupervisor extends EventEmitter {
           state: request.state,
           stateRevision: request.stateRevision,
           config: {},
-          targetInfo: { tabId: 0, targetId: '', url: '' },
+          targetInfo: request.tabInfo
+            ? { tabId: request.tabInfo.tabId, targetId: request.tabInfo.targetId ?? '', url: request.tabInfo.url ?? '' }
+            : { tabId: 0, targetId: '', url: '' },
         } satisfies InitPayload,
       };
 
       child.send(this.codec.encode(initMsg));
-
-      // Wait for ready, then send execute.
-      // The worker sends 'ready' after init; we send 'execute' in the message handler.
     });
   }
 
@@ -220,20 +250,18 @@ export class ExecutorSupervisor extends EventEmitter {
 
     switch (msg.kind) {
       case 'ready': {
-        // Worker is initialized — send the execute command.
+        // Worker initialized — send execute command with actual code.
         const execMsg: WorkerMessage = {
           kind: 'execute',
           id: worker.requestId,
           sessionId: worker.sessionId,
           executeEpoch: worker.executeEpoch,
           payload: {
-            code: '', // Set during execute() call.
-            timeoutMs: 30000,
+            code: worker.code,
+            timeoutMs: worker.timeoutMs,
             requestId: worker.requestId,
           } satisfies ExecutePayload,
         };
-        // We need the original code — store it in the worker.
-        // For now, the execute payload comes from the initial request.
         worker.process.send(this.codec.encode(execMsg));
         break;
       }
@@ -285,7 +313,9 @@ export class ExecutorSupervisor extends EventEmitter {
 
     this.guard.recordExit(workerId, code ?? -1, signal);
 
-    // If we haven't resolved yet, the worker crashed or was killed.
+    // If code 0 and already resolved, this is a normal post-execute exit.
+    if (worker.resolved) return;
+
     this.resolveWorker(workerId, {
       requestId: worker.requestId,
       success: false,
@@ -300,7 +330,7 @@ export class ExecutorSupervisor extends EventEmitter {
 
   private handleWorkerError(workerId: string, err: Error): void {
     const worker = this.workers.get(workerId);
-    if (!worker) return;
+    if (!worker || worker.resolved) return;
 
     this.resolveWorker(workerId, {
       requestId: worker.requestId,
@@ -313,9 +343,9 @@ export class ExecutorSupervisor extends EventEmitter {
 
   private resolveWorker(workerId: string, response: ExecuteResponse): void {
     const worker = this.workers.get(workerId);
-    if (!worker) return;
+    if (!worker || worker.resolved) return;
 
-    // Clean up.
+    worker.resolved = true;
     if (worker.timeoutTimer) clearTimeout(worker.timeoutTimer);
     this.workers.delete(workerId);
     this.budget.releaseWorker(workerId);
